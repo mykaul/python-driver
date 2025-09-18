@@ -44,3 +44,4 @@ tests/unit/cython/bytesio_testhelper.c
 #iPython
 *.ipynb
 
+test_slots_implementation.py

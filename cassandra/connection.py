@@ -129,6 +129,7 @@ class EndPoint(object):
     """
     Represents the information to connect to a cassandra node.
     """
+    __slots__ = ()
 
     @property
     def address(self):
@@ -189,6 +190,7 @@ class DefaultEndPoint(EndPoint):
     """
     Default EndPoint implementation, basically just an address and port.
     """
+    __slots__ = ('_address', '_port')
 
     def __init__(self, address, port=9042):
         self._address = address
@@ -251,6 +253,7 @@ class DefaultEndPointFactory(EndPointFactory):
 @total_ordering
 class SniEndPoint(EndPoint):
     """SNI Proxy EndPoint implementation."""
+    __slots__ = ('_proxy_address', '_index', '_resolved_address', '_port', '_server_name', '_ssl_options')
 
     def __init__(self, proxy_address, server_name, port=9042):
         self._proxy_address = proxy_address
@@ -330,6 +333,7 @@ class UnixSocketEndPoint(EndPoint):
     """
     Unix Socket EndPoint implementation.
     """
+    __slots__ = ('_unix_socket_path',)
 
     def __init__(self, unix_socket_path):
         self._unix_socket_path = unix_socket_path
@@ -367,6 +371,8 @@ class UnixSocketEndPoint(EndPoint):
 
 
 class _Frame(object):
+    __slots__ = ('version', 'flags', 'stream', 'opcode', 'body_offset', 'end_pos')
+    
     def __init__(self, version, flags, stream, opcode, body_offset, end_pos):
         self.version = version
         self.flags = flags
@@ -470,6 +476,8 @@ class ContinuousPagingState(object):
 
 
 class ContinuousPagingSession(object):
+    __slots__ = ('stream_id', 'decoder', 'row_factory', 'connection', '_condition', '_stop', '_page_queue', '_state', 'released')
+    
     def __init__(self, stream_id, decoder, row_factory, connection, state):
         self.stream_id = stream_id
         self.decoder = decoder
@@ -624,14 +632,13 @@ class _ConnectionIOBuffer(object):
     protocol V5 and checksumming, the data is read, validated and copied to another
     cql frame buffer.
     """
-    _io_buffer = None
-    _cql_frame_buffer = None
-    _connection = None
-    _segment_consumed = False
+    __slots__ = ('_io_buffer', '_cql_frame_buffer', '_connection', '_segment_consumed')
 
     def __init__(self, connection):
         self._io_buffer = io.BytesIO()
         self._connection = weakref.proxy(connection)
+        self._cql_frame_buffer = None
+        self._segment_consumed = False
 
     @property
     def io_buffer(self):
@@ -673,6 +680,8 @@ class _ConnectionIOBuffer(object):
 
 
 class ShardawarePortGenerator:
+    __slots__ = ()
+    
     @classmethod
     def generate(cls, shard_id, total_shards):
         start = random.randrange(DEFAULT_LOCAL_PORT_LOW, DEFAULT_LOCAL_PORT_HIGH)
@@ -1593,6 +1602,7 @@ class Connection(object):
 
 
 class ResponseWaiter(object):
+    __slots__ = ('connection', 'pending', 'fail_on_error', 'error', 'responses', 'event')
 
     def __init__(self, connection, num_responses, fail_on_error):
         self.connection = connection
@@ -1643,6 +1653,8 @@ class ResponseWaiter(object):
 
 
 class HeartbeatFuture(object):
+    __slots__ = ('_exception', '_event', 'connection', 'owner')
+    
     def __init__(self, connection, owner):
         self._exception = None
         self._event = Event()
@@ -1765,12 +1777,12 @@ class ConnectionHeartbeat(Thread):
 
 
 class Timer(object):
-
-    canceled = False
+    __slots__ = ('end', 'callback', 'canceled')
 
     def __init__(self, timeout, callback):
         self.end = time.time() + timeout
         self.callback = callback
+        self.canceled = False
 
     def __lt__(self, other):
         return self.end < other.end
@@ -1790,6 +1802,7 @@ class Timer(object):
 
 
 class TimerManager(object):
+    __slots__ = ('_queue', '_new_timers')
 
     def __init__(self):
         self._queue = []
