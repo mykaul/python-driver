@@ -870,6 +870,50 @@ class Connection(object):
     features = None
     _application_info: Optional[ApplicationInfoBase] = None
 
+    tcp_fastopen_connect = False
+    """
+    When ``True``, enable TCP Fast Open for outgoing connections.
+    This allows data to be sent during the TCP handshake, reducing latency
+    for connection establishment. Requires Linux 4.11+ (client-side).
+    Silently ignored on platforms that do not support ``TCP_FASTOPEN_CONNECT``.
+    """
+
+    tcp_keepalive = False
+    """
+    When ``True``, enable ``SO_KEEPALIVE`` on connections and tune
+    the keepalive interval/count parameters when the platform supports them
+    (``TCP_KEEPIDLE``, ``TCP_KEEPINTVL``, ``TCP_KEEPCNT``).
+    """
+
+    tcp_keepalive_idle = 30
+    """
+    Seconds of idle time before the first keepalive probe is sent.
+    Only meaningful when :attr:`tcp_keepalive` is ``True``.
+    Default ``30`` (matches :attr:`~.Cluster.idle_heartbeat_interval`).
+    """
+
+    tcp_keepalive_interval = 5
+    """
+    Seconds between successive keepalive probes after the initial probe.
+    Only meaningful when :attr:`tcp_keepalive` is ``True``. Default ``5``.
+    """
+
+    tcp_keepalive_count = 6
+    """
+    Number of unacknowledged keepalive probes before the connection is
+    considered dead. Only meaningful when :attr:`tcp_keepalive` is ``True``.
+    Default ``6``.
+    """
+
+    tcp_user_timeout = None
+    """
+    Value in **milliseconds** for ``TCP_USER_TIMEOUT`` (Linux 2.6.37+).
+    When set, the kernel will abort a connection if transmitted data remains
+    unacknowledged for this long. ``None`` (default) means the driver will
+    derive a value from ``idle_heartbeat_timeout * 1000`` at the
+    :class:`~.Cluster` level; set an explicit integer to override.
+    """
+
     @property
     def _iobuf(self):
         # backward compatibility, to avoid any change in the reactors
@@ -880,7 +924,9 @@ class Connection(object):
                  cql_version=None, protocol_version=ProtocolVersion.MAX_SUPPORTED, is_control_connection=False,
                  user_type_map=None, connect_timeout=None, allow_beta_protocol_version=False, no_compact=False,
                  ssl_context=None, owning_pool=None, shard_id=None, total_shards=None,
-                 on_orphaned_stream_released=None, application_info: Optional[ApplicationInfoBase] = None):
+                 on_orphaned_stream_released=None, application_info: Optional[ApplicationInfoBase] = None,
+                 tcp_fastopen_connect=None, tcp_keepalive=None, tcp_keepalive_idle=None,
+                 tcp_keepalive_interval=None, tcp_keepalive_count=None, tcp_user_timeout=None):
         # TODO next major rename host to endpoint and remove port kwarg.
         self.endpoint = host if isinstance(host, EndPoint) else DefaultEndPoint(host, port)
 
@@ -904,6 +950,27 @@ class Connection(object):
         self.orphaned_request_ids = set()
         self._on_orphaned_stream_released = on_orphaned_stream_released
         self._application_info = application_info
+
+        if tcp_fastopen_connect is not None:
+            self.tcp_fastopen_connect = tcp_fastopen_connect
+        if tcp_keepalive is not None:
+            self.tcp_keepalive = tcp_keepalive
+        if tcp_keepalive_idle is not None:
+            if isinstance(tcp_keepalive_idle, bool) or not isinstance(tcp_keepalive_idle, int) or tcp_keepalive_idle < 1:
+                raise ValueError("tcp_keepalive_idle must be a positive integer, got %r" % (tcp_keepalive_idle,))
+            self.tcp_keepalive_idle = tcp_keepalive_idle
+        if tcp_keepalive_interval is not None:
+            if isinstance(tcp_keepalive_interval, bool) or not isinstance(tcp_keepalive_interval, int) or tcp_keepalive_interval < 1:
+                raise ValueError("tcp_keepalive_interval must be a positive integer, got %r" % (tcp_keepalive_interval,))
+            self.tcp_keepalive_interval = tcp_keepalive_interval
+        if tcp_keepalive_count is not None:
+            if isinstance(tcp_keepalive_count, bool) or not isinstance(tcp_keepalive_count, int) or tcp_keepalive_count < 1:
+                raise ValueError("tcp_keepalive_count must be a positive integer, got %r" % (tcp_keepalive_count,))
+            self.tcp_keepalive_count = tcp_keepalive_count
+        if tcp_user_timeout is not None:
+            if isinstance(tcp_user_timeout, bool) or not isinstance(tcp_user_timeout, int) or tcp_user_timeout < 0:
+                raise ValueError("tcp_user_timeout must be a non-negative integer (milliseconds), got %r" % (tcp_user_timeout,))
+            self.tcp_user_timeout = tcp_user_timeout
 
         if ssl_options:
             self.ssl_options.update(self.endpoint.ssl_options or {})
@@ -1061,6 +1128,70 @@ class Connection(object):
 
         return addresses
 
+    def _apply_socket_options(self, address_family=None):
+        """
+        Apply user-supplied ``sockopts`` and built-in TCP tuning options
+        (TCP Fast Open, SO_KEEPALIVE with tuning, TCP_USER_TIMEOUT) to
+        ``self._socket``.  Called **before** ``connect()`` so that the
+        kernel can use them during handshake.
+
+        Options that are not supported on the running platform are silently
+        skipped (logged at DEBUG level).
+        """
+        sock = self._socket
+
+        # Skip TCP-specific options for AF_UNIX sockets.
+        if address_family is not None and hasattr(socket, 'AF_UNIX') and address_family == socket.AF_UNIX:
+            # Still apply user-supplied sockopts for AF_UNIX.
+            if self.sockopts:
+                for args in self.sockopts:
+                    sock.setsockopt(*args)
+            return
+
+        # --- TCP Fast Open (client-side) ---
+        if self.tcp_fastopen_connect:
+            if hasattr(socket, 'TCP_FASTOPEN_CONNECT'):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_FASTOPEN_CONNECT, 1)
+                except OSError as e:
+                    log.debug("Unable to set TCP_FASTOPEN_CONNECT: %s", e)
+
+        # --- SO_KEEPALIVE with tuning ---
+        if self.tcp_keepalive:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError as e:
+                log.debug("Unable to set SO_KEEPALIVE: %s", e)
+            else:
+                if hasattr(socket, 'TCP_KEEPIDLE'):
+                    try:
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, self.tcp_keepalive_idle)
+                    except OSError as e:
+                        log.debug("Unable to set TCP_KEEPIDLE: %s", e)
+                if hasattr(socket, 'TCP_KEEPINTVL'):
+                    try:
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, self.tcp_keepalive_interval)
+                    except OSError as e:
+                        log.debug("Unable to set TCP_KEEPINTVL: %s", e)
+                if hasattr(socket, 'TCP_KEEPCNT'):
+                    try:
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, self.tcp_keepalive_count)
+                    except OSError as e:
+                        log.debug("Unable to set TCP_KEEPCNT: %s", e)
+
+        # --- TCP_USER_TIMEOUT ---
+        if self.tcp_user_timeout is not None:
+            if hasattr(socket, 'TCP_USER_TIMEOUT'):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, self.tcp_user_timeout)
+                except OSError as e:
+                    log.debug("Unable to set TCP_USER_TIMEOUT: %s", e)
+
+        # User-supplied sockopts last so they can override any built-in option.
+        if self.sockopts:
+            for args in self.sockopts:
+                sock.setsockopt(*args)
+
     def _connect_socket(self):
         sockerr = None
         addresses = self._get_socket_addresses()
@@ -1068,6 +1199,7 @@ class Connection(object):
         for (af, socktype, proto, _, sockaddr) in addresses:
             try:
                 self._socket = self._socket_impl.socket(af, socktype, proto)
+                self._apply_socket_options(af)
                 if self.ssl_context:
                     self._socket = self._wrap_socket_from_context()
                 self._socket.settimeout(self.connect_timeout)
@@ -1095,10 +1227,6 @@ class Connection(object):
         if sockerr:
             raise socket.error(sockerr.errno, "Tried connecting to %s. Last error: %s" %
                                ([a[4] for a in addresses], sockerr.strerror or sockerr))
-
-        if self.sockopts:
-            for args in self.sockopts:
-                self._socket.setsockopt(*args)
 
     def _enable_compression(self):
         if self._compressor:

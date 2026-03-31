@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import socket
 import unittest
 from io import BytesIO
 import time
@@ -606,3 +607,293 @@ class TestShardawarePortGenerator(unittest.TestCase):
         second_run = list(itertools.islice(gen.generate(0, 2), 5))
 
         assert first_run == second_run
+
+
+class TestSocketOptions(unittest.TestCase):
+    """Unit tests for Connection._apply_socket_options()."""
+
+    def _make_conn(self, **overrides):
+        """Create a Connection without actually connecting."""
+        conn = object.__new__(Connection)
+        # Set defaults that _apply_socket_options expects
+        conn.sockopts = None
+        conn.tcp_fastopen_connect = False
+        conn.tcp_keepalive = False
+        conn.tcp_keepalive_idle = 30
+        conn.tcp_keepalive_interval = 5
+        conn.tcp_keepalive_count = 6
+        conn.tcp_user_timeout = None
+        for k, v in overrides.items():
+            setattr(conn, k, v)
+        conn._socket = Mock()
+        return conn
+
+    # --- TCP Fast Open ---
+
+    @patch.object(socket, 'TCP_FASTOPEN_CONNECT', 30, create=True)
+    def test_tfo_enabled(self):
+        conn = self._make_conn(tcp_fastopen_connect=True)
+        conn._apply_socket_options(socket.AF_INET)
+        conn._socket.setsockopt.assert_any_call(
+            socket.IPPROTO_TCP, socket.TCP_FASTOPEN_CONNECT, 1)
+
+    @patch.object(socket, 'TCP_FASTOPEN_CONNECT', 30, create=True)
+    def test_tfo_disabled(self):
+        conn = self._make_conn(tcp_fastopen_connect=False)
+        conn._apply_socket_options(socket.AF_INET)
+        calls = conn._socket.setsockopt.call_args_list
+        for c in calls:
+            self.assertNotEqual(c[0][1], socket.TCP_FASTOPEN_CONNECT)
+
+    def test_tfo_missing_constant(self):
+        """No error when TCP_FASTOPEN_CONNECT is absent from socket module."""
+        if hasattr(socket, 'TCP_FASTOPEN_CONNECT'):
+            saved = socket.TCP_FASTOPEN_CONNECT
+            delattr(socket, 'TCP_FASTOPEN_CONNECT')
+        else:
+            saved = None
+        try:
+            conn = self._make_conn()
+            conn._apply_socket_options(socket.AF_INET)  # should not raise
+        finally:
+            if saved is not None:
+                socket.TCP_FASTOPEN_CONNECT = saved
+
+    # --- SO_KEEPALIVE ---
+
+    def test_keepalive_enabled(self):
+        conn = self._make_conn(tcp_keepalive=True)
+        conn._apply_socket_options(socket.AF_INET)
+        conn._socket.setsockopt.assert_any_call(
+            socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    def test_keepalive_disabled(self):
+        conn = self._make_conn(tcp_keepalive=False)
+        conn._apply_socket_options(socket.AF_INET)
+        calls = conn._socket.setsockopt.call_args_list
+        for c in calls:
+            self.assertNotEqual(c[0][:2], (socket.SOL_SOCKET, socket.SO_KEEPALIVE))
+
+    @patch.object(socket, 'TCP_KEEPIDLE', 4, create=True)
+    @patch.object(socket, 'TCP_KEEPINTVL', 5, create=True)
+    @patch.object(socket, 'TCP_KEEPCNT', 6, create=True)
+    def test_keepalive_tuning(self):
+        conn = self._make_conn(tcp_keepalive=True, tcp_keepalive_idle=10, tcp_keepalive_interval=2, tcp_keepalive_count=3)
+        conn._apply_socket_options(socket.AF_INET)
+        conn._socket.setsockopt.assert_any_call(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+        conn._socket.setsockopt.assert_any_call(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+        conn._socket.setsockopt.assert_any_call(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+
+    # --- TCP_USER_TIMEOUT ---
+
+    @patch.object(socket, 'TCP_USER_TIMEOUT', 18, create=True)
+    def test_user_timeout_set(self):
+        conn = self._make_conn(tcp_fastopen_connect=False, tcp_keepalive=False, tcp_user_timeout=30000)
+        conn._apply_socket_options(socket.AF_INET)
+        conn._socket.setsockopt.assert_any_call(
+            socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, 30000)
+
+    @patch.object(socket, 'TCP_USER_TIMEOUT', 18, create=True)
+    def test_user_timeout_none_skipped(self):
+        conn = self._make_conn(tcp_user_timeout=None)
+        conn._apply_socket_options(socket.AF_INET)
+        calls = conn._socket.setsockopt.call_args_list
+        for c in calls:
+            if len(c[0]) >= 2:
+                self.assertNotEqual(c[0][1], socket.TCP_USER_TIMEOUT)
+
+    # --- AF_UNIX guard ---
+
+    @unittest.skipUnless(hasattr(socket, 'AF_UNIX'), 'AF_UNIX not available')
+    def test_af_unix_skips_tcp_options(self):
+        conn = self._make_conn(tcp_keepalive=True, tcp_user_timeout=5000)
+        conn._apply_socket_options(socket.AF_UNIX)
+        # Only sockopts (none here) should have been applied
+        conn._socket.setsockopt.assert_not_called()
+
+    # --- User sockopts applied ---
+
+    def test_user_sockopts_applied(self):
+        user_opts = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
+        conn = self._make_conn(sockopts=user_opts)
+        conn._apply_socket_options(socket.AF_INET)
+        conn._socket.setsockopt.assert_any_call(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    # --- OSError suppression ---
+
+    @patch.object(socket, 'TCP_FASTOPEN_CONNECT', 30, create=True)
+    def test_oserror_suppressed(self):
+        conn = self._make_conn(tcp_fastopen_connect=True, tcp_keepalive=True)
+        conn._socket.setsockopt.side_effect = OSError("not supported")
+        # Should not raise
+        conn._apply_socket_options(socket.AF_INET)
+
+
+class TestConnectionTcpValidation(unittest.TestCase):
+    """Validate Connection.__init__ rejects bad TCP option values."""
+
+    def test_keepalive_idle_bool(self):
+        with self.assertRaises(ValueError):
+            Connection.__new__(Connection).__init__('127.0.0.1', tcp_keepalive_idle=True)
+
+    def test_keepalive_interval_bool(self):
+        with self.assertRaises(ValueError):
+            Connection.__new__(Connection).__init__('127.0.0.1', tcp_keepalive_interval=False)
+
+    def test_keepalive_count_negative(self):
+        with self.assertRaises(ValueError):
+            Connection.__new__(Connection).__init__('127.0.0.1', tcp_keepalive_count=-1)
+
+    def test_user_timeout_bool(self):
+        with self.assertRaises(ValueError):
+            Connection.__new__(Connection).__init__('127.0.0.1', tcp_user_timeout=True)
+
+    def test_user_timeout_float(self):
+        with self.assertRaises(ValueError):
+            Connection.__new__(Connection).__init__('127.0.0.1', tcp_user_timeout=1.5)
+
+    def test_user_timeout_zero_allowed(self):
+        # Should not raise - validation runs before connect attempt
+        try:
+            Connection.__new__(Connection).__init__('127.0.0.1', tcp_user_timeout=0)
+        except ValueError:
+            self.fail("tcp_user_timeout=0 should be allowed")
+        except Exception:
+            pass  # Other errors (connection, etc.) are expected
+
+
+class TestClusterTcpOptions(unittest.TestCase):
+    """Unit tests for Cluster-level TCP option passthrough."""
+
+    def test_defaults_propagated(self):
+        c = Cluster(contact_points=[])
+        self.assertFalse(c.tcp_fastopen_connect)
+        self.assertFalse(c.tcp_keepalive)
+        self.assertEqual(c.tcp_keepalive_idle, 30)
+        self.assertEqual(c.tcp_keepalive_interval, 5)
+        self.assertEqual(c.tcp_keepalive_count, 6)
+        self.assertIsNone(c.tcp_user_timeout)
+
+    def test_custom_values(self):
+        c = Cluster(contact_points=[], tcp_keepalive_idle=60, tcp_user_timeout=15000)
+        self.assertEqual(c.tcp_keepalive_idle, 60)
+        self.assertEqual(c.tcp_user_timeout, 15000)
+
+    def test_make_connection_kwargs_passthrough(self):
+        c = Cluster(contact_points=[], tcp_keepalive_idle=45)
+        ep = DefaultEndPoint('127.0.0.1', 9042)
+        kw = c._make_connection_kwargs(ep, {})
+        self.assertEqual(kw['tcp_keepalive_idle'], 45)
+        self.assertFalse(kw['tcp_fastopen_connect'])
+
+    def test_tcp_user_timeout_derived_from_heartbeat(self):
+        c = Cluster(contact_points=[], idle_heartbeat_timeout=30)
+        ep = DefaultEndPoint('127.0.0.1', 9042)
+        kw = c._make_connection_kwargs(ep, {})
+        self.assertEqual(kw['tcp_user_timeout'], 30000)
+
+    def test_tcp_user_timeout_explicit_overrides_derivation(self):
+        c = Cluster(contact_points=[], idle_heartbeat_timeout=30, tcp_user_timeout=5000)
+        ep = DefaultEndPoint('127.0.0.1', 9042)
+        kw = c._make_connection_kwargs(ep, {})
+        self.assertEqual(kw['tcp_user_timeout'], 5000)
+
+    def test_tcp_user_timeout_not_derived_when_heartbeat_zero(self):
+        c = Cluster(contact_points=[], idle_heartbeat_timeout=0)
+        ep = DefaultEndPoint('127.0.0.1', 9042)
+        kw = c._make_connection_kwargs(ep, {})
+        self.assertIsNone(kw['tcp_user_timeout'])
+
+    def test_tcp_user_timeout_not_derived_when_heartbeat_interval_zero(self):
+        c = Cluster(contact_points=[], idle_heartbeat_interval=0, idle_heartbeat_timeout=30)
+        ep = DefaultEndPoint('127.0.0.1', 9042)
+        kw = c._make_connection_kwargs(ep, {})
+        self.assertIsNone(kw['tcp_user_timeout'])
+
+    def test_validation_keepalive_idle_negative(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_keepalive_idle=-1)
+
+    def test_validation_keepalive_idle_zero(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_keepalive_idle=0)
+
+    def test_validation_keepalive_idle_float(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_keepalive_idle=1.5)
+
+    def test_validation_keepalive_interval_negative(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_keepalive_interval=-1)
+
+    def test_validation_keepalive_count_zero(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_keepalive_count=0)
+
+    def test_validation_user_timeout_negative(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_user_timeout=-1)
+
+    def test_validation_user_timeout_zero_allowed(self):
+        c = Cluster(contact_points=[], tcp_user_timeout=0)
+        self.assertEqual(c.tcp_user_timeout, 0)
+
+    def test_validation_user_timeout_float(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_user_timeout=30.5)
+
+    def test_validation_keepalive_idle_bool(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_keepalive_idle=True)
+
+    def test_validation_keepalive_interval_bool(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_keepalive_interval=True)
+
+    def test_validation_keepalive_count_bool(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_keepalive_count=False)
+
+    def test_validation_user_timeout_bool(self):
+        with self.assertRaises(ValueError):
+            Cluster(contact_points=[], tcp_user_timeout=True)
+
+
+class TestSocketOptionsPrecedence(unittest.TestCase):
+    """Verify user sockopts override built-in TCP options."""
+
+    def _make_conn(self, **overrides):
+        conn = object.__new__(Connection)
+        conn.sockopts = None
+        conn.tcp_fastopen_connect = False
+        conn.tcp_keepalive = False
+        conn.tcp_keepalive_idle = 30
+        conn.tcp_keepalive_interval = 5
+        conn.tcp_keepalive_count = 6
+        conn.tcp_user_timeout = None
+        for k, v in overrides.items():
+            setattr(conn, k, v)
+        conn._socket = Mock()
+        return conn
+
+    def test_user_sockopts_override_builtin_keepalive(self):
+        """User SO_KEEPALIVE=0 should override built-in SO_KEEPALIVE=1."""
+        user_opts = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 0)]
+        conn = self._make_conn(tcp_keepalive=True, sockopts=user_opts)
+        conn._apply_socket_options(socket.AF_INET)
+        # Last call with SO_KEEPALIVE should be the user's (0), not built-in (1)
+        keepalive_calls = [
+            c for c in conn._socket.setsockopt.call_args_list
+            if len(c[0]) >= 2 and c[0][0] == socket.SOL_SOCKET and c[0][1] == socket.SO_KEEPALIVE
+        ]
+        self.assertTrue(len(keepalive_calls) >= 2, "Expected both built-in and user SO_KEEPALIVE calls")
+        self.assertEqual(keepalive_calls[-1][0][2], 0, "User sockopt should be last and win")
+
+    @unittest.skipUnless(hasattr(socket, 'AF_UNIX'), 'AF_UNIX not available')
+    def test_user_sockopts_still_applied_for_af_unix(self):
+        """Even AF_UNIX should get user sockopts applied."""
+        user_opts = [(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)]
+        conn = self._make_conn(sockopts=user_opts)
+        conn._apply_socket_options(socket.AF_UNIX)
+        conn._socket.setsockopt.assert_called_once_with(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+

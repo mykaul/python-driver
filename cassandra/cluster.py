@@ -886,6 +886,51 @@ class Cluster(object):
     To try with your own workload, set ``sockopts = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]``
     """
 
+
+    tcp_fastopen_connect = False
+    """
+    When ``True``, enable TCP Fast Open for outgoing connections.
+    This allows data to be sent during the TCP handshake, reducing latency
+    for connection establishment. Requires Linux 4.11+ (client-side).
+    Silently ignored on platforms that do not support ``TCP_FASTOPEN_CONNECT``.
+    """
+
+    tcp_keepalive = False
+    """
+    When ``True``, enable ``SO_KEEPALIVE`` on connections and tune
+    the keepalive interval/count parameters when the platform supports them
+    (``TCP_KEEPIDLE``, ``TCP_KEEPINTVL``, ``TCP_KEEPCNT``).
+    """
+
+    tcp_keepalive_idle = 30
+    """
+    Seconds of idle time before the first keepalive probe is sent.
+    Only meaningful when :attr:`tcp_keepalive` is ``True``.
+    Default ``30`` (matches :attr:`~.Cluster.idle_heartbeat_interval`).
+    """
+
+    tcp_keepalive_interval = 5
+    """
+    Seconds between successive keepalive probes after the initial probe.
+    Only meaningful when :attr:`tcp_keepalive` is ``True``. Default ``5``.
+    """
+
+    tcp_keepalive_count = 6
+    """
+    Number of unacknowledged keepalive probes before the connection is
+    considered dead. Only meaningful when :attr:`tcp_keepalive` is ``True``.
+    Default ``6``.
+    """
+
+    tcp_user_timeout = None
+    """
+    Value in **milliseconds** for ``TCP_USER_TIMEOUT`` (Linux 2.6.37+).
+    When set, the kernel will abort a connection if transmitted data remains
+    unacknowledged for this long. ``None`` (default) means the driver will
+    derive a value from ``idle_heartbeat_timeout * 1000``; set an explicit
+    integer to override.
+    """
+
     max_schema_agreement_wait = 10
     """
     The maximum duration (in seconds) that the driver will wait for schema
@@ -1217,7 +1262,9 @@ class Cluster(object):
                  metadata_request_timeout: Optional[float] = None,
                  column_encryption_policy=None,
                  application_info:Optional[ApplicationInfoBase]=None,
-                 client_routes_config:Optional[ClientRoutesConfig]=None
+                 client_routes_config:Optional[ClientRoutesConfig]=None,
+                 tcp_fastopen_connect=None, tcp_keepalive=None, tcp_keepalive_idle=None,
+                 tcp_keepalive_interval=None, tcp_keepalive_count=None, tcp_user_timeout=None,
                  ):
         """
         ``executor_threads`` defines the number of threads in a pool for handling asynchronous tasks such as
@@ -1462,6 +1509,27 @@ class Cluster(object):
         self.ssl_options = ssl_options
         self.ssl_context = ssl_context
         self.sockopts = sockopts
+
+        if tcp_fastopen_connect is not None:
+            self.tcp_fastopen_connect = tcp_fastopen_connect
+        if tcp_keepalive is not None:
+            self.tcp_keepalive = tcp_keepalive
+        if tcp_keepalive_idle is not None:
+            if isinstance(tcp_keepalive_idle, bool) or not isinstance(tcp_keepalive_idle, int) or tcp_keepalive_idle < 1:
+                raise ValueError("tcp_keepalive_idle must be a positive integer, got %r" % (tcp_keepalive_idle,))
+            self.tcp_keepalive_idle = tcp_keepalive_idle
+        if tcp_keepalive_interval is not None:
+            if isinstance(tcp_keepalive_interval, bool) or not isinstance(tcp_keepalive_interval, int) or tcp_keepalive_interval < 1:
+                raise ValueError("tcp_keepalive_interval must be a positive integer, got %r" % (tcp_keepalive_interval,))
+            self.tcp_keepalive_interval = tcp_keepalive_interval
+        if tcp_keepalive_count is not None:
+            if isinstance(tcp_keepalive_count, bool) or not isinstance(tcp_keepalive_count, int) or tcp_keepalive_count < 1:
+                raise ValueError("tcp_keepalive_count must be a positive integer, got %r" % (tcp_keepalive_count,))
+            self.tcp_keepalive_count = tcp_keepalive_count
+        if tcp_user_timeout is not None:
+            if isinstance(tcp_user_timeout, bool) or not isinstance(tcp_user_timeout, int) or tcp_user_timeout < 0:
+                raise ValueError("tcp_user_timeout must be a non-negative integer (milliseconds), got %r" % (tcp_user_timeout,))
+            self.tcp_user_timeout = tcp_user_timeout
         self.cql_version = cql_version
         self.max_schema_agreement_wait = max_schema_agreement_wait
         self.control_connection_timeout = control_connection_timeout
@@ -1712,6 +1780,15 @@ class Cluster(object):
         kwargs_dict.setdefault('allow_beta_protocol_version', self.allow_beta_protocol_version)
         kwargs_dict.setdefault('no_compact', self.no_compact)
         kwargs_dict.setdefault('application_info', self.application_info)
+        kwargs_dict.setdefault('tcp_fastopen_connect', self.tcp_fastopen_connect)
+        kwargs_dict.setdefault('tcp_keepalive', self.tcp_keepalive)
+        kwargs_dict.setdefault('tcp_keepalive_idle', self.tcp_keepalive_idle)
+        kwargs_dict.setdefault('tcp_keepalive_interval', self.tcp_keepalive_interval)
+        kwargs_dict.setdefault('tcp_keepalive_count', self.tcp_keepalive_count)
+        tcp_user_timeout = self.tcp_user_timeout
+        if tcp_user_timeout is None and self.idle_heartbeat_interval and self.idle_heartbeat_timeout:
+            tcp_user_timeout = int(self.idle_heartbeat_timeout * 1000)
+        kwargs_dict.setdefault('tcp_user_timeout', tcp_user_timeout)
 
         return kwargs_dict
 
