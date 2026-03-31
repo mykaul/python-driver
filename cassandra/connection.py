@@ -874,8 +874,9 @@ class Connection(object):
     """
     When ``True``, enable TCP Fast Open for outgoing connections.
     This allows data to be sent during the TCP handshake, reducing latency
-    for connection establishment. Requires Linux 4.11+ (client-side).
-    Silently ignored on platforms that do not support ``TCP_FASTOPEN_CONNECT``.
+    for connection establishment. Currently effective only on Linux 4.11+
+    (``TCP_FASTOPEN_CONNECT``). Silently ignored on other platforms and
+    older kernels.
     """
 
     tcp_keepalive = False
