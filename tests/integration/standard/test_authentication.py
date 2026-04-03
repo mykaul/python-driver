@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 from packaging.version import Version
 import logging
 import time
@@ -38,18 +40,34 @@ def setup_module():
         use_singledc(start=False)
         ccm_cluster = get_cluster()
         ccm_cluster.stop()
-        config_options = {'authenticator': 'PasswordAuthenticator',
-                          'authorizer': 'CassandraAuthorizer'}
+        config_options = {
+            'authenticator': 'PasswordAuthenticator',
+            'authorizer': 'CassandraAuthorizer',
+            'auth_superuser_name': 'cassandra',
+            'auth_superuser_salted_password': '$6$x7IFjiX5VCpvNiFk$2IfjTvSyGL7zerpV.wbY7mJjaRCrJ/68dtT3UpT.sSmNYz1bPjtn3mH.kJKFvaZ2T4SbVeBijjmwGjcb83LlV/'
+        }
         ccm_cluster.set_configuration_options(config_options)
         log.debug("Starting ccm test cluster with %s", config_options)
         start_cluster_wait_for_up(ccm_cluster)
 
     # PYTHON-1328
     #
-    # Give the cluster enough time to startup (and perform necessary initialization)
-    # before executing the test.
+    # Wait for PasswordAuthenticator to finish initializing (creating the
+    # default superuser). Poll by attempting to authenticate rather than
+    # using a fixed sleep.
     if CASSANDRA_VERSION > Version('4.0-a'):
-        time.sleep(10)
+        from tests.util import wait_until_not_raised
+
+        def _check_auth_ready():
+            cluster = TestCluster(protocol_version=PROTOCOL_VERSION,
+                                  auth_provider=PlainTextAuthProvider('cassandra', 'cassandra'))
+            try:
+                session = cluster.connect()
+                session.execute("SELECT * FROM system.local WHERE key='local'")
+            finally:
+                cluster.shutdown()
+
+        wait_until_not_raised(_check_auth_ready, delay=1, max_attempts=30)
 
 def teardown_module():
     remove_cluster()  # this test messes with config
