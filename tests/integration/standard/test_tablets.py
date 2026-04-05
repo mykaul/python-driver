@@ -1,11 +1,10 @@
-import time
-
 import pytest
 
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
 from cassandra.policies import ConstantReconnectionPolicy, RoundRobinPolicy, TokenAwarePolicy
 
 from tests.integration import PROTOCOL_VERSION, use_cluster, get_cluster
+from tests.util import wait_until
 from tests.unit.test_host_connection_pool import LOGGER
 
 
@@ -28,7 +27,7 @@ class TestTabletsIntegration:
         cls.cluster.shutdown()
 
     def verify_hosts_in_tracing(self, results, expected):
-        traces = results.get_query_trace()
+        traces = results.get_query_trace(max_wait_sec=10)
         events = traces.events
         host_set = set()
         for event in events:
@@ -54,7 +53,7 @@ class TestTabletsIntegration:
         return metadata._tablets.get_tablet_for_key(query.keyspace, query.table, metadata.token_map.token_class.from_key(query.routing_key))
 
     def verify_same_shard_in_tracing(self, results):
-        traces = results.get_query_trace()
+        traces = results.get_query_trace(max_wait_sec=10)
         events = traces.events
         shard_set = set()
         for event in events:
@@ -212,7 +211,10 @@ class TestTabletsIntegration:
         def drop_ks(_):
             # Drop and recreate ks and table to trigger tablets invalidation
             self.create_ks_and_cf(self.cluster.connect())
-            time.sleep(3)
+            # Wait for tablet metadata to be refreshed
+            wait_until(
+                lambda: 'test1' in self.cluster.metadata.keyspaces,
+                delay=0.5, max_attempts=20)
 
         self.run_tablets_invalidation_test(drop_ks)
 
@@ -233,7 +235,12 @@ class TestTabletsIntegration:
                 break
             else:
                 assert False, "failed to find node to decommission"
-            time.sleep(10)
+            # Wait for decommission to complete and metadata to update
+            wait_until(
+                lambda: len([h for h in self.cluster.metadata.all_hosts() if h.is_up]) < 3,
+                delay=1, max_attempts=60)
+            # Tablet metadata invalidation may take additional time to propagate;
+            # run_tablets_invalidation_test will poll for the expected result.
 
         self.run_tablets_invalidation_test(decommission_non_cc_node)
 
@@ -257,5 +264,7 @@ class TestTabletsIntegration:
 
         invalidate(rec)
 
-        # Check if tablets information was purged
-        assert self.get_tablet_record(bound) is None, "tablet was not deleted, invalidation did not work"
+        # Wait for tablets information to be purged (invalidation is async)
+        wait_until(
+            lambda: self.get_tablet_record(bound) is None,
+            delay=0.5, max_attempts=20)
