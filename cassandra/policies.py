@@ -307,21 +307,7 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
         return HostDistance.IGNORED
 
     def make_query_plan(self, working_keyspace=None, query=None):
-        # not thread-safe, but we don't care much about lost increments
-        # for the purposes of load balancing
-        pos = self._position
-        self._position += 1
-
-        local_live = self._dc_live_hosts.get(self.local_dc, ())
-        length = len(local_live)
-        if length:
-            pos %= length
-            for i in range(length):
-                yield local_live[(pos + i) % length]
-
-        remote_hosts = self._remote_hosts
-        for host in remote_hosts:
-            yield host
+        return self.make_query_plan_with_exclusion(working_keyspace, query)
 
     def make_query_plan_with_exclusion(self, working_keyspace=None, query=None, excluded=()):
         # not thread-safe, but we don't care much about lost increments
@@ -331,13 +317,14 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
 
         local_live = self._dc_live_hosts.get(self.local_dc, ())
         length = len(local_live)
-        remote_hosts = self._remote_hosts
         if not excluded:
             if length:
                 pos %= length
                 for i in range(length):
                     yield local_live[(pos + i) % length]
-            for host in remote_hosts:
+            # Read remote_hosts lazily after yielding all local hosts,
+            # so concurrent on_up/on_down changes are visible.
+            for host in self._remote_hosts:
                 yield host
             return
 
@@ -352,7 +339,7 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
                     continue
                 yield host
 
-        for host in remote_hosts:
+        for host in self._remote_hosts:
             if host in excluded:
                 continue
             yield host
@@ -430,7 +417,7 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
         self._live_hosts = {}
         self._dc_live_hosts = {}
         self._remote_hosts = {}
-        self._non_local_rack_hosts = []
+        self._non_local_rack_hosts = ()
         self._endpoints = []
         self._position = 0
         LoadBalancingPolicy.__init__(self)
@@ -455,9 +442,9 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
 
     def _refresh_non_local_rack_hosts(self):
         local_live = self._dc_live_hosts.get(self.local_dc, ())
-        self._non_local_rack_hosts = [
+        self._non_local_rack_hosts = tuple(
             h for h in local_live if self._rack(h) != self.local_rack
-        ]
+        )
 
     def populate(self, cluster, hosts):
         for (dc, rack), rack_hosts in groupby(hosts, lambda host: (self._dc(host), self._rack(host))):
@@ -482,26 +469,7 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
         return HostDistance.IGNORED
 
     def make_query_plan(self, working_keyspace=None, query=None):
-        pos = self._position
-        self._position += 1
-
-        local_rack_live = self._live_hosts.get((self.local_dc, self.local_rack), ())
-        length = len(local_rack_live)
-        if length:
-            p = pos % length
-            for i in range(length):
-                yield local_rack_live[(p + i) % length]
-
-        local_non_rack = self._non_local_rack_hosts
-        length = len(local_non_rack)
-        if length:
-            p = pos % length
-            for i in range(length):
-                yield local_non_rack[(p + i) % length]
-
-        remote_hosts = self._remote_hosts
-        for host in remote_hosts:
-            yield host
+        return self.make_query_plan_with_exclusion(working_keyspace, query)
 
     def make_query_plan_with_exclusion(self, working_keyspace=None, query=None, excluded=()):
         pos = self._position
@@ -509,7 +477,6 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
 
         local_rack_live = self._live_hosts.get((self.local_dc, self.local_rack), ())
         length = len(local_rack_live)
-        remote_hosts = self._remote_hosts
         if not excluded:
             if length:
                 p = pos % length
@@ -523,7 +490,9 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
                 for i in range(length):
                     yield local_non_rack[(p + i) % length]
 
-            for host in remote_hosts:
+            # Read remote_hosts lazily after yielding all local hosts,
+            # so concurrent on_up/on_down changes are visible.
+            for host in self._remote_hosts:
                 yield host
             return
 
@@ -548,7 +517,7 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
                     continue
                 yield host
 
-        for host in remote_hosts:
+        for host in self._remote_hosts:
             if host in excluded:
                 continue
             yield host
@@ -617,7 +586,7 @@ class TokenAwarePolicy(LoadBalancingPolicy):
     If no :attr:`~.Statement.routing_key` is set on the query, the child
     policy's query plan will be used as is.
 
-    An LRU cache of size :attr:`cache_replicas_size` (default 1024) avoids
+    An LRU cache of size :attr:`cache_replicas_size` (default 256) avoids
     repeated token-to-replica lookups for the same (keyspace, routing_key)
     pair.  Set to 0 to disable caching.  The cache is automatically
     invalidated when the cluster topology changes.
@@ -630,7 +599,7 @@ class TokenAwarePolicy(LoadBalancingPolicy):
     Yield local replicas in a random order.
     """
 
-    def __init__(self, child_policy, shuffle_replicas=True, cache_replicas_size=1024):
+    def __init__(self, child_policy, shuffle_replicas=True, cache_replicas_size=256):
         super().__init__()
         self._child_policy = child_policy
         self.shuffle_replicas = shuffle_replicas
@@ -779,12 +748,16 @@ class TokenAwarePolicy(LoadBalancingPolicy):
             # (local_rack -> local -> remote), so we can stream directly.
             # For other child policies we must re-sort by distance.
             if isinstance(child, (DCAwareRoundRobinPolicy, RackAwareRoundRobinPolicy)):
-                yield from child.make_query_plan_with_exclusion(keyspace, query, yielded)
+                for host in child.make_query_plan_with_exclusion(keyspace, query, yielded):
+                    if host.is_up:
+                        yield host
             else:
                 remaining_local_rack = []
                 remaining_local = []
                 remaining_remote = []
                 for host in child.make_query_plan_with_exclusion(keyspace, query, yielded):
+                    if not host.is_up:
+                        continue
                     d = child_distance(host)
                     if d == HostDistance.LOCAL_RACK:
                         remaining_local_rack.append(host)
