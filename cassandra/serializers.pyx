@@ -220,7 +220,25 @@ cdef class SerVectorType(Serializer):
 
     cpdef bytes serialize(self, object value, int protocol_version):
         cdef object result
-        cdef Py_ssize_t v_length = len(value)
+        cdef Py_ssize_t v_length
+
+        # ---- bytes / bytearray passthrough ----
+        # If the caller already holds a correctly-sized blob (e.g. from
+        # VectorType.serialize_numpy_bulk), skip all conversion work.
+        if isinstance(value, (bytes, bytearray)):
+            v_length = len(value)
+            if self.type_code == 1 and v_length == self.vector_size * 4:
+                return value if isinstance(value, bytes) else bytes(value)
+            elif self.type_code == 2 and v_length == self.vector_size * 8:
+                return value if isinstance(value, bytes) else bytes(value)
+            elif self.type_code == 3 and v_length == self.vector_size * 4:
+                return value if isinstance(value, bytes) else bytes(value)
+            raise ValueError(
+                "Pre-serialized bytes have wrong length %d for vector of type "
+                "%s and dimension %d" % (
+                    v_length, self.subtype.typename, self.vector_size))
+
+        v_length = len(value)
         if v_length != self.vector_size:
             raise ValueError(
                 "Expected sequence of size %d for vector of type %s and "

@@ -1,0 +1,3 @@
+[
+  {"variant": "C", "label": "scylla-driver (enhanced), execute_concurrent, numpy bulk", "rows": 500000, "elapsed_sec": 33.38, "rows_per_sec": 14978.8}
+]
