@@ -761,6 +761,10 @@ class TokenAwarePolicy(LoadBalancingPolicy):
                             replica_dict = tablet._replica_dict
                             child_plan = child.make_query_plan(keyspace, query)
                             replicas = [host for host in child_plan if host.host_id in replica_dict]
+                            # Stash the tablet so that downstream shard-aware
+                            # connection selection can reuse it instead of
+                            # repeating the bisect lookup.
+                            query._tablet = tablet
 
                     if not replicas:
                         try:
