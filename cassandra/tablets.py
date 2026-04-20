@@ -57,6 +57,9 @@ class Tablets(object):
         }
         self._lock = Lock()
 
+    def __bool__(self):
+        return bool(self._tablets)
+
     def table_has_tablets(self, keyspace, table) -> bool:
         return bool(self._tablets.get((keyspace, table), []))
 
