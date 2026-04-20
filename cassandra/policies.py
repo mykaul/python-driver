@@ -758,9 +758,9 @@ class TokenAwarePolicy(LoadBalancingPolicy):
                         tablet = cluster_metadata._tablets.get_tablet_for_key(
                             keyspace, query.table, token)
                         if tablet is not None:
-                            replicas_mapped = {r[0] for r in tablet.replicas}
+                            replica_dict = tablet._replica_dict
                             child_plan = child.make_query_plan(keyspace, query)
-                            replicas = [host for host in child_plan if host.host_id in replicas_mapped]
+                            replicas = [host for host in child_plan if host.host_id in replica_dict]
 
                     if not replicas:
                         try:
