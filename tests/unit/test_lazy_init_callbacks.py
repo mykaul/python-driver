@@ -56,7 +56,8 @@ class TestLazyInitCallbacks(unittest.TestCase):
         # Should not raise
         rf._set_final_result("some result")
         self.assertEqual(rf._final_result, "some result")
-        self.assertTrue(rf._event.is_set())
+        # With lazy Event, _event stays None when result() is never called
+        self.assertIsNone(rf._event)
 
     def test_set_final_exception_no_errbacks(self):
         """_set_final_exception should work when _errbacks is None."""
@@ -66,7 +67,7 @@ class TestLazyInitCallbacks(unittest.TestCase):
         # Should not raise
         rf._set_final_exception(exc)
         self.assertIs(rf._final_exception, exc)
-        self.assertTrue(rf._event.is_set())
+        self.assertIsNone(rf._event)
 
     def test_set_final_result_with_callbacks(self):
         """_set_final_result should invoke registered callbacks."""
