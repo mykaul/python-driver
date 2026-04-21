@@ -15,21 +15,21 @@ BENCH_SCRIPT="$SCRIPT_DIR/bench_ingest.py"
 
 HOST="127.0.0.1"
 PORT=9042
-BATCH_SIZE=100
-MAX_ROWS=0
-CONCURRENCY=0
+MAX_ROWS=100000
+CONCURRENCY=1000
+RUNS=3
 DIM=768
 CLIENT_CPUSET="4-5"
 DATASET_DIR="$HOME/vector_bench/dataset/cohere/cohere_medium_1m"
-VARIANTS="A,B,C,D"
+VARIANTS="A,A2,B,C,E"
 RESULTS_FILE="$SCRIPT_DIR/results.json"
 
 for arg in "$@"; do
     case "$arg" in
         --variants=*)    VARIANTS="${arg#*=}" ;;
-        --batch-size=*)  BATCH_SIZE="${arg#*=}" ;;
         --max-rows=*)    MAX_ROWS="${arg#*=}" ;;
         --concurrency=*) CONCURRENCY="${arg#*=}" ;;
+        --runs=*)        RUNS="${arg#*=}" ;;
         --client-cpuset=*) CLIENT_CPUSET="${arg#*=}" ;;
         --host=*)        HOST="${arg#*=}" ;;
         --port=*)        PORT="${arg#*=}" ;;
@@ -41,22 +41,28 @@ done
 # Map variant -> venv
 venv_for_variant() {
     case "$1" in
-        A) echo "$SCRIPT_DIR/venv-baseline" ;;
-        B) echo "$SCRIPT_DIR/venv-enhanced" ;;
-        C) echo "$SCRIPT_DIR/venv-enhanced" ;;
-        D) echo "$SCRIPT_DIR/venv-rs-driver" ;;
-        F) echo "$SCRIPT_DIR/venv-enhanced-ft" ;;
+        A)  echo "$SCRIPT_DIR/venv-baseline" ;;
+        A2) echo "$SCRIPT_DIR/venv-baseline" ;;
+        A3) echo "$SCRIPT_DIR/venv-baseline" ;;
+        B)  echo "$SCRIPT_DIR/venv-enhanced" ;;
+        C)  echo "$SCRIPT_DIR/venv-enhanced" ;;
+        D)  echo "$SCRIPT_DIR/venv-rs-driver" ;;
+        E)  echo "$SCRIPT_DIR/venv-enhanced" ;;
+        F)  echo "$SCRIPT_DIR/venv-enhanced-ft" ;;
         *) echo "ERROR: unknown variant $1" >&2; exit 1 ;;
     esac
 }
 
 variant_label() {
     case "$1" in
-        A) echo "scylla-driver (master), execute_concurrent" ;;
-        B) echo "scylla-driver (enhanced), execute_concurrent, list[float]" ;;
-        C) echo "scylla-driver (enhanced), execute_concurrent, numpy" ;;
-        D) echo "python-rs-driver, asyncio.gather" ;;
-        F) echo "scylla-driver (enhanced), free-threaded, numpy" ;;
+        A)  echo "scylla-driver (master), execute_concurrent, list[float]" ;;
+        A2) echo "scylla-driver (master), execute_concurrent, numpy" ;;
+        A3) echo "scylla-driver (master), decoupled executor, numpy" ;;
+        B)  echo "scylla-driver (enhanced), execute_concurrent, list[float]" ;;
+        C)  echo "scylla-driver (enhanced), execute_concurrent, numpy" ;;
+        D)  echo "python-rs-driver, asyncio.gather" ;;
+        E)  echo "scylla-driver (enhanced), decoupled executor, numpy" ;;
+        F)  echo "scylla-driver (enhanced), free-threaded, numpy" ;;
     esac
 }
 
@@ -106,8 +112,9 @@ echo "============================================================"
 echo " Vector Ingestion Benchmark"
 echo "============================================================"
 echo " Dataset:    Cohere 768-dim, 1M vectors"
-echo " Batch size: $BATCH_SIZE"
-echo " Max rows:   $MAX_ROWS (0 = all)"
+echo " Max rows:   $MAX_ROWS"
+echo " Concurrency:$CONCURRENCY"
+echo " Runs:       $RUNS"
 echo " Client CPU: $CLIENT_CPUSET"
 echo " Host:       $HOST:$PORT"
 echo " Variants:   $VARIANTS"
@@ -136,14 +143,20 @@ for v in "${VARIANT_LIST[@]}"; do
     echo " Variant $v: $label"
     echo "------------------------------------------------------------"
 
-    if ! result=$(taskset -c "$CLIENT_CPUSET" env $env_prefix $python_bin "$BENCH_SCRIPT" \
+    # -I (isolated mode) removes '' from sys.path so that the local
+    # cassandra/ package in the repo root does not shadow the pip-installed
+    # driver in site-packages.  This is critical for baseline variants (A)
+    # where we want stock master code, not the enhanced branch.
+    # Editable installs (enhanced venvs) use a custom path hook that
+    # survives -I, so they still load from the working tree correctly.
+    if ! result=$(taskset -c "$CLIENT_CPUSET" env $env_prefix $python_bin -I "$BENCH_SCRIPT" \
         --variant "$v" \
         --host "$HOST" \
         --port "$PORT" \
         --dataset-dir "$DATASET_DIR" \
-        --batch-size "$BATCH_SIZE" \
         --max-rows "$MAX_ROWS" \
         --concurrency "$CONCURRENCY" \
+        --runs "$RUNS" \
         --dim "$DIM" \
     ); then
         echo "  ERROR: Variant $v failed (exit code $?). Skipping."
@@ -204,17 +217,18 @@ if not results:
     print("No results to display.")
     sys.exit(0)
 
-baseline_rps = results[0]["rows_per_sec"]
+baseline_rps = results[0]["avg"]
 
-print(f"{'Variant':<45} | {'Rows/sec':>10} | {'Total Time':>10} | {'vs Baseline':>11}")
-print(f"{'-'*45}-+-{'-'*10}-+-{'-'*10}-+-{'-'*11}")
+print(f"{'Variant':<55} | {'Best':>8} | {'Avg':>8} | {'Worst':>8} | {'vs Baseline':>11}")
+print(f"{'-'*55}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*11}")
 
 for r in results:
     variant = f"{r['variant']}: {r['label']}"
-    rps = r["rows_per_sec"]
-    elapsed = r["elapsed_sec"]
-    speedup = rps / baseline_rps if baseline_rps > 0 else 0
-    print(f"{variant:<45} | {rps:>10,.0f} | {elapsed:>8.1f}s  | {speedup:>9.2f}x")
+    best = r["best"]
+    avg = r["avg"]
+    worst = r["worst"]
+    speedup = avg / baseline_rps if baseline_rps > 0 else 0
+    print(f"{variant:<55} | {best:>8,.0f} | {avg:>8,.0f} | {worst:>8,.0f} | {speedup:>9.2f}x")
 
 print()
 print(f"Results saved to: {results_file}")

@@ -5,16 +5,19 @@ Measures insert throughput (rows/sec) for a given driver variant against a
 ScyllaDB cluster with vector-search support.
 
 Variants:
-    A  -- scylla-driver (stock/master), BatchStatement, list[float]
-    B  -- scylla-driver (enhanced), BatchStatement, numpy bulk serialization
-    C  -- scylla-driver (enhanced), concurrent execute_async, numpy bulk
+    A  -- scylla-driver (stock/master), execute_concurrent, list[float]
+    A2 -- scylla-driver (stock/master), execute_concurrent, numpy
+    B  -- scylla-driver (enhanced), execute_concurrent, list[float]
+    C  -- scylla-driver (enhanced), execute_concurrent, numpy bulk
     D  -- python-rs-driver (Rust-backed), asyncio.gather
+    E  -- scylla-driver (enhanced), decoupled executor, numpy bulk
+    F  -- scylla-driver (enhanced), free-threaded, execute_concurrent, numpy
 
 Usage:
-    python bench_ingest.py --variant A|B|C|D \
+    python bench_ingest.py --variant A|A2|B|C|D|E|F \
         --host 127.0.0.1 --port 9042 \
-        --dataset-dir /tmp/vectordb_bench/dataset/cohere/cohere_medium_1m \
-        --dim 768 --batch-size 100
+        --dataset-dir ~/vector_bench/dataset/cohere/cohere_medium_1m \
+        --dim 768 --concurrency 1000 --max-rows 100000 --runs 3
 """
 
 from __future__ import annotations
@@ -55,6 +58,8 @@ def _wait_for_shard_connections(session, timeout=10):
 KEYSPACE = "vdb_bench"
 TABLE = "vdb_bench_collection"
 
+PROGRESS_INTERVAL = 10_000  # print progress every N rows
+
 
 def cql_create_keyspace():
     return (
@@ -77,266 +82,85 @@ def cql_create_table(dim: int):
 CQL_TRUNCATE = f"TRUNCATE {KEYSPACE}.{TABLE}"
 CQL_INSERT = f"INSERT INTO {KEYSPACE}.{TABLE} (id, vector) VALUES (?, ?)"
 
-PROGRESS_INTERVAL = 10_000  # print progress every N rows
-
-
-def _should_report(total: int, prev_reported: int) -> bool:
-    """Return True when we've crossed a PROGRESS_INTERVAL boundary."""
-    return total // PROGRESS_INTERVAL > prev_reported // PROGRESS_INTERVAL
-
 
 # ---------------------------------------------------------------------------
-# Variant A: scylla-driver (stock), BatchStatement, list[float]
+# Data loading helpers
 # ---------------------------------------------------------------------------
 
-def run_variant_a(host: str, port: int, dataset_dir: str, batch_size: int, dim: int, max_rows: int = 0, concurrency: int = 0):
-    from cassandra import ConsistencyLevel
-    from cassandra.cluster import Cluster
-    from cassandra.concurrent import execute_concurrent_with_args
-
-    conc = concurrency if concurrency > 0 else 1000
-    cluster = Cluster([host], port=port, compression=False)
-    session = cluster.connect()
-
-    session.execute(cql_create_keyspace())
-    session.set_keyspace(KEYSPACE)
-    session.execute(cql_create_table(dim))
-    session.execute(CQL_TRUNCATE)
-
-    prepared = session.prepare(CQL_INSERT)
-    prepared.consistency_level = ConsistencyLevel.ONE
-
-    n_conns = _wait_for_shard_connections(session)
-    print(f"  shard connections: {n_conns}", file=sys.stderr)
-
+def load_params_pylist(dataset_dir: str, dim: int, max_rows: int):
+    """Load parameters as list[float] via to_pylist() -- the slow path."""
     pf = ParquetFile(f"{dataset_dir}/shuffle_train.parquet")
+    all_params = []
     total = 0
-    t0 = time.perf_counter()
-
-    for batch in pf.iter_batches(conc):
+    for batch in pf.iter_batches(min(max_rows, 10000)):
         ids = batch.column("id").to_pylist()
         embeddings = batch.column("emb").to_pylist()
-
-        params = list(zip(ids, embeddings))
-        execute_concurrent_with_args(session, prepared, params,
-                                     concurrency=conc,
-                                     raise_on_first_error=True)
-
-        prev = total
+        all_params.extend(zip(ids, embeddings))
         total += len(ids)
-        if _should_report(total, prev):
-            elapsed = time.perf_counter() - t0
-            print(f"  [{total:>8,} rows] {total/elapsed:,.0f} rows/sec", file=sys.stderr)
         if max_rows > 0 and total >= max_rows:
             break
+    return all_params[:max_rows] if max_rows > 0 else all_params
 
-    elapsed = time.perf_counter() - t0
-    cluster.shutdown()
-    return total, elapsed
+
+def load_params_numpy(dataset_dir: str, dim: int, max_rows: int):
+    """Load parameters as numpy arrays -- zero-copy from Arrow."""
+    import numpy as np
+    pf = ParquetFile(f"{dataset_dir}/shuffle_train.parquet")
+    batch = next(pf.iter_batches(max_rows))
+    ids = batch.column("id").to_pylist()
+    emb_col = batch.column("emb")
+    arr = np.frombuffer(emb_col.values.buffers()[1], dtype=np.float32).reshape(-1, dim)
+    n = min(len(ids), max_rows) if max_rows > 0 else len(ids)
+    return [(ids[i], arr[i]) for i in range(n)]
 
 
 # ---------------------------------------------------------------------------
-# Variant B: scylla-driver (enhanced), execute_concurrent, list[float] (to_pylist)
+# Ingestion functions
+#
+# Each returns (total_rows, elapsed_seconds) for a single run.
+# They receive a pre-connected session, prepared statement, and pre-loaded
+# params list.  The caller handles schema setup, truncation, warmup, and
+# multiple runs.
 # ---------------------------------------------------------------------------
 
-def run_variant_b(host: str, port: int, dataset_dir: str, batch_size: int, dim: int, max_rows: int = 0, concurrency: int = 0):
-    from cassandra import ConsistencyLevel
-    from cassandra.cluster import Cluster
+def ingest_execute_concurrent(session, prepared, params, concurrency):
+    """Ingest using execute_concurrent_with_args (variants A, A2, B, C, F)."""
     from cassandra.concurrent import execute_concurrent_with_args
 
-    conc = concurrency if concurrency > 0 else 1000
-    cluster = Cluster([host], port=port, compression=False)
-    session = cluster.connect()
-
-    session.execute(cql_create_keyspace())
-    session.set_keyspace(KEYSPACE)
-    session.execute(cql_create_table(dim))
-    session.execute(CQL_TRUNCATE)
-
-    prepared = session.prepare(CQL_INSERT)
-    prepared.consistency_level = ConsistencyLevel.ONE
-
-    n_conns = _wait_for_shard_connections(session)
-    print(f"  shard connections: {n_conns}", file=sys.stderr)
-
-    pf = ParquetFile(f"{dataset_dir}/shuffle_train.parquet")
-    total = 0
+    n = len(params)
     t0 = time.perf_counter()
 
-    for batch in pf.iter_batches(conc):
-        ids = batch.column("id").to_pylist()
-        embeddings = batch.column("emb").to_pylist()
-
-        params = list(zip(ids, embeddings))
-        execute_concurrent_with_args(session, prepared, params,
-                                     concurrency=conc,
+    # Feed params in chunks matching concurrency to avoid materialising
+    # a huge intermediate list inside execute_concurrent_with_args.
+    for start in range(0, n, concurrency):
+        chunk = params[start:start + concurrency]
+        execute_concurrent_with_args(session, prepared, chunk,
+                                     concurrency=concurrency,
                                      raise_on_first_error=True)
-
-        prev = total
-        total += len(ids)
-        if _should_report(total, prev):
+        total = start + len(chunk)
+        if total % PROGRESS_INTERVAL < concurrency:
             elapsed = time.perf_counter() - t0
-            print(f"  [{total:>8,} rows] {total/elapsed:,.0f} rows/sec", file=sys.stderr)
-        if max_rows > 0 and total >= max_rows:
-            break
+            print(f"  [{total:>8,} rows] {total/elapsed:,.0f} rows/sec",
+                  file=sys.stderr)
 
     elapsed = time.perf_counter() - t0
-    cluster.shutdown()
-    return total, elapsed
+    return n, elapsed
 
 
-# ---------------------------------------------------------------------------
-# Variant C: scylla-driver (enhanced), execute_concurrent, numpy bulk
-# ---------------------------------------------------------------------------
+def ingest_decoupled(session, prepared, params, concurrency):
+    """Ingest using DecoupledExecutor (variant E).
 
-def run_variant_c(host: str, port: int, dataset_dir: str, batch_size: int, dim: int, max_rows: int = 0, concurrency: int = 0):
-    import numpy as np
-    from cassandra import ConsistencyLevel
-    from cassandra.cluster import Cluster
-    from cassandra.concurrent import execute_concurrent_with_args
-
-    conc = concurrency if concurrency > 0 else 1000
-    cluster = Cluster([host], port=port, compression=False)
-    session = cluster.connect()
-
-    session.execute(cql_create_keyspace())
-    session.set_keyspace(KEYSPACE)
-    session.execute(cql_create_table(dim))
-    session.execute(CQL_TRUNCATE)
-
-    prepared = session.prepare(CQL_INSERT)
-    prepared.consistency_level = ConsistencyLevel.ONE
-
-    n_conns = _wait_for_shard_connections(session)
-    print(f"  shard connections: {n_conns}", file=sys.stderr)
-
-    pf = ParquetFile(f"{dataset_dir}/shuffle_train.parquet")
-    total = 0
-    t0 = time.perf_counter()
-
-    for batch in pf.iter_batches(conc):
-        ids = batch.column("id").to_pylist()
-        emb_col = batch.column("emb")
-
-        # Zero-copy Arrow -> numpy, pass rows directly to driver
-        arr = np.frombuffer(emb_col.values.buffers()[1], dtype=np.float32).reshape(-1, dim)
-
-        params = [(ids[i], arr[i]) for i in range(len(ids))]
-        execute_concurrent_with_args(session, prepared, params,
-                                     concurrency=conc,
-                                     raise_on_first_error=True)
-
-        prev = total
-        total += len(ids)
-        if _should_report(total, prev):
-            elapsed = time.perf_counter() - t0
-            print(f"  [{total:>8,} rows] {total/elapsed:,.0f} rows/sec", file=sys.stderr)
-        if max_rows > 0 and total >= max_rows:
-            break
-
-    elapsed = time.perf_counter() - t0
-    cluster.shutdown()
-    return total, elapsed
-
-
-# ---------------------------------------------------------------------------
-# Variant D: python-rs-driver, asyncio.gather
-# ---------------------------------------------------------------------------
-
-def run_variant_d(host: str, port: int, dataset_dir: str, batch_size: int, dim: int, max_rows: int = 0, concurrency: int = 0):
-    import asyncio
-    import numpy as np
-
-    from scylla.enums import Consistency
-    from scylla.execution_profile import ExecutionProfile
-    from scylla.session_builder import SessionBuilder
-
-    async def _run():
-        profile = ExecutionProfile(consistency=Consistency.One)
-        builder = SessionBuilder([host], port, execution_profile=profile)
-        session = await builder.connect()
-
-        await session.execute(cql_create_keyspace())
-        await session.execute(f"USE {KEYSPACE}")
-        await session.execute(cql_create_table(dim))
-        await session.execute(CQL_TRUNCATE)
-
-        prepared = await session.prepare(CQL_INSERT)
-        prepared = prepared.with_consistency(Consistency.One)
-
-        chunk_size = concurrency if concurrency > 0 else batch_size
-        pf = ParquetFile(f"{dataset_dir}/shuffle_train.parquet")
-        total = 0
-        t0 = time.perf_counter()
-
-        for batch in pf.iter_batches(chunk_size):
-            ids = batch.column("id").to_pylist()
-            emb_col = batch.column("emb")
-
-            # Zero-copy Arrow -> numpy, then per-row tolist() for rs-driver
-            arr = np.frombuffer(emb_col.values.buffers()[1], dtype=np.float32).reshape(-1, dim)
-
-            coros = [
-                session.execute(prepared, [key, arr[i].tolist()])
-                for i, key in enumerate(ids)
-            ]
-            await asyncio.gather(*coros)
-
-            prev = total
-            total += len(ids)
-            if _should_report(total, prev):
-                elapsed = time.perf_counter() - t0
-                print(f"  [{total:>8,} rows] {total/elapsed:,.0f} rows/sec",
-                      file=sys.stderr)
-            if max_rows > 0 and total >= max_rows:
-                break
-
-        elapsed = time.perf_counter() - t0
-        return total, elapsed
-
-    return asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
-# Variant E: scylla-driver (enhanced), decoupled executor, numpy bulk
-# ---------------------------------------------------------------------------
-
-def run_variant_e(host: str, port: int, dataset_dir: str, batch_size: int, dim: int, max_rows: int = 0, concurrency: int = 0):
-    """Decoupled executor: callbacks on the event loop just signal completion,
-    a dedicated submitter thread handles execute_async in batches.  This frees
-    the libev event loop from doing request serialisation / routing work."""
-    import numpy as np
+    Callbacks on the event loop just signal completion; a dedicated
+    submitter thread handles execute_async in batches.  This frees
+    the libev event loop from doing request serialisation / routing work.
+    """
     import threading
     from collections import deque
-    from cassandra import ConsistencyLevel
-    from cassandra.cluster import Cluster
-
-    conc = concurrency if concurrency > 0 else 1000
-
-    cluster = Cluster([host], port=port, compression=False)
-    session = cluster.connect()
-
-    session.execute(cql_create_keyspace())
-    session.set_keyspace(KEYSPACE)
-    session.execute(cql_create_table(dim))
-    session.execute(CQL_TRUNCATE)
-
-    prepared = session.prepare(CQL_INSERT)
-    prepared.consistency_level = ConsistencyLevel.ONE
-
-    n_conns = _wait_for_shard_connections(session)
-    print(f"  shard connections: {n_conns}", file=sys.stderr)
 
     class _DecoupledExecutor:
-        """Fire-and-forget write executor that keeps the event loop lean.
-
-        The libev event-loop callback does only ``deque.append`` +
-        ``Event.set`` (~100 ns).  A dedicated submitter thread drains
-        the deque and calls ``execute_async`` in batches, which involves
-        the heavier work of query-plan lookup, connection borrowing,
-        message serialisation and enqueuing.
-        """
-        __slots__ = ('session', 'prepared', 'params', 'total', 'submitted',
+        __slots__ = ('session', 'prepared', 'params', 'total',
+                     'concurrency', 'submitted',
+                     '_completed', '_completed_lock',
                      'done_event', 'error', '_ready', '_ready_event',
                      '_stopped')
 
@@ -345,7 +169,10 @@ def run_variant_e(host: str, port: int, dataset_dir: str, batch_size: int, dim: 
             self.prepared = prepared
             self.params = params
             self.total = len(params)
+            self.concurrency = concurrency
             self.submitted = 0
+            self._completed = 0
+            self._completed_lock = threading.Lock()
             self.done_event = threading.Event()
             self.error = None
             self._ready = deque()
@@ -356,7 +183,7 @@ def run_variant_e(host: str, port: int, dataset_dir: str, batch_size: int, dim: 
             ea = self.session.execute_async
             prep = self.prepared
             params = self.params
-            batch = min(concurrency, self.total)
+            batch = min(self.concurrency, self.total)
             # Submit initial batch *before* starting the submitter thread
             # so self.submitted is visible without a race.
             for i in range(batch):
@@ -364,7 +191,7 @@ def run_variant_e(host: str, port: int, dataset_dir: str, batch_size: int, dim: 
                 f.add_callbacks(callback=self._on_done, callback_args=(f,),
                                 errback=self._on_err, errback_args=(f,))
             self.submitted = batch
-            # Handle edge case: fewer items than concurrency
+            # If all items submitted in initial batch, just wait for completions
             if self.total <= batch:
                 self.done_event.wait()
                 if self.error:
@@ -381,8 +208,14 @@ def run_variant_e(host: str, port: int, dataset_dir: str, batch_size: int, dim: 
 
         def _on_done(self, _result, future):
             future.clear_callbacks()
-            self._ready.append(1)
-            self._ready_event.set()
+            with self._completed_lock:
+                self._completed += 1
+                done = self._completed >= self.total
+            if done:
+                self.done_event.set()
+            else:
+                self._ready.append(1)
+                self._ready_event.set()
 
         def _on_err(self, exc, _future):
             self.error = exc
@@ -397,7 +230,6 @@ def run_variant_e(host: str, port: int, dataset_dir: str, batch_size: int, dim: 
             ready = self._ready
             ready_event = self._ready_event
             submitted = self.submitted
-            completed = 0
             while not self._stopped:
                 ready_event.wait()
                 ready_event.clear()
@@ -408,7 +240,6 @@ def run_variant_e(host: str, port: int, dataset_dir: str, batch_size: int, dim: 
                         count += 1
                     except IndexError:
                         break
-                completed += count
                 end = min(submitted + count, total)
                 try:
                     for i in range(submitted, end):
@@ -420,47 +251,101 @@ def run_variant_e(host: str, port: int, dataset_dir: str, batch_size: int, dim: 
                     self.done_event.set()
                     return
                 submitted = end
-                if completed >= total:
-                    self.done_event.set()
+                if submitted >= total:
+                    # All submitted; _on_done will set done_event
+                    # when the last one completes
                     return
 
-    pf = ParquetFile(f"{dataset_dir}/shuffle_train.parquet")
-    total = 0
+    n = len(params)
     t0 = time.perf_counter()
 
-    for batch in pf.iter_batches(conc):
-        ids = batch.column("id").to_pylist()
-        emb_col = batch.column("emb")
-        arr = np.frombuffer(emb_col.values.buffers()[1], dtype=np.float32).reshape(-1, dim)
-        params = [(ids[i], arr[i]) for i in range(len(ids))]
-
-        executor = _DecoupledExecutor(session, prepared, params, conc)
+    # Process in chunks to show progress and avoid holding all params
+    # in a single executor (matches execute_concurrent behaviour).
+    for start in range(0, n, concurrency):
+        chunk = params[start:start + concurrency]
+        executor = _DecoupledExecutor(session, prepared, chunk, concurrency)
         executor.run()
-
-        prev = total
-        total += len(ids)
-        if _should_report(total, prev):
+        total = start + len(chunk)
+        if total % PROGRESS_INTERVAL < concurrency:
             elapsed = time.perf_counter() - t0
-            print(f"  [{total:>8,} rows] {total/elapsed:,.0f} rows/sec", file=sys.stderr)
-        if max_rows > 0 and total >= max_rows:
-            break
+            print(f"  [{total:>8,} rows] {total/elapsed:,.0f} rows/sec",
+                  file=sys.stderr)
 
     elapsed = time.perf_counter() - t0
-    cluster.shutdown()
-    return total, elapsed
+    return n, elapsed
+
+
+def ingest_rust_asyncio(session_builder_args, prepared_stmt_cql, params, concurrency):
+    """Ingest using python-rs-driver with asyncio.gather (variant D).
+
+    Unlike the scylla-driver variants, this creates its own async session
+    because python-rs-driver uses a fundamentally different API.
+    """
+    import asyncio
+
+    async def _run():
+        from scylla.enums import Consistency
+        from scylla.execution_profile import ExecutionProfile
+        from scylla.session_builder import SessionBuilder
+
+        host, port = session_builder_args
+        profile = ExecutionProfile(consistency=Consistency.One)
+        builder = SessionBuilder([host], port, execution_profile=profile)
+        s = await builder.connect()
+
+        await s.execute(cql_create_keyspace())
+        await s.execute(f"USE {KEYSPACE}")
+
+        prepared = await s.prepare(prepared_stmt_cql)
+        prepared = prepared.with_consistency(Consistency.One)
+
+        # Rust driver needs list[float], not numpy arrays
+        n = len(params)
+        t0 = time.perf_counter()
+
+        for chunk_start in range(0, n, concurrency):
+            chunk_end = min(chunk_start + concurrency, n)
+            coros = [
+                s.execute(prepared, [params[i][0], params[i][1]])
+                for i in range(chunk_start, chunk_end)
+            ]
+            await asyncio.gather(*coros)
+            if chunk_end % PROGRESS_INTERVAL < concurrency:
+                elapsed = time.perf_counter() - t0
+                print(f"  [{chunk_end:>8,} rows] {chunk_end/elapsed:,.0f} rows/sec",
+                      file=sys.stderr)
+
+        elapsed = time.perf_counter() - t0
+        return n, elapsed
+
+    return asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Variant definitions
 # ---------------------------------------------------------------------------
+
+# Each variant is: (label, data_loader, ingestion_function, is_rust)
+# data_loader: 'pylist' or 'numpy'
+# ingestion_function: one of the ingest_* functions above
 
 VARIANTS = {
-    "A": ("scylla-driver (master), execute_concurrent, list[float]", run_variant_a),
-    "B": ("scylla-driver (enhanced), execute_concurrent, list[float]", run_variant_b),
-    "C": ("scylla-driver (enhanced), execute_concurrent, numpy bulk", run_variant_c),
-    "D": ("python-rs-driver, asyncio.gather", run_variant_d),
-    "E": ("scylla-driver (enhanced), decoupled executor, numpy bulk", run_variant_e),
-    "F": ("scylla-driver (enhanced), free-threaded, execute_concurrent, numpy bulk", run_variant_c),
+    "A":  ("scylla-driver (master), execute_concurrent, list[float]",
+           'pylist', ingest_execute_concurrent, False),
+    "A2": ("scylla-driver (master), execute_concurrent, numpy",
+           'numpy', ingest_execute_concurrent, False),
+    "A3": ("scylla-driver (master), decoupled executor, numpy",
+           'numpy', ingest_decoupled, False),
+    "B":  ("scylla-driver (enhanced), execute_concurrent, list[float]",
+           'pylist', ingest_execute_concurrent, False),
+    "C":  ("scylla-driver (enhanced), execute_concurrent, numpy bulk",
+           'numpy', ingest_execute_concurrent, False),
+    "D":  ("python-rs-driver, asyncio.gather",
+           'numpy_tolist', ingest_rust_asyncio, True),
+    "E":  ("scylla-driver (enhanced), decoupled executor, numpy bulk",
+           'numpy', ingest_decoupled, False),
+    "F":  ("scylla-driver (enhanced), free-threaded, execute_concurrent, numpy bulk",
+           'numpy', ingest_execute_concurrent, False),
 }
 
 
@@ -472,37 +357,135 @@ def main():
     parser.add_argument("--port", type=int, default=9042)
     parser.add_argument("--dataset-dir",
                         default=os.path.expanduser("~/vector_bench/dataset/cohere/cohere_medium_1m"))
-    parser.add_argument("--batch-size", type=int, default=100)
-    parser.add_argument("--max-rows", type=int, default=0,
-                        help="Stop after this many rows (0 = all)")
-    parser.add_argument("--concurrency", type=int, default=0,
-                        help="Max in-flight requests for variants C/D (0 = same as batch-size)")
+    parser.add_argument("--max-rows", type=int, default=100_000,
+                        help="Number of rows to ingest per run (default: 100000)")
+    parser.add_argument("--concurrency", type=int, default=1000,
+                        help="Max in-flight requests (default: 1000)")
     parser.add_argument("--dim", type=int, default=768)
+    parser.add_argument("--runs", type=int, default=3,
+                        help="Number of timed runs (default: 3)")
+    parser.add_argument("--warmup-rows", type=int, default=1000,
+                        help="Rows to ingest as warmup before timed runs (default: 1000)")
+    parser.add_argument("--warmup-sleep", type=float, default=3.0,
+                        help="Seconds to sleep after warmup (default: 3.0)")
+    parser.add_argument("--inter-run-sleep", type=float, default=2.0,
+                        help="Seconds to sleep between runs (default: 2.0)")
     args = parser.parse_args()
 
-    label, fn = VARIANTS[args.variant]
-    concurrency = args.concurrency if args.concurrency > 0 else args.batch_size
+    label, data_loader, ingest_fn, is_rust = VARIANTS[args.variant]
+    concurrency = args.concurrency
+    max_rows = args.max_rows
+
     print(f"Running variant {args.variant}: {label}", file=sys.stderr)
-    print(f"  host={args.host}:{args.port}  batch_size={args.batch_size}  dim={args.dim}  concurrency={concurrency}",
+    print(f"  host={args.host}:{args.port}  dim={args.dim}  concurrency={concurrency}",
+          file=sys.stderr)
+    print(f"  max_rows={max_rows}  runs={args.runs}  warmup_rows={args.warmup_rows}",
           file=sys.stderr)
     print(f"  dataset={args.dataset_dir}", file=sys.stderr)
     print("", file=sys.stderr)
 
-    total, elapsed = fn(args.host, args.port, args.dataset_dir, args.batch_size, args.dim, args.max_rows, concurrency)
+    # ---- Load data ----
+    print("  Loading data...", file=sys.stderr)
+    t_load = time.perf_counter()
+    if data_loader == 'pylist':
+        params = load_params_pylist(args.dataset_dir, args.dim, max_rows)
+    elif data_loader == 'numpy':
+        params = load_params_numpy(args.dataset_dir, args.dim, max_rows)
+    elif data_loader == 'numpy_tolist':
+        # Rust driver needs list[float], not numpy arrays
+        import numpy as np
+        pf = ParquetFile(f"{args.dataset_dir}/shuffle_train.parquet")
+        batch = next(pf.iter_batches(max_rows))
+        ids = batch.column("id").to_pylist()
+        emb_col = batch.column("emb")
+        arr = np.frombuffer(emb_col.values.buffers()[1], dtype=np.float32).reshape(-1, args.dim)
+        n = min(len(ids), max_rows) if max_rows > 0 else len(ids)
+        params = [(ids[i], arr[i].tolist()) for i in range(n)]
+    else:
+        raise ValueError(f"Unknown data_loader: {data_loader}")
+    print(f"  Loaded {len(params):,} rows in {time.perf_counter()-t_load:.1f}s",
+          file=sys.stderr)
 
-    rows_per_sec = total / elapsed if elapsed > 0 else 0
+    # ---- Rust driver path (different session model) ----
+    if is_rust:
+        # Rust driver handles its own session; we just need truncate via cqlsh
+        # For simplicity, the rust ingest function handles everything.
+        # TODO: add warmup + multi-run support for rust variant
+        total, elapsed = ingest_fn((args.host, args.port), CQL_INSERT, params, concurrency)
+        rows_per_sec = total / elapsed if elapsed > 0 else 0
+        result = {
+            "variant": args.variant, "label": label,
+            "rows": total, "runs": 1,
+            "rates": [round(rows_per_sec, 1)],
+            "best": round(rows_per_sec, 1),
+            "avg": round(rows_per_sec, 1),
+            "worst": round(rows_per_sec, 1),
+        }
+        print(json.dumps(result))
+        print(f"\n  Result: {rows_per_sec:,.0f} rows/sec", file=sys.stderr)
+        return
+
+    # ---- scylla-driver path ----
+    from cassandra import ConsistencyLevel
+    from cassandra.cluster import Cluster
+
+    cluster = Cluster([args.host], port=args.port, compression=False)
+    session = cluster.connect()
+
+    session.execute(cql_create_keyspace())
+    session.set_keyspace(KEYSPACE)
+    session.execute(cql_create_table(args.dim))
+    session.execute(CQL_TRUNCATE)
+
+    prepared = session.prepare(CQL_INSERT)
+    prepared.consistency_level = ConsistencyLevel.ONE
+
+    n_conns = _wait_for_shard_connections(session)
+    print(f"  shard connections: {n_conns}", file=sys.stderr)
+
+    # ---- Warmup ----
+    if args.warmup_rows > 0:
+        warmup_params = params[:args.warmup_rows]
+        print(f"  Warmup: {len(warmup_params)} rows...", file=sys.stderr)
+        ingest_fn(session, prepared, warmup_params, concurrency)
+        print(f"  Warmup done, sleeping {args.warmup_sleep}s...", file=sys.stderr)
+        time.sleep(args.warmup_sleep)
+
+    # ---- Timed runs ----
+    rates = []
+    for run_idx in range(args.runs):
+        session.execute(CQL_TRUNCATE)
+        if args.inter_run_sleep > 0 and run_idx > 0:
+            time.sleep(args.inter_run_sleep)
+
+        print(f"  --- Run {run_idx+1}/{args.runs} ---", file=sys.stderr)
+        total, elapsed = ingest_fn(session, prepared, params, concurrency)
+        rate = total / elapsed if elapsed > 0 else 0
+        rates.append(rate)
+        print(f"  Run {run_idx+1}: {total:,} rows in {elapsed:.2f}s = {rate:,.0f} rows/sec",
+              file=sys.stderr)
+
+    cluster.shutdown()
+
+    best = max(rates)
+    avg = sum(rates) / len(rates)
+    worst = min(rates)
+
     result = {
         "variant": args.variant,
         "label": label,
         "rows": total,
-        "elapsed_sec": round(elapsed, 2),
-        "rows_per_sec": round(rows_per_sec, 1),
+        "runs": args.runs,
+        "rates": [round(r, 1) for r in rates],
+        "best": round(best, 1),
+        "avg": round(avg, 1),
+        "worst": round(worst, 1),
     }
 
     # Print JSON to stdout (machine-readable), human-readable to stderr
     print(json.dumps(result))
     print("", file=sys.stderr)
-    print(f"  Result: {total:,} rows in {elapsed:.1f}s = {rows_per_sec:,.0f} rows/sec",
+    print(f"  Summary: best={best:,.0f}  avg={avg:,.0f}  worst={worst:,.0f} rows/sec",
           file=sys.stderr)
 
 
