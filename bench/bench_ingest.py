@@ -298,6 +298,159 @@ def run_variant_d(host: str, port: int, dataset_dir: str, batch_size: int, dim: 
 
 
 # ---------------------------------------------------------------------------
+# Variant E: scylla-driver (enhanced), decoupled executor, numpy bulk
+# ---------------------------------------------------------------------------
+
+def run_variant_e(host: str, port: int, dataset_dir: str, batch_size: int, dim: int, max_rows: int = 0, concurrency: int = 0):
+    """Decoupled executor: callbacks on the event loop just signal completion,
+    a dedicated submitter thread handles execute_async in batches.  This frees
+    the libev event loop from doing request serialisation / routing work."""
+    import numpy as np
+    import threading
+    from collections import deque
+    from cassandra import ConsistencyLevel
+    from cassandra.cluster import Cluster
+
+    conc = concurrency if concurrency > 0 else 1000
+
+    cluster = Cluster([host], port=port, compression=False)
+    session = cluster.connect()
+
+    session.execute(cql_create_keyspace())
+    session.set_keyspace(KEYSPACE)
+    session.execute(cql_create_table(dim))
+    session.execute(CQL_TRUNCATE)
+
+    prepared = session.prepare(CQL_INSERT)
+    prepared.consistency_level = ConsistencyLevel.ONE
+
+    n_conns = _wait_for_shard_connections(session)
+    print(f"  shard connections: {n_conns}", file=sys.stderr)
+
+    class _DecoupledExecutor:
+        """Fire-and-forget write executor that keeps the event loop lean.
+
+        The libev event-loop callback does only ``deque.append`` +
+        ``Event.set`` (~100 ns).  A dedicated submitter thread drains
+        the deque and calls ``execute_async`` in batches, which involves
+        the heavier work of query-plan lookup, connection borrowing,
+        message serialisation and enqueuing.
+        """
+        __slots__ = ('session', 'prepared', 'params', 'total', 'submitted',
+                     'done_event', 'error', '_ready', '_ready_event',
+                     '_stopped')
+
+        def __init__(self, session, prepared, params, concurrency):
+            self.session = session
+            self.prepared = prepared
+            self.params = params
+            self.total = len(params)
+            self.submitted = 0
+            self.done_event = threading.Event()
+            self.error = None
+            self._ready = deque()
+            self._ready_event = threading.Event()
+            self._stopped = False
+
+        def run(self):
+            ea = self.session.execute_async
+            prep = self.prepared
+            params = self.params
+            batch = min(concurrency, self.total)
+            # Submit initial batch *before* starting the submitter thread
+            # so self.submitted is visible without a race.
+            for i in range(batch):
+                f = ea(prep, params[i], timeout=None)
+                f.add_callbacks(callback=self._on_done, callback_args=(f,),
+                                errback=self._on_err, errback_args=(f,))
+            self.submitted = batch
+            # Handle edge case: fewer items than concurrency
+            if self.total <= batch:
+                self.done_event.wait()
+                if self.error:
+                    raise self.error
+                return
+            submitter = threading.Thread(target=self._submitter_loop,
+                                        daemon=True, name="decoupled-submitter")
+            submitter.start()
+            self.done_event.wait()
+            self._stopped = True
+            self._ready_event.set()
+            if self.error:
+                raise self.error
+
+        def _on_done(self, _result, future):
+            future.clear_callbacks()
+            self._ready.append(1)
+            self._ready_event.set()
+
+        def _on_err(self, exc, _future):
+            self.error = exc
+            self._stopped = True
+            self.done_event.set()
+
+        def _submitter_loop(self):
+            ea = self.session.execute_async
+            prep = self.prepared
+            params = self.params
+            total = self.total
+            ready = self._ready
+            ready_event = self._ready_event
+            submitted = self.submitted
+            completed = 0
+            while not self._stopped:
+                ready_event.wait()
+                ready_event.clear()
+                count = 0
+                while True:
+                    try:
+                        ready.popleft()
+                        count += 1
+                    except IndexError:
+                        break
+                completed += count
+                end = min(submitted + count, total)
+                try:
+                    for i in range(submitted, end):
+                        f = ea(prep, params[i], timeout=None)
+                        f.add_callbacks(callback=self._on_done, callback_args=(f,),
+                                        errback=self._on_err, errback_args=(f,))
+                except Exception as exc:
+                    self.error = exc
+                    self.done_event.set()
+                    return
+                submitted = end
+                if completed >= total:
+                    self.done_event.set()
+                    return
+
+    pf = ParquetFile(f"{dataset_dir}/shuffle_train.parquet")
+    total = 0
+    t0 = time.perf_counter()
+
+    for batch in pf.iter_batches(conc):
+        ids = batch.column("id").to_pylist()
+        emb_col = batch.column("emb")
+        arr = np.frombuffer(emb_col.values.buffers()[1], dtype=np.float32).reshape(-1, dim)
+        params = [(ids[i], arr[i]) for i in range(len(ids))]
+
+        executor = _DecoupledExecutor(session, prepared, params, conc)
+        executor.run()
+
+        prev = total
+        total += len(ids)
+        if _should_report(total, prev):
+            elapsed = time.perf_counter() - t0
+            print(f"  [{total:>8,} rows] {total/elapsed:,.0f} rows/sec", file=sys.stderr)
+        if max_rows > 0 and total >= max_rows:
+            break
+
+    elapsed = time.perf_counter() - t0
+    cluster.shutdown()
+    return total, elapsed
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -306,6 +459,7 @@ VARIANTS = {
     "B": ("scylla-driver (enhanced), execute_concurrent, list[float]", run_variant_b),
     "C": ("scylla-driver (enhanced), execute_concurrent, numpy bulk", run_variant_c),
     "D": ("python-rs-driver, asyncio.gather", run_variant_d),
+    "E": ("scylla-driver (enhanced), decoupled executor, numpy bulk", run_variant_e),
     "F": ("scylla-driver (enhanced), free-threaded, execute_concurrent, numpy bulk", run_variant_c),
 }
 
