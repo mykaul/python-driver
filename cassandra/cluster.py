@@ -4477,7 +4477,7 @@ class ResponseFuture(object):
             self._host = host
         self._spec_execution_plan = speculative_execution_plan or self._spec_execution_plan
         self._make_query_plan()
-        self._event = Event()
+        self._event = None  # lazily created on first wait/check
         self._errors = {}
         self._callbacks = None
         self._errbacks = None
@@ -4563,25 +4563,31 @@ class ResponseFuture(object):
 
     def _on_speculative_execute(self):
         self._timer = None
-        if not self._event.is_set():
+        # Unlocked reads: under free-threaded Python a stale read may
+        # allow a harmless redundant speculative query — acceptable
+        # because the duplicate response will be discarded.
+        if self._final_result is not _NOT_SET or self._final_exception is not None:
+            return  # already done
+        if self._event is not None and self._event.is_set():
+            return  # already done (Event path)
 
-            # PYTHON-836, the speculative queries must be after
-            # the query is sent from the main thread, otherwise the
-            # query from the main thread may raise NoHostAvailable
-            # if the _query_plan has been exhausted by the specualtive queries.
-            # This also prevents a race condition accessing the iterator.
-            # We reschedule this call until the main thread has succeeded
-            # making a query
-            if not self.attempted_hosts:
-                self._timer = self.session.cluster.connection_class.create_timer(0.01, self._on_speculative_execute)
+        # PYTHON-836, the speculative queries must be after
+        # the query is sent from the main thread, otherwise the
+        # query from the main thread may raise NoHostAvailable
+        # if the _query_plan has been exhausted by the specualtive queries.
+        # This also prevents a race condition accessing the iterator.
+        # We reschedule this call until the main thread has succeeded
+        # making a query
+        if not self.attempted_hosts:
+            self._timer = self.session.cluster.connection_class.create_timer(0.01, self._on_speculative_execute)
+            return
+
+        if self._time_remaining is not None:
+            if self._time_remaining <= 0:
+                self._on_timeout()
                 return
-
-            if self._time_remaining is not None:
-                if self._time_remaining <= 0:
-                    self._on_timeout()
-                    return
-            self.send_request(error_no_hosts=False)
-            self._start_timer()
+        self.send_request(error_no_hosts=False)
+        self._start_timer()
 
     def _make_query_plan(self):
         # set the query_plan according to the load balancing policy,
@@ -4692,7 +4698,7 @@ class ResponseFuture(object):
         Otherwise it may throw if the response has not been received.
         """
         # TODO: When timers are introduced, just make this wait
-        if not self._event.is_set():
+        if self._event is None or not self._event.is_set():
             raise DriverException("warnings cannot be retrieved before ResponseFuture is finalized")
         return self._warnings
 
@@ -4710,7 +4716,7 @@ class ResponseFuture(object):
         :return: :ref:`custom_payload`.
         """
         # TODO: When timers are introduced, just make this wait
-        if not self._event.is_set():
+        if self._final_result is _NOT_SET and self._final_exception is None:
             raise DriverException("custom_payload cannot be retrieved before ResponseFuture is finalized")
         return self._custom_payload
 
@@ -4729,7 +4735,8 @@ class ResponseFuture(object):
 
         self._make_query_plan()
         self.message.paging_state = self._paging_state
-        self._event.clear()
+        if self._event is not None:
+            self._event.clear()
         self._final_result = _NOT_SET
         self._final_exception = None
         self._start_timer()
@@ -5029,8 +5036,10 @@ class ResponseFuture(object):
                 )
             else:
                 to_call = None
+            event = self._event  # capture under lock for free-threaded safety
 
-        self._event.set()
+        if event is not None:
+            event.set()
 
         # apply each callback
         if to_call:
@@ -5056,7 +5065,9 @@ class ResponseFuture(object):
                 )
             else:
                 to_call = None
-        self._event.set()
+            event = self._event  # capture under lock for free-threaded safety
+        if event is not None:
+            event.set()
 
         # apply each callback
         if to_call:
@@ -5143,7 +5154,20 @@ class ResponseFuture(object):
         return ResultSet(self, self._wait_for_result())
 
     def _wait_for_result(self):
-        self._event.wait()
+        # Check under lock whether the result is already available.
+        # If so, we can skip Event creation entirely.
+        with self._callback_lock:
+            if self._final_result is not _NOT_SET:
+                return self._final_result
+            if self._final_exception is not None:
+                raise self._final_exception
+            # Result not yet available — ensure Event exists so that
+            # _set_final_result/_set_final_exception (which also hold
+            # _callback_lock when capturing _event) will call .set().
+            if self._event is None:
+                self._event = Event()
+            event = self._event
+        event.wait()
         if self._final_result is not _NOT_SET:
             return self._final_result
         else:
@@ -5288,8 +5312,26 @@ class ResponseFuture(object):
             ...     errback=log_error, errback_args=(query,))
 
         """
-        self.add_callback(callback, *callback_args, **(callback_kwargs or {}))
-        self.add_errback(errback, *errback_args, **(errback_kwargs or {}))
+        cb_kwargs = callback_kwargs or {}
+        eb_kwargs = errback_kwargs or {}
+        run_callback = False
+        run_errback = False
+        with self._callback_lock:
+            if self._callbacks is None:
+                self._callbacks = []
+            self._callbacks.append((callback, callback_args, cb_kwargs))
+            if self._errbacks is None:
+                self._errbacks = []
+            self._errbacks.append((errback, errback_args, eb_kwargs))
+            if self._final_result is not _NOT_SET:
+                run_callback = True
+            if self._final_exception:
+                run_errback = True
+        if run_callback:
+            callback(self._final_result, *callback_args, **cb_kwargs)
+        if run_errback:
+            errback(self._final_exception, *errback_args, **eb_kwargs)
+        return self
 
     def clear_callbacks(self):
         with self._callback_lock:

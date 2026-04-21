@@ -534,7 +534,8 @@ class ResponseFutureTests(unittest.TestCase):
         result = Mock(spec=UnavailableErrorMessage, info={"required_replicas":2, "alive_replicas": 1, "consistency": 1})
         result.to_exception.return_value = expected_exception
         rf._set_result(None, None, None, result)
-        rf._event.set()
+        if rf._event is not None:
+            rf._event.set()
         with pytest.raises(Exception):
             rf.result()
 
