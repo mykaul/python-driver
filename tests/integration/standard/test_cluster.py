@@ -1098,36 +1098,34 @@ class ClusterTests(unittest.TestCase):
 
         @test_category config_profiles
         """
-        max_retry_count = 10
-        for i in range(max_retry_count):
-            node1 = ExecutionProfile(
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+        node1 = ExecutionProfile(
+            load_balancing_policy=HostFilterPolicy(
+                RoundRobinPolicy(), lambda host: host.address == "127.0.0.1"
+            )
+        )
+        with TestCluster(execution_profiles={EXEC_PROFILE_DEFAULT: node1}) as cluster:
+            session = cluster.connect(wait_for_all_pools=True)
+            pools = session.get_pool_state()
+            assert len(cluster.metadata.all_hosts()) > 2
+            assert set(h.address for h in pools) == set(('127.0.0.1',))
+
+            node2 = ExecutionProfile(
                 load_balancing_policy=HostFilterPolicy(
-                    RoundRobinPolicy(), lambda host: host.address == "127.0.0.1"
+                    RoundRobinPolicy(), lambda host: host.address in ["127.0.0.2", "127.0.0.3"]
                 )
             )
-            with TestCluster(execution_profiles={EXEC_PROFILE_DEFAULT: node1}) as cluster:
-                session = cluster.connect(wait_for_all_pools=True)
-                pools = session.get_pool_state()
-                assert len(cluster.metadata.all_hosts()) > 2
-                assert set(h.address for h in pools) == set(('127.0.0.1',))
 
-                node2 = ExecutionProfile(
-                    load_balancing_policy=HostFilterPolicy(
-                        RoundRobinPolicy(), lambda host: host.address in ["127.0.0.2", "127.0.0.3"]
-                    )
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = executor.submit(
+                    cluster.add_execution_profile, 'profile_node2', node2
                 )
-
-                start = time.time()
-                try:
-                    with pytest.raises(cassandra.OperationTimedOut):
-                        cluster.add_execution_profile('profile_{0}'.format(i),
-                                      node2, pool_wait_timeout=sys.float_info.min)
-                    break
-                except AssertionError:
-                    end = time.time()
-                    assert start == pytest.approx(end, abs=1e-1)
-        else:
-            raise Exception("add_execution_profile didn't timeout after {0} retries".format(max_retry_count))
+                with pytest.raises(TimeoutError):
+                    future.result(timeout=0.5)
+            finally:
+                executor.shutdown(wait=False)
 
     def test_stale_connections_after_shutdown(self):
         """
