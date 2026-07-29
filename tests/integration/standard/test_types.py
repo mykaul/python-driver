@@ -21,15 +21,13 @@ import string
 import socket
 import uuid
 
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from functools import partial
 
-from packaging.version import Version
 
 import cassandra
 from cassandra import InvalidRequest
-from cassandra import util
 from cassandra.cluster import ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.cqltypes import Int32Type, EMPTY
@@ -38,7 +36,7 @@ from cassandra.util import sortedset, Duration, OrderedMap
 from tests.unit.cython.utils import cythontest
 from tests.util import assertEqual
 
-from tests.integration import use_singledc, execute_until_pass, notprotocolv1, \
+from tests.integration import use_single_node, execute_until_pass, notprotocolv1, \
     BasicSharedKeyspaceUnitTestCase, greaterthancass21, lessthancass30, \
     greaterthanorequalcass3_10, TestCluster, requires_composite_type, \
     requires_vector_type
@@ -48,7 +46,7 @@ import pytest
 
 
 def setup_module():
-    use_singledc()
+    use_single_node()
     update_datatypes()
 
 
@@ -663,18 +661,22 @@ class TypeTests(BasicSharedKeyspaceUnitTestCase):
         s.encoder.mapping[tuple] = s.encoder.cql_encode_tuple
 
         # create a table with multiple sizes of nested tuples
+        # Note: Scylla limits CQL expression nesting depth to 12 (every
+        # recursive `term` counts, including the innermost scalar value), so a
+        # nested tuple literal can be at most 11 levels deep before the server
+        # rejects it with "expression nested too deeply".
         s.execute("CREATE TABLE nested_tuples ("
                   "k int PRIMARY KEY, "
                   "v_1 frozen<%s>,"
                   "v_2 frozen<%s>,"
                   "v_3 frozen<%s>,"
-                  "v_32 frozen<%s>"
+                  "v_11 frozen<%s>"
                   ")" % (self.nested_tuples_schema_helper(1),
                          self.nested_tuples_schema_helper(2),
                          self.nested_tuples_schema_helper(3),
-                         self.nested_tuples_schema_helper(32)))
+                         self.nested_tuples_schema_helper(11)))
 
-        for i in (1, 2, 3, 32):
+        for i in (1, 2, 3, 11):
             # create tuple
             created_tuple = self.nested_tuples_creator_helper(i)
 

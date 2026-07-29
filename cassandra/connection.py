@@ -25,12 +25,14 @@ import sys
 from threading import Thread, Event, RLock, Condition
 import time
 import ssl
+import uuid
 import weakref
 import random
 import itertools
-from typing import Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from cassandra.application_info import ApplicationInfoBase
+from cassandra.client_routes import _ClientRoutesHandler
 from cassandra.protocol_features import ProtocolFeatures
 
 if 'gevent.monkey' in sys.modules:
@@ -49,7 +51,7 @@ from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessag
                                 RegisterMessage, ReviseRequestMessage)
 from cassandra.segment import SegmentCodec, CrcException
 from cassandra.util import OrderedDict
-from cassandra.shard_info import ShardingInfo
+from cassandra.shard_info import ShardingInfo  # noqa: F401  # re-exported for cassandra.connection.ShardingInfo
 
 log = logging.getLogger(__name__)
 
@@ -230,7 +232,7 @@ class DefaultEndPointFactory(EndPointFactory):
     port = None
     """
     If no port is discovered in the row, this is the default port
-    used for endpoint creation. 
+    used for endpoint creation.
     """
 
     def __init__(self, port=None):
@@ -328,6 +330,50 @@ class SniEndPointFactory(EndPointFactory):
         return SniEndPoint(self._proxy_address, sni, self._port)
 
 
+class ClientRoutesEndPointFactory(EndPointFactory):
+    """
+    EndPointFactory for Client Routes (Private Link) support.
+
+    Creates ClientRoutesEndPoint instances that defer both address translation
+    (host_id -> hostname lookup) and DNS resolution until connection time.
+    This ensures immediate reaction to infrastructure changes.
+    """
+
+    client_routes_handler: _ClientRoutesHandler
+    default_port: int
+
+    def __init__(self, client_routes_handler: _ClientRoutesHandler, default_port: int = None) -> None:
+        """
+        :param client_routes_handler: _ClientRoutesHandler instance to lookup routes
+        :param default_port: Default port if none found in row
+        """
+        self.client_routes_handler = client_routes_handler
+        self.default_port = default_port
+
+    def create(self, row: Dict[str, Any]) -> 'ClientRoutesEndPoint':
+        """
+        Create a ClientRoutesEndPoint from a system.peers row.
+
+        Stores only the host_id and handler reference. Both translation
+        (route lookup) and DNS resolution happen later in resolve().
+        """
+        from cassandra.metadata import _NodeInfo
+        host_id = row.get("host_id")
+
+        if host_id is None:
+            raise ValueError("No host_id to create ClientRoutesEndPoint")
+
+        addr = _NodeInfo.get_broadcast_rpc_address(row)
+        port = _NodeInfo.get_broadcast_rpc_port(row) or _NodeInfo.get_broadcast_port(row) or self.default_port
+
+        return ClientRoutesEndPoint(
+            host_id=host_id,
+            handler=self.client_routes_handler,
+            original_address=addr,
+            original_port=port,
+        )
+
+
 @total_ordering
 class UnixSocketEndPoint(EndPoint):
     """
@@ -367,6 +413,76 @@ class UnixSocketEndPoint(EndPoint):
 
     def __repr__(self):
         return "<%s: %s>" % (self.__class__.__name__, self._unix_socket_path)
+
+
+@total_ordering
+class ClientRoutesEndPoint(EndPoint):
+    """
+    Client Routes (Private Link) EndPoint implementation.
+
+    Defers both address translation (route lookup) and DNS resolution
+    until resolve() is called at connection time. This ensures immediate
+    reaction to infrastructure changes and CLIENT_ROUTES_CHANGE events.
+    """
+
+    _host_id: uuid.UUID
+    _handler: _ClientRoutesHandler
+    _original_address: str
+    _original_port: int
+
+    def __init__(self, host_id: uuid.UUID, handler: _ClientRoutesHandler, original_address: str, original_port: int = None) -> None:
+        """
+        :param host_id: Host UUID for route lookup
+        :param handler: _ClientRoutesHandler instance
+        :param original_address: Original address from system.peers (for identification)
+        :param original_port: Original port if route doesn't specify one
+        """
+        self._host_id = host_id
+        self._handler = handler
+        self._original_address = original_address
+        self._original_port = original_port
+
+    @property
+    def address(self) -> str:
+        """Returns the original address (updated by resolve())."""
+        return self._original_address
+
+    @property
+    def port(self) -> Optional[int]:
+        return self._original_port
+
+    @property
+    def host_id(self) -> uuid.UUID:
+        return self._host_id
+
+    def resolve(self) -> Tuple[str, int]:
+        """
+        Resolve endpoint by delegating to the handler.
+        Falls back to original address/port if no route mapping is available.
+        """
+        result = self._handler.resolve_host(self._host_id)
+        if result is None:
+            return self._original_address, self._original_port
+        return result
+
+    def __eq__(self, other):
+        return (isinstance(other, ClientRoutesEndPoint) and
+                self._host_id == other._host_id and
+                self._original_address == other._original_address)
+
+    def __hash__(self):
+        return hash((self._host_id, self._original_address))
+
+    def __lt__(self, other):
+        return ((self._host_id, self._original_address) <
+                (other._host_id, other._original_address))
+
+    def __str__(self):
+        return str("%s (host_id=%s)" % (self._original_address, self._host_id))
+
+    def __repr__(self):
+        return "<%s: host_id=%s, original_addr=%s>" % (
+            self.__class__.__name__, self._host_id, self._original_address)
 
 
 class _Frame(object):
@@ -868,7 +984,10 @@ class Connection(object):
             raise conn.last_error
         elif not conn.connected_event.is_set():
             conn.close()
-            raise OperationTimedOut("Timed out creating connection (%s seconds)" % timeout)
+            raise OperationTimedOut("Timed out creating connection (%s seconds)" % timeout,
+                                    timeout=timeout)
+        elif conn.is_closed:
+            raise ConnectionShutdown("Connection to %s was closed by server" % conn.endpoint)
         else:
             return conn
 
@@ -1103,7 +1222,8 @@ class Connection(object):
         # this allows us to inject custom functions per request to encode, decode messages
         self._requests[request_id] = (cb, decoder, result_metadata)
         msg = encoder(msg, request_id, self.protocol_version, compressor=self.compressor,
-                      allow_beta_protocol_version=self.allow_beta_protocol_version)
+                      allow_beta_protocol_version=self.allow_beta_protocol_version,
+                      protocol_features=self.features)
 
         if self._is_checksumming_enabled:
             buffer = io.BytesIO()
@@ -1131,6 +1251,7 @@ class Connection(object):
                 msg += ": %s" % (self.last_error,)
             raise ConnectionShutdown(msg)
         timeout = kwargs.get('timeout')
+        original_timeout = timeout  # preserve for exception reporting
         fail_on_error = kwargs.get('fail_on_error', True)
         waiter = ResponseWaiter(self, len(msgs), fail_on_error)
 
@@ -1155,7 +1276,8 @@ class Connection(object):
                 if timeout is not None:
                     timeout -= 0.01
                     if timeout <= 0.0:
-                        raise OperationTimedOut()
+                        raise OperationTimedOut(timeout=original_timeout,
+                                                in_flight=self.in_flight)
                 time.sleep(0.01)
 
         try:
@@ -1542,7 +1664,8 @@ class Connection(object):
         if not keyspace or keyspace == self.keyspace:
             return
 
-        query = QueryMessage(query='USE "%s"' % (keyspace,),
+        from cassandra.metadata import escape_name
+        query = QueryMessage(query='USE %s' % (escape_name(keyspace),),
                              consistency_level=ConsistencyLevel.ONE)
         try:
             result = self.wait_for_response(query)
@@ -1596,7 +1719,8 @@ class Connection(object):
             callback(self, None)
             return
 
-        query = QueryMessage(query='USE "%s"' % (keyspace,),
+        from cassandra.metadata import escape_name
+        query = QueryMessage(query='USE %s' % (escape_name(keyspace),),
                              consistency_level=ConsistencyLevel.ONE)
 
         def process_result(result):
@@ -1678,7 +1802,8 @@ class ResponseWaiter(object):
         if self.error:
             raise self.error
         elif not self.event.is_set():
-            raise OperationTimedOut()
+            raise OperationTimedOut(timeout=timeout,
+                                    in_flight=self.connection.in_flight)
         else:
             return self.responses
 
@@ -1694,7 +1819,19 @@ class HeartbeatFuture(object):
         with connection.lock:
             if connection.in_flight < connection.max_request_id:
                 connection.in_flight += 1
-                connection.send_msg(OptionsMessage(), connection.get_request_id(), self._options_callback)
+                request_id = connection.get_request_id()
+                try:
+                    connection.send_msg(OptionsMessage(), request_id, self._options_callback)
+                except Exception as exc:
+                    if connection.is_control_connection:
+                        connection.in_flight -= 1
+                    # send_msg() registers the callback before writing to the socket,
+                    # so a write failure must unwind that registration here.
+                    connection._requests.pop(request_id, None)
+                    if request_id not in connection.request_ids:
+                        connection.request_ids.append(request_id)
+                    self._exception = exc
+                    self._event.set()
             else:
                 self._exception = Exception("Failed to send heartbeat because connection 'in_flight' exceeds threshold")
                 self._event.set()
@@ -1705,7 +1842,10 @@ class HeartbeatFuture(object):
             if self._exception:
                 raise self._exception
         else:
-            raise OperationTimedOut("Connection heartbeat timeout after %s seconds" % (timeout,), self.connection.endpoint)
+            raise OperationTimedOut("Connection heartbeat timeout after %s seconds" % (timeout,),
+                                    self.connection.endpoint,
+                                    timeout=timeout,
+                                    in_flight=self.connection.in_flight)
 
     def _options_callback(self, response):
         if isinstance(response, SupportedMessage):

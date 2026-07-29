@@ -11,11 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import unittest
 
 from collections import namedtuple, OrderedDict
 
-from cassandra import ProtocolVersion
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT
 from cassandra.query import (named_tuple_factory, tuple_factory,
                              dict_factory, ordered_dict_factory)
@@ -140,9 +138,9 @@ class EmptyColumnTests(SimulacronCluster):
             'delay_in_ms': 0,
             'rows': [
                 {
-                    "strategy_class": "SimpleStrategy",  # C* 2.2
+                    "strategy_class": "NetworkTopologyStrategy",  # C* 2.2
                     "strategy_options": '{}',  # C* 2.2
-                    "replication": {'strategy': 'SimpleStrategy', 'replication_factor': 1},
+                    "replication": {'strategy': 'NetworkTopologyStrategy', 'replication_factor': 1},
                     "durable_writes": True,
                     "keyspace_name": "testks"
                 }
