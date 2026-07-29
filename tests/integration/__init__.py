@@ -122,7 +122,6 @@ def cmd_line_args_to_dict(env_var):
             args[cmd_arg.lstrip('-')] = cmd_arg_value
     return args
 
-USE_CASS_EXTERNAL = bool(os.getenv('USE_CASS_EXTERNAL', False))
 KEEP_TEST_CLUSTER = bool(os.getenv('KEEP_TEST_CLUSTER', False))
 SIMULACRON_JAR = os.getenv('SIMULACRON_JAR', None)
 
@@ -250,7 +249,7 @@ PROTOCOL_VERSION = int(os.getenv('PROTOCOL_VERSION', default_protocol_version))
 
 
 def local_decorator_creator():
-    if USE_CASS_EXTERNAL or not CASSANDRA_IP.startswith("127.0.0."):
+    if not CASSANDRA_IP.startswith("127.0.0."):
         return unittest.skip('Tests only runs against local C*')
 
     def _id_and_mark(f):
@@ -373,7 +372,7 @@ def check_log_error():
 
 
 def remove_cluster():
-    if USE_CASS_EXTERNAL or KEEP_TEST_CLUSTER:
+    if KEEP_TEST_CLUSTER:
         return
 
     global CCM_CLUSTER
@@ -430,21 +429,6 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, 
     cassandra_version = ccm_options.get('version', CCM_VERSION)
 
     global CCM_CLUSTER
-    if USE_CASS_EXTERNAL:
-        if CCM_CLUSTER:
-            log.debug("Using external CCM cluster {0}".format(CCM_CLUSTER.name))
-        else:
-            ccm_path = os.getenv("CCM_PATH", None)
-            ccm_name = os.getenv("CCM_NAME", None)
-            if ccm_path and ccm_name:
-                CCM_CLUSTER = CCMClusterFactory.load(ccm_path, ccm_name)
-                log.debug("Using external CCM cluster {0}".format(CCM_CLUSTER.name))
-            else:
-                log.debug("Using unnamed external cluster")
-        if set_keyspace and start:
-            setup_keyspace(ipformat=ipformat, wait=False)
-        return
-
     if is_current_cluster(cluster_name, nodes, workloads):
         log.debug("Using existing cluster, matching topology: {0}".format(cluster_name))
     else:
@@ -549,7 +533,7 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, 
 
 
 def teardown_package():
-    if USE_CASS_EXTERNAL or KEEP_TEST_CLUSTER:
+    if KEEP_TEST_CLUSTER:
         return
     # when multiple modules are run explicitly, this runs between them
     # need to make sure CCM_CLUSTER is properly cleared for that case
@@ -600,7 +584,7 @@ def execute_with_long_wait_retry(session, query, timeout=30):
             del tb
             tries += 1
 
-    raise RuntimeError("Failed to execute query after 100 attempts: {0}".format(query))
+    raise RuntimeError("Failed to execute query after 10 attempts: {0}".format(query))
 
 
 def execute_with_retry_tolerant(session, query, retry_exceptions, escape_exception):
@@ -632,11 +616,7 @@ def drop_keyspace_shutdown_cluster(keyspace_name, session, cluster):
         cluster.shutdown()
 
 
-def setup_keyspace(ipformat=None, wait=True, protocol_version=None, port=9042):
-    # wait for nodes to startup
-    if wait:
-        time.sleep(10)
-
+def setup_keyspace(ipformat=None, protocol_version=None, port=9042):
     if protocol_version:
         _protocol_version = protocol_version
     else:
@@ -655,17 +635,17 @@ def setup_keyspace(ipformat=None, wait=True, protocol_version=None, port=9042):
 
         ddl = '''
             CREATE KEYSPACE test3rf
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '3'}'''
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '3'}'''
         execute_with_long_wait_retry(session, ddl)
 
         ddl = '''
             CREATE KEYSPACE test2rf
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '2'}'''
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '2'}'''
         execute_with_long_wait_retry(session, ddl)
 
         ddl = '''
             CREATE KEYSPACE test1rf
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}'''
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}'''
         execute_with_long_wait_retry(session, ddl)
 
         ddl_3f = '''
@@ -691,29 +671,56 @@ def is_scylla_enterprise(version: Version) -> bool:
     return version > Version('2000.1.1')
 
 
-def xfail_scylla_version_lt(reason, oss_scylla_version, ent_scylla_version, *args, **kwargs):
+def xfail_scylla_version_lt(reason, scylla_version, *args, **kwargs):
     """
     It is used to mark tests that are going to fail on certain scylla versions.
     :param reason: message to fail test with
-    :param oss_scylla_version: str, oss version from which test supposed to succeed
-    :param ent_scylla_version: str, enterprise version from which test supposed to succeed
+    :param scylla_version: str, version from which test supposed to succeed
     """
     if not (reason.startswith("scylladb/scylladb#") or reason.startswith("scylladb/scylla-enterprise#")):
         raise ValueError('reason should start with scylladb/scylladb#<issue-id> or scylladb/scylla-enterprise#<issue-id> to reference issue in scylla repo')
 
-    if not isinstance(ent_scylla_version, str):
-        raise ValueError('ent_scylla_version should be a str')
+    if not isinstance(scylla_version, str):
+        raise ValueError('scylla_version should be a str')
 
     if SCYLLA_VERSION is None:
         return pytest.mark.skipif(False, reason="It is just a NoOP Decor, should not skip anything")
 
     current_version = Version(get_scylla_version(SCYLLA_VERSION))
 
-    if is_scylla_enterprise(current_version):
-        return pytest.mark.xfail(current_version < Version(ent_scylla_version),
-                                 reason=reason, *args, **kwargs)
+    return pytest.mark.xfail(current_version < Version(scylla_version), reason=reason, *args, **kwargs)
 
-    return pytest.mark.xfail(current_version < Version(oss_scylla_version), reason=reason, *args, **kwargs)
+
+def get_tablets_disabled_ddl_suffix(scylla_version='2026.1'):
+    """
+    Returns DDL option string for disabling tablets on ScyllaDB versions older than scylla_version.
+    Used to work around features not yet supported with tablets (e.g. MVs, secondary indexes, counters).
+    :param scylla_version: str, version from which tablets support the feature
+    """
+    if SCYLLA_VERSION is not None and Version(get_scylla_version(SCYLLA_VERSION)) < Version(scylla_version):
+        return " AND tablets = {'enabled': false}"
+    return ""
+
+
+def skip_scylla_version_lt(reason, scylla_version):
+    """
+    Skip tests on scylla versions older than the specified thresholds.
+    :param reason: message explaining why the test is skipped
+    :param scylla_version: str, version from which test supposed to work
+    """
+    if not (reason.startswith("scylladb/scylladb#") or reason.startswith("scylladb/scylla-enterprise#")):
+        raise ValueError('reason should start with scylladb/scylladb#<issue-id> or scylladb/scylla-enterprise#<issue-id> to reference issue in scylla repo')
+
+    if not isinstance(scylla_version, str):
+        raise ValueError('scylla_version should be a str')
+
+    if SCYLLA_VERSION is None:
+        return pytest.mark.skipif(False, reason="It is just a NoOP Decor, should not skip anything")
+
+    current_version = Version(get_scylla_version(SCYLLA_VERSION))
+
+    return pytest.mark.skipif(current_version < Version(scylla_version), reason=reason)
+
 
 class UpDownWaiter(object):
 
@@ -762,7 +769,7 @@ class BasicKeyspaceUnitTestCase(unittest.TestCase):
 
     @classmethod
     def create_keyspace(cls, rf):
-        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '{1}'}}".format(cls.ks_name, rf)
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}".format(cls.ks_name, rf)
         execute_with_long_wait_retry(cls.session, ddl)
 
     @classmethod

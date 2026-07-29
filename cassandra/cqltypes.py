@@ -44,7 +44,7 @@ import sys
 from uuid import UUID
 
 from cassandra.marshal import (int8_pack, int8_unpack, int16_pack, int16_unpack,
-                               uint16_pack, uint16_unpack, uint32_pack, uint32_unpack,
+                               uint16_unpack, uint32_pack, uint32_unpack,
                                int32_pack, int32_unpack, int64_pack, int64_unpack,
                                float_pack, float_unpack, double_pack, double_unpack,
                                varint_pack, varint_unpack, point_be, point_le,
@@ -249,6 +249,8 @@ def lookup_casstype(casstype):
     """
     if isinstance(casstype, (CassandraType, CassandraTypeType)):
         return casstype
+    if '(' not in casstype:
+        return lookup_casstype_simple(casstype)
     try:
         return parse_casstype_args(casstype)
     except (ValueError, AssertionError, IndexError) as e:
