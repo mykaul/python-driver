@@ -13,7 +13,6 @@
 # limitations under the License.
 import atexit
 from collections import deque
-from functools import partial
 import logging
 import os
 import socket
@@ -125,6 +124,7 @@ class LibevLoop(object):
             for watcher in (conn._write_watcher, conn._read_watcher):
                 if watcher:
                     watcher.stop()
+            conn._socket.close()
 
         self.notify()  # wake the timer watcher
 
@@ -222,6 +222,8 @@ class LibevLoop(object):
                     conn._read_watcher.stop()
                     # clear reference cycles from IO callback
                     del conn._read_watcher
+                conn._socket.close()
+                log.debug("Closed socket to %s", conn.endpoint)
 
             changed = True
 
@@ -232,8 +234,20 @@ class LibevLoop(object):
             self._notifier.send()
 
 
+def _atexit_cleanup():
+    """Cleanup function called by atexit that uses the current _global_loop value.
+
+    This wrapper ensures that cleanup receives the actual LibevLoop instance
+    instead of None, which was the value of _global_loop when the module was
+    imported.
+    """
+    global _global_loop
+    if _global_loop is not None:
+        _cleanup(_global_loop)
+
+
 _global_loop = None
-atexit.register(partial(_cleanup, _global_loop))
+atexit.register(_atexit_cleanup)
 
 
 class LibevConnection(Connection):
@@ -297,8 +311,6 @@ class LibevConnection(Connection):
         log.debug("Closing connection (%s) to %s", id(self), self.endpoint)
 
         _global_loop.connection_destroyed(self)
-        self._socket.close()
-        log.debug("Closed socket to %s", self.endpoint)
 
         # don't leave in-progress operations hanging
         if not self.is_defunct:
@@ -309,6 +321,8 @@ class LibevConnection(Connection):
             self.connected_event.set()
 
     def handle_write(self, watcher, revents, errno=None):
+        if self.is_closed:
+            return
         if revents & libev.EV_ERROR:
             if errno:
                 exc = IOError(errno, os.strerror(errno))
@@ -350,6 +364,8 @@ class LibevConnection(Connection):
                         return
 
     def handle_read(self, watcher, revents, errno=None):
+        if self.is_closed:
+            return
         if revents & libev.EV_ERROR:
             if errno:
                 exc = IOError(errno, os.strerror(errno))

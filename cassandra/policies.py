@@ -514,7 +514,7 @@ class TokenAwarePolicy(LoadBalancingPolicy):
         else:
             replicas = self._cluster_metadata.get_replicas(keyspace, query.routing_key)
 
-        if self.shuffle_replicas and not query.is_lwt():
+        if self.shuffle_replicas and not query.is_lwt() and not ConsistencyLevel.is_serial(query.consistency_level):
             shuffle(replicas)
 
         def yield_in_order(hosts):
@@ -1158,7 +1158,7 @@ class ExponentialBackoffRetryPolicy(RetryPolicy):
         self.min_interval = min_interval
         self.max_num_retries = max_num_retries
         self.max_interval = max_interval
-        super(ExponentialBackoffRetryPolicy).__init__(*args, **kwargs)
+        super(ExponentialBackoffRetryPolicy, self).__init__(*args, **kwargs)
 
     def _calculate_backoff(self, attempt: int):
         delay = min(self.max_interval, self.min_interval * 2 ** attempt)
