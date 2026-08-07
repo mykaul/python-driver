@@ -514,7 +514,7 @@ class TokenAwarePolicy(LoadBalancingPolicy):
         else:
             replicas = self._cluster_metadata.get_replicas(keyspace, query.routing_key)
 
-        if self.shuffle_replicas and not query.is_lwt():
+        if self.shuffle_replicas and not query.is_lwt() and not ConsistencyLevel.is_serial(query.consistency_level):
             shuffle(replicas)
 
         def yield_in_order(hosts):
@@ -773,7 +773,7 @@ class ConstantReconnectionPolicy(ReconnectionPolicy):
     in-between each reconnection attempt.
     """
 
-    def __init__(self, delay, max_attempts=64):
+    def __init__(self, delay, max_attempts=None):
         """
         `delay` should be a floating point number of seconds to wait in-between
         each attempt.
@@ -807,10 +807,7 @@ class ExponentialReconnectionPolicy(ReconnectionPolicy):
     trying to reconnect at exactly the same time.
     """
 
-    # TODO: max_attempts is 64 to preserve legacy default behavior
-    # consider changing to None in major release to prevent the policy
-    # giving up forever
-    def __init__(self, base_delay, max_delay, max_attempts=64):
+    def __init__(self, base_delay, max_delay, max_attempts=None):
         """
         `base_delay` and `max_delay` should be in floating point units of
         seconds.
@@ -1158,7 +1155,7 @@ class ExponentialBackoffRetryPolicy(RetryPolicy):
         self.min_interval = min_interval
         self.max_num_retries = max_num_retries
         self.max_interval = max_interval
-        super(ExponentialBackoffRetryPolicy).__init__(*args, **kwargs)
+        super(ExponentialBackoffRetryPolicy, self).__init__(*args, **kwargs)
 
     def _calculate_backoff(self, attempt: int):
         delay = min(self.max_interval, self.min_interval * 2 ** attempt)
