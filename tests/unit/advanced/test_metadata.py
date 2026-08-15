@@ -16,7 +16,7 @@ import unittest
 
 from cassandra.metadata import (
     KeyspaceMetadata, TableMetadataDSE68,
-    VertexMetadata, EdgeMetadata, SchemaParserV22, _SchemaParser
+    VertexMetadata, EdgeMetadata, _SchemaParser
 )
 from cassandra.protocol import ResultMessage, RESULT_KIND_ROWS
 
@@ -34,8 +34,8 @@ class GraphMetadataToCQLTests(unittest.TestCase):
 
     def _create_keyspace_metadata(self, graph_engine):
         return KeyspaceMetadata(
-            'keyspace', True, 'org.apache.cassandra.locator.SimpleStrategy',
-            {'replication_factor': 1}, graph_engine=graph_engine)
+            'keyspace', True, 'org.apache.cassandra.locator.NetworkTopologyStrategy',
+            {'dc1': 1}, graph_engine=graph_engine)
 
     def _create_table_metadata(self, with_vertex=False, with_edge=False):
         tm = TableMetadataDSE68('keyspace', 'table')

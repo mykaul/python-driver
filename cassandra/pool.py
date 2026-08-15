@@ -18,11 +18,9 @@ Connection pooling and host management.
 from concurrent.futures import Future
 from functools import total_ordering
 import logging
-import socket
 import time
 import random
 import copy
-import uuid
 from threading import Lock, RLock, Condition
 import weakref
 try:
@@ -391,7 +389,7 @@ class HostConnection(object):
     # the number below, all excess connections will be closed.
     max_excess_connections_per_shard_multiplier = 3
 
-    tablets_routing_v1 = False
+    supports_tablet_routing = False
 
     def __init__(self, host, host_distance, session):
         self.host = host
@@ -438,11 +436,13 @@ class HostConnection(object):
         if first_connection.features.sharding_info and not self._session.cluster.shard_aware_options.disable:
             self.host.sharding_info = first_connection.features.sharding_info
             self._open_connections_for_all_shards(first_connection.features.shard_id)
-        self.tablets_routing_v1 = first_connection.features.tablets_routing_v1
+
+        self.supports_tablet_routing = first_connection.features.tablets_routing_v1 \
+                                       or first_connection.features.tablets_routing_v2
 
         log.debug("Finished initializing connection for host %s", self.host)
 
-    def _get_connection_for_routing_key(self, routing_key=None, keyspace=None, table=None):
+    def _get_connection_for_routing_key(self, routing_key=None, keyspace=None, table=None, routing_token=None):
         if self.is_shutdown:
             raise ConnectionException(
                 "Pool for %s is shutdown" % (self.host,), self.host)
@@ -452,22 +452,32 @@ class HostConnection(object):
 
         shard_id = None
         if not self._session.cluster.shard_aware_options.disable and self.host.sharding_info and routing_key:
-            t = self._session.cluster.metadata.token_map.token_class.from_key(routing_key)
-            
-            shard_id = None
-            if self.tablets_routing_v1 and table is not None:
+            # Reuse the token computed once for this request when available, so
+            # the routing-key hash runs once per request instead of again here;
+            # fall back to hashing the routing key directly otherwise. The caller
+            # leaves the token unset when the cluster's partitioner cannot be
+            # hashed (see Session._create_response_future), so the fallback has to
+            # make the same check rather than retry a hash that would raise.
+            metadata = self._session.cluster.metadata
+            t = routing_token
+            if t is None and metadata.token_map is not None and metadata.can_support_partitioner():
+                t = metadata.token_map.token_class.from_key(routing_key)
+            if t is not None and self.supports_tablet_routing and table is not None:
                 if keyspace is None:
                     keyspace = self._keyspace
 
                 tablet = self._session.cluster.metadata._tablets.get_tablet_for_key(keyspace, table, t)
 
+                # In both V1 and V2 the request is sent to this host, so we pick
+                # the shard that this host owns for the tablet. Leader-aware host
+                # selection (V2) happens earlier, in the load balancing policy.
                 if tablet is not None:
                     for replica in tablet.replicas:
                         if replica[0] == self.host.host_id:
                             shard_id = replica[1]
                             break
 
-            if shard_id is None:
+            if shard_id is None and t is not None:
                 shard_id = self.host.sharding_info.shard_id_from_token(t.value)
 
         conn = self._connections.get(shard_id)
@@ -476,12 +486,6 @@ class HostConnection(object):
         # optimistic try to connect to it
         if shard_id is not None:
             if conn:
-                log.debug(
-                    "Using connection to shard_id=%i on host %s for routing_key=%s",
-                    shard_id,
-                    self.host,
-                    routing_key
-                )
                 if conn.orphaned_threshold_reached and shard_id not in self._connecting:
                     # The connection has met its orphaned stream ID limit
                     # and needs to be replaced. Start opening a connection
@@ -514,15 +518,15 @@ class HostConnection(object):
             return random.choice(active_connections)
         return random.choice(list(self._connections.values()))
 
-    def borrow_connection(self, timeout, routing_key=None, keyspace=None, table=None):
-        conn = self._get_connection_for_routing_key(routing_key, keyspace, table)
+    def borrow_connection(self, timeout, routing_key=None, keyspace=None, table=None, routing_token=None):
+        conn = self._get_connection_for_routing_key(routing_key, keyspace, table, routing_token)
         start = time.time()
         remaining = timeout
         last_retry = False
         while True:
             if conn.is_closed:
                 # The connection might have been closed in the meantime - if so, try again
-                conn = self._get_connection_for_routing_key(routing_key, keyspace, table)
+                conn = self._get_connection_for_routing_key(routing_key, keyspace, table, routing_token)
             with conn.lock:
                 if (not conn.is_closed or last_retry) and conn.in_flight < conn.max_request_id:
                     # On last retry we ignore connection status, since it is better to return closed connection than
@@ -683,15 +687,26 @@ class HostConnection(object):
         self.advanced_shardaware_block_until = max(time.time() + secs, self.advanced_shardaware_block_until)
 
     def _get_shard_aware_endpoint(self):
-        if (self.advanced_shardaware_block_until and self.advanced_shardaware_block_until < time.time()) or \
+        """
+        Return an endpoint for the advertised shard-aware port, if usable.
+
+        Plaintext clusters use shard_aware_port. SSL-enabled clusters use only
+        shard_aware_port_ssl; if it is absent, return None so the pool opens a
+        regular SSL connection instead of falling back to the plaintext port.
+        Explicit ssl_options={}, like ssl_context, marks the cluster SSL-enabled.
+        """
+        if (self.advanced_shardaware_block_until and self.advanced_shardaware_block_until > time.time()) or \
            self._session.cluster.shard_aware_options.disable_shardaware_port:
             return None
 
+        cluster = self._session.cluster
+        ssl_enabled = cluster.ssl_context is not None or cluster.ssl_options is not None
+
         endpoint = None
-        if self._session.cluster.ssl_options and self.host.sharding_info.shard_aware_port_ssl:
+        if ssl_enabled and self.host.sharding_info.shard_aware_port_ssl:
             endpoint = copy.copy(self.host.endpoint)
             endpoint._port = self.host.sharding_info.shard_aware_port_ssl
-        elif self.host.sharding_info.shard_aware_port:
+        elif not ssl_enabled and self.host.sharding_info.shard_aware_port:
             endpoint = copy.copy(self.host.endpoint)
             endpoint._port = self.host.sharding_info.shard_aware_port
 
@@ -926,5 +941,3 @@ class HostConnection(object):
     @property
     def _excess_connection_limit(self):
         return self.host.sharding_info.shards_count * self.max_excess_connections_per_shard_multiplier
-
-
