@@ -27,14 +27,17 @@ from cassandra import (Unavailable, WriteTimeout, RateLimitReached, ReadTimeout,
                        AlreadyExists, InvalidRequest, Unauthorized,
                        UnsupportedOperation, UserFunctionDescriptor,
                        UserAggregateDescriptor, SchemaTargetType)
-from cassandra.cqltypes import (AsciiType, BytesType, BooleanType,
-                                CounterColumnType, DateType, DecimalType,
-                                DoubleType, FloatType, Int32Type,
-                                InetAddressType, IntegerType, ListType,
-                                LongType, MapType, SetType, TimeUUIDType,
-                                UTF8Type, VarcharType, UUIDType, UserType,
-                                TupleType, lookup_casstype, SimpleDateType,
-                                TimeType, ByteType, ShortType, DurationType)
+# NOTE: many of these names are not referenced directly, but are required in module
+# scope because ResultMessage.type_codes resolves them dynamically via globals()[name]
+# (see the type_codes mapping below). Do not remove as "unused imports".
+from cassandra.cqltypes import (AsciiType, BytesType, BooleanType,  # noqa: F401
+                                CounterColumnType, DateType, DecimalType,  # noqa: F401
+                                DoubleType, FloatType, Int32Type,  # noqa: F401
+                                InetAddressType, IntegerType, ListType,  # noqa: F401
+                                LongType, MapType, SetType, TimeUUIDType,  # noqa: F401
+                                UTF8Type, VarcharType, UUIDType, UserType,  # noqa: F401
+                                TupleType, lookup_casstype, SimpleDateType,  # noqa: F401
+                                TimeType, ByteType, ShortType, DurationType)  # noqa: F401
 from cassandra.marshal import (int32_pack, int32_unpack, uint16_pack, uint16_unpack,
                                uint8_pack, int8_unpack, uint64_pack,
                                v3_header_pack, uint32_pack, uint32_le_unpack, uint32_le_pack)
@@ -421,7 +424,7 @@ class StartupMessage(_MessageType):
         self.cqlversion = cqlversion
         self.options = options
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features=None):
         optmap = self.options.copy()
         optmap['CQL_VERSION'] = self.cqlversion
         write_stringmap(f, optmap)
@@ -456,7 +459,7 @@ class CredentialsMessage(_MessageType):
     def __init__(self, creds):
         self.creds = creds
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features=None):
         if protocol_version > 1:
             raise UnsupportedOperation(
                 "Credentials-based authentication is not supported with "
@@ -487,7 +490,7 @@ class AuthResponseMessage(_MessageType):
     def __init__(self, response):
         self.response = response
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features=None):
         write_longstring(f, self.response)
 
 
@@ -507,7 +510,7 @@ class OptionsMessage(_MessageType):
     opcode = 0x05
     name = 'OPTIONS'
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features=None):
         pass
 
 
@@ -555,7 +558,15 @@ class _QueryMessage(_MessageType):
         self.skip_meta = skip_meta
         self.keyspace = keyspace
 
-    def _write_query_params(self, f, protocol_version):
+    def _should_skip_metadata(self, protocol_version, protocol_features):
+        """Whether to set ``_SKIP_METADATA_FLAG`` on this message.
+
+        The base is unconditional (the message's own ``skip_meta``); subclasses
+        narrow it based on the connection's negotiated features.
+        """
+        return self.skip_meta
+
+    def _write_query_params(self, f, protocol_version, protocol_features=None):
         write_consistency_level(f, self.consistency_level)
         flags = 0x00
         if self.query_params is not None:
@@ -572,6 +583,9 @@ class _QueryMessage(_MessageType):
 
         if self.timestamp is not None:
             flags |= _PROTOCOL_TIMESTAMP_FLAG
+
+        if self._should_skip_metadata(protocol_version, protocol_features):
+            flags |= _SKIP_METADATA_FLAG
 
         if self.keyspace is not None:
             if ProtocolVersion.uses_keyspace_flag(protocol_version):
@@ -611,14 +625,26 @@ class QueryMessage(_QueryMessage):
     name = 'QUERY'
 
     def __init__(self, query, consistency_level, serial_consistency_level=None,
-                 fetch_size=None, paging_state=None, timestamp=None, continuous_paging_options=None, keyspace=None):
+                 fetch_size=None, paging_state=None, timestamp=None, continuous_paging_options=None, keyspace=None,
+                 query_params=None):
         self.query = query
-        super(QueryMessage, self).__init__(None, consistency_level, serial_consistency_level, fetch_size,
+        super(QueryMessage, self).__init__(query_params, consistency_level, serial_consistency_level, fetch_size,
                                            paging_state, timestamp, False, continuous_paging_options, keyspace)
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features=None):
         write_longstring(f, self.query)
-        self._write_query_params(f, protocol_version)
+        self._write_query_params(f, protocol_version, protocol_features)
+
+
+def _metadata_id_negotiated(protocol_version, protocol_features):
+    """Whether the result-metadata-id field is part of the frame layout.
+
+    It is part of the layout of EXECUTE requests and PREPARE responses whenever
+    the connection speaks CQL v5+ natively or negotiated SCYLLA_USE_METADATA_ID,
+    so on such connections it must always be written and always be read.
+    """
+    return (ProtocolVersion.uses_prepared_metadata(protocol_version)
+            or (protocol_features is not None and protocol_features.use_metadata_id))
 
 
 class ExecuteMessage(_QueryMessage):
@@ -634,14 +660,35 @@ class ExecuteMessage(_QueryMessage):
         super(ExecuteMessage, self).__init__(query_params, consistency_level, serial_consistency_level, fetch_size,
                                              paging_state, timestamp, skip_meta, continuous_paging_options)
 
-    def _write_query_params(self, f, protocol_version):
-        super(ExecuteMessage, self)._write_query_params(f, protocol_version)
+    def _should_skip_metadata(self, protocol_version, protocol_features):
+        """Whether to ask the server to skip sending result metadata.
 
-    def send_body(self, f, protocol_version):
+        Only when the SCYLLA_USE_METADATA_ID extension is negotiated on this
+        connection. Without the metadata-id mechanism a schema change after
+        PREPARE would leave the driver decoding rows with stale cached metadata.
+
+        This is deliberately narrower than :func:`_metadata_id_negotiated`: on
+        native CQL v5 the metadata-id field is part of the frame layout, but we
+        do NOT emit ``_SKIP_METADATA_FLAG`` there. Upstream never emitted it on
+        any version, and turning the skip optimization on for native v5 is a
+        separate behavior change out of scope for this Scylla extension.
+        """
+        return (self.skip_meta
+                and protocol_features is not None
+                and protocol_features.use_metadata_id)
+
+    def _write_query_params(self, f, protocol_version, protocol_features=None):
+        super(ExecuteMessage, self)._write_query_params(f, protocol_version, protocol_features)
+
+    def send_body(self, f, protocol_version, protocol_features=None):
         write_string(f, self.query_id)
-        if ProtocolVersion.uses_prepared_metadata(protocol_version):
-            write_string(f, self.result_metadata_id)
-        self._write_query_params(f, protocol_version)
+        if _metadata_id_negotiated(protocol_version, protocol_features):
+            # An empty id is written when the statement has no cached metadata id
+            # (prepared before the extension was negotiated, e.g. in a mixed
+            # cluster): the server treats the mismatch as METADATA_CHANGED and
+            # responds with full metadata plus the current id.
+            write_string(f, self.result_metadata_id if self.result_metadata_id is not None else b'')
+        self._write_query_params(f, protocol_version, protocol_features)
 
 
 CUSTOM_TYPE = object()
@@ -744,7 +791,7 @@ class ResultMessage(_MessageType):
 
     def recv_results_prepared(self, f, protocol_version, protocol_features, user_type_map):
         self.query_id = read_binary_string(f)
-        if ProtocolVersion.uses_prepared_metadata(protocol_version):
+        if _metadata_id_negotiated(protocol_version, protocol_features):
             self.result_metadata_id = read_binary_string(f)
         else:
             self.result_metadata_id = None
@@ -866,7 +913,7 @@ class PrepareMessage(_MessageType):
         self.query = query
         self.keyspace = keyspace
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features=None):
         write_longstring(f, self.query)
 
         flags = 0x00
@@ -910,7 +957,7 @@ class BatchMessage(_MessageType):
         self.timestamp = timestamp
         self.keyspace = keyspace
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features=None):
         write_byte(f, self.batch_type.value)
         write_short(f, len(self.queries))
         for prepared, string_or_query_id, params in self.queries:
@@ -968,7 +1015,7 @@ class RegisterMessage(_MessageType):
     def __init__(self, event_list):
         self.event_list = event_list
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features=None):
         write_stringlist(f, self.event_list)
 
 
@@ -1042,7 +1089,7 @@ class ReviseRequestMessage(_MessageType):
         self.op_id = op_id
         self.next_pages = next_pages
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features=None):
         write_int(f, self.op_type)
         write_int(f, self.op_id)
         if self.op_type == ReviseRequestMessage.RevisionType.PAGING_BACKPRESSURE:
@@ -1075,7 +1122,8 @@ class _ProtocolHandler(object):
     """Instance of :class:`cassandra.policies.ColumnEncryptionPolicy` in use by this handler"""
 
     @classmethod
-    def encode_message(cls, msg, stream_id, protocol_version, compressor, allow_beta_protocol_version):
+    def encode_message(cls, msg, stream_id, protocol_version, compressor, allow_beta_protocol_version,
+                       protocol_features):
         """
         Encodes a message using the specified frame parameters, and compressor
 
@@ -1083,6 +1131,11 @@ class _ProtocolHandler(object):
         :param stream_id: protocol stream id for the frame header
         :param protocol_version: version for the frame header, and used encoding contents
         :param compressor: optional compression function to be used on the body
+        :param protocol_features: :class:`~cassandra.protocol_features.ProtocolFeatures` negotiated on the connection
+            this message is sent over, forwarded to ``send_body``. Messages carry
+            connection-independent request data; ``send_body`` decides the wire format from
+            ``(protocol_version, protocol_features)``, so fields belonging to a negotiated
+            protocol extension are emitted exactly on the connections that negotiated it.
         """
         flags = 0
         if msg.custom_payload:
@@ -1104,7 +1157,7 @@ class _ProtocolHandler(object):
             body = io.BytesIO()
             if msg.custom_payload:
                 write_bytesmap(body, msg.custom_payload)
-            msg.send_body(body, protocol_version)
+            msg.send_body(body, protocol_version, protocol_features)
             body = body.getvalue()
 
             if len(body) > 0:
@@ -1116,7 +1169,7 @@ class _ProtocolHandler(object):
         else:
             if msg.custom_payload:
                 write_bytesmap(buff, msg.custom_payload)
-            msg.send_body(buff, protocol_version)
+            msg.send_body(buff, protocol_version, protocol_features)
 
             length = buff.tell() - 9
 

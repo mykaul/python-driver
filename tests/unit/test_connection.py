@@ -21,11 +21,12 @@ from unittest.mock import Mock, ANY, call, patch
 from cassandra import OperationTimedOut
 from cassandra.cluster import Cluster
 from cassandra.connection import (Connection, HEADER_DIRECTION_TO_CLIENT, ProtocolError,
-                                  locally_supported_compressions, ConnectionHeartbeat, _Frame, Timer, TimerManager,
+                                  locally_supported_compressions, ConnectionHeartbeat, HeartbeatFuture, _Frame, Timer, TimerManager,
                                   ConnectionException, ConnectionShutdown, DefaultEndPoint, ShardAwarePortGenerator)
 from cassandra.marshal import uint8_pack, uint32_pack, int32_pack
 from cassandra.protocol import (write_stringmultimap, write_int, write_string,
-                                SupportedMessage, ProtocolHandler)
+                                SupportedMessage, ProtocolHandler, ResultMessage,
+                                RESULT_KIND_SET_KEYSPACE)
 
 from tests.util import wait_until, assertRegex
 import pytest
@@ -256,6 +257,60 @@ class ConnectionTest(unittest.TestCase):
         c.set_keyspace_blocking('ks')
         assert c.keyspace == 'ks'
 
+    def test_set_keyspace_blocking_escapes_quotes(self):
+        """
+        Test that set_keyspace_blocking properly escapes double quotes in
+        keyspace names to prevent CQL injection. This is the Python equivalent
+        of the vulnerability fixed in the Go driver:
+        https://github.com/scylladb/gocql/pull/783
+        """
+        c = self.make_connection()
+        c.wait_for_response = Mock(return_value=ResultMessage(kind=RESULT_KIND_SET_KEYSPACE))
+
+        c.set_keyspace_blocking('my"ks')
+        query_msg = c.wait_for_response.call_args[0][0]
+        assert query_msg.query == 'USE "my""ks"', (
+            "Double quotes in keyspace name must be escaped as double-double quotes")
+
+    def test_set_keyspace_async_escapes_quotes(self):
+        """
+        Test that set_keyspace_async properly escapes double quotes in
+        keyspace names to prevent CQL injection.
+        """
+        c = self.make_connection()
+        c.lock = Lock()
+        c.in_flight = 0
+        c.max_request_id = 100
+        c.get_request_id = Mock(return_value=1)
+        c.send_msg = Mock()
+
+        callback = Mock()
+        c.set_keyspace_async('my"ks', callback)
+
+        query_msg = c.send_msg.call_args[0][0]
+        assert query_msg.query == 'USE "my""ks"', (
+            "Double quotes in keyspace name must be escaped as double-double quotes")
+
+    def test_send_msg_passes_negotiated_features_to_encoder(self):
+        """
+        send_msg must hand the connection's negotiated ProtocolFeatures to the
+        encoder, so message serialization can emit fields belonging to protocol
+        extensions exactly on the connections that negotiated them.
+        """
+        c = self.make_connection()
+        c.push = Mock()
+        captured = {}
+
+        def encoder(msg, stream_id, protocol_version, compressor, allow_beta_protocol_version,
+                    protocol_features=None):
+            captured['protocol_features'] = protocol_features
+            return b'encoded-frame'
+
+        c.send_msg(Mock(), 1, cb=Mock(), encoder=encoder, decoder=Mock())
+
+        assert captured['protocol_features'] is c.features
+        c.push.assert_called_once_with(b'encoded-frame')
+
     def test_set_connection_class(self):
         cluster = Cluster(connection_class='test')
         assert 'test' == cluster.connection_class
@@ -428,6 +483,31 @@ class ConnectionHeartbeatTest(unittest.TestCase):
         holder.return_connection.assert_has_calls(
             [call(max_connection)] * get_holders.call_count)
 
+    def test_heartbeat_future_releases_request_id_when_send_fails(self, *args):
+        connection = Connection(DefaultEndPoint('1.2.3.4'))
+        connection.push = Mock(side_effect=ConnectionException("write failed"))
+        owner = Mock()
+        initial_in_flight = connection.in_flight
+        initial_request_ids = len(connection.request_ids)
+
+        # HostConnection.return_connection releases the heartbeat's in-flight slot.
+        def return_connection(conn):
+            with conn.lock:
+                conn.in_flight -= 1
+
+        owner.return_connection.side_effect = return_connection
+
+        future = HeartbeatFuture(connection, owner)
+
+        with pytest.raises(ConnectionException):
+            future.wait(0)
+
+        owner.return_connection(connection)
+
+        assert connection.in_flight == initial_in_flight
+        assert len(connection.request_ids) == initial_request_ids
+        assert not connection._requests
+
     def test_unexpected_response(self, *args):
         request_id = 999
 
@@ -485,6 +565,8 @@ class ConnectionHeartbeatTest(unittest.TestCase):
         assert isinstance(exc, OperationTimedOut)
         assert exc.errors == 'Connection heartbeat timeout after 0.05 seconds'
         assert exc.last_host == DefaultEndPoint('localhost')
+        assert exc.timeout == 0.05
+        assert isinstance(exc.in_flight, int)
         holder.return_connection.assert_has_calls(
             [call(connection)] * get_holders.call_count)
 

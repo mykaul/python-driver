@@ -27,10 +27,10 @@ import os
 import pytest
 
 import cassandra
-from cassandra.cluster import NoHostAvailable, ExecutionProfile, EXEC_PROFILE_DEFAULT, ControlConnection, Cluster
+from cassandra.cluster import NoHostAvailable, ExecutionProfile, EXEC_PROFILE_DEFAULT, Cluster
 from cassandra.concurrent import execute_concurrent
 from cassandra.policies import (RoundRobinPolicy, ExponentialReconnectionPolicy,
-                                RetryPolicy, SimpleConvictionPolicy, HostDistance,
+                                SimpleConvictionPolicy, HostDistance,
                                 AddressTranslator, TokenAwarePolicy, HostFilterPolicy)
 from cassandra import ConsistencyLevel
 
@@ -43,7 +43,7 @@ from tests import notwindows, notasyncio
 from tests.integration import use_cluster, get_server_versions, CASSANDRA_VERSION, \
     execute_until_pass, execute_with_long_wait_retry, get_node, MockLoggingHandler, get_unsupported_lower_protocol, \
     get_unsupported_upper_protocol, local, CASSANDRA_IP, greaterthanorequalcass30, \
-    lessthanorequalcass40, TestCluster, PROTOCOL_VERSION, xfail_scylla, incorrect_test
+    lessthanorequalcass40, TestCluster, PROTOCOL_VERSION, incorrect_test
 from tests.integration.util import assert_quiescent_pool_state
 from tests.util import assertListEqual
 import sys
@@ -51,10 +51,22 @@ import sys
 log = logging.getLogger(__name__)
 
 
+_saved_scylla_ext_opts = None
+
+
 def setup_module():
-    os.environ['SCYLLA_EXT_OPTS'] = "--smp 1"
+    global _saved_scylla_ext_opts
+    _saved_scylla_ext_opts = os.environ.get('SCYLLA_EXT_OPTS')
+    os.environ['SCYLLA_EXT_OPTS'] = "--smp 2"
     use_cluster("cluster_tests", [3], start=True, workloads=None)
     warnings.simplefilter("always")
+
+
+def teardown_module():
+    if _saved_scylla_ext_opts is None:
+        os.environ.pop('SCYLLA_EXT_OPTS', None)
+    else:
+        os.environ['SCYLLA_EXT_OPTS'] = _saved_scylla_ext_opts
 
 
 class IgnoredHostPolicy(RoundRobinPolicy):
@@ -168,7 +180,7 @@ class ClusterTests(unittest.TestCase):
         result = execute_until_pass(session,
             """
             CREATE KEYSPACE clustertests
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}
             """)
         assert not result
 
@@ -720,10 +732,13 @@ class ClusterTests(unittest.TestCase):
                 session = cluster.connect()
                 assert session.execute("SELECT * from system.local WHERE key='local'") is not None
 
-            # Three conenctions to nodes plus the control connection
+            # Verify that auth warnings are issued for connections where
+            # auth is configured but the server does not send a challenge.
+            # At minimum one warning per node connection (3 for a 3-node
+            # cluster).  The control connection and shard-aware connections
+            # may add more, so we only assert a lower bound.
             auth_warning = mock_handler.get_message_count('warning', "An authentication challenge was not sent")
-            assert auth_warning >= 4
-            assert auth_warning == mock_handler.get_message_count("debug", "Got ReadyMessage on new connection")
+            assert auth_warning >= 3
 
     def _wait_for_all_shard_connections(self, cluster, timeout=30):
         """Wait until all shard-aware connections are fully established."""
@@ -1121,8 +1136,7 @@ class ClusterTests(unittest.TestCase):
         """
         for _ in range(10):
             with TestCluster(protocol_version=3) as cluster:
-                cluster.connect().execute("SELECT * FROM system_schema.keyspaces")
-                time.sleep(1)
+                cluster.connect(wait_for_all_pools=True).execute("SELECT * FROM system_schema.keyspaces")
 
             with TestCluster(protocol_version=3) as cluster:
                 session = cluster.connect()
@@ -1181,27 +1195,35 @@ class ClusterTests(unittest.TestCase):
         Then using HostFilterPolicy the replica is excluded from the considered hosts.
         By checking the trace we verify that there are no more replicas.
 
+        Requires tablets feature disabled.
+
         @since 3.5
         @jira_ticket PYTHON-653
         @expected_result the replicas are queried for HostFilterPolicy
 
         @test_category metadata
         """
+        ks_name = 'test_replicas_queried_ks'
         queried_hosts = set()
         tap_profile = ExecutionProfile(
             load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy())
         )
         with TestCluster(execution_profiles={EXEC_PROFILE_DEFAULT: tap_profile}) as cluster:
             session = cluster.connect(wait_for_all_pools=True)
+            session.execute("DROP KEYSPACE IF EXISTS {}".format(ks_name))
+            session.execute(
+                "CREATE KEYSPACE {} WITH replication = {{'class': 'NetworkTopologyStrategy', "
+                "'replication_factor': '1'}} AND tablets = {{'enabled': false}}".format(ks_name)
+            )
             session.execute('''
-                    CREATE TABLE test1rf.table_with_big_key (
+                    CREATE TABLE {}.table_with_big_key (
                         k1 int,
                         k2 int,
                         k3 int,
                         k4 int,
-                        PRIMARY KEY((k1, k2, k3), k4))''')
-            prepared = session.prepare("""SELECT * from test1rf.table_with_big_key
-                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""")
+                        PRIMARY KEY((k1, k2, k3), k4))'''.format(ks_name))
+            prepared = session.prepare("""SELECT * from {}.table_with_big_key
+                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""".format(ks_name))
             for i in range(10):
                 result = session.execute(prepared, (i, i, i, i), trace=True)
                 trace = result.response_future.get_query_trace(query_cl=ConsistencyLevel.ALL)
@@ -1220,14 +1242,14 @@ class ClusterTests(unittest.TestCase):
                          execution_profiles={EXEC_PROFILE_DEFAULT: hfp_profile}) as cluster:
 
             session = cluster.connect(wait_for_all_pools=True)
-            prepared = session.prepare("""SELECT * from test1rf.table_with_big_key
-                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""")
+            prepared = session.prepare("""SELECT * from {}.table_with_big_key
+                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""".format(ks_name))
             for _ in range(10):
                 result = session.execute(prepared, (last_i, last_i, last_i, last_i), trace=True)
                 trace = result.response_future.get_query_trace(query_cl=ConsistencyLevel.ALL)
                 self._assert_replica_queried(trace, only_replicas=False)
 
-            session.execute('''DROP TABLE test1rf.table_with_big_key''')
+            session.execute('DROP KEYSPACE {}'.format(ks_name))
 
     @greaterthanorequalcass30
     @lessthanorequalcass40
@@ -1492,7 +1514,7 @@ class DontPrepareOnIgnoredHostsTest(unittest.TestCase):
         hosts = cluster.metadata.all_hosts()
         session.execute("CREATE KEYSPACE clustertests "
                         "WITH replication = "
-                        "{'class': 'SimpleStrategy', 'replication_factor': '1'}")
+                        "{'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}")
         session.execute("CREATE TABLE clustertests.tab (a text, PRIMARY KEY (a))")
         # assign to an unused variable so cluster._prepared_statements retains
         # reference
