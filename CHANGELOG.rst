@@ -1,3 +1,98 @@
+Unreleased
+==========
+
+Features
+--------
+* Negotiate and implement the ``SCYLLA_USE_METADATA_ID`` protocol extension: prepared
+  statements skip re-sending result metadata on EXECUTE, and the driver automatically
+  refreshes cached metadata when the server detects a schema change (DRIVER-153)
+
+Others
+------
+* ``PreparedStatement.result_metadata`` and ``PreparedStatement.result_metadata_id`` are
+  now read-only. They are replaced together by
+  ``PreparedStatement.update_result_metadata()``, so a request can never observe a metadata
+  id paired with result metadata from a different schema version. Code that assigned either
+  attribute directly must call ``update_result_metadata()`` instead.
+* Message serialization now receives the connection's negotiated ``ProtocolFeatures``:
+  ``Connection.send_msg`` passes ``protocol_features`` to the encoder, and
+  ``_ProtocolHandler.encode_message`` forwards it to each message's ``send_body``.
+  This changes the contracted signature of ``encode_message`` (and of ``send_body``).
+  Custom protocol handlers that override ``encode_message`` must accept a required
+  ``protocol_features`` keyword argument (adding ``**kwargs`` is recommended for
+  future-proofing), and custom encoders that delegate to ``msg.send_body`` should
+  forward it. There is deliberately no compatibility fallback: protocol extensions
+  are negotiated per connection at STARTUP, so an encoder unaware of
+  ``protocol_features`` could silently omit fields a negotiated extension requires.
+  This release emits no new bytes on the wire; the parameter is groundwork for
+  upcoming protocol extensions (``SCYLLA_USE_METADATA_ID``, ``TABLETS_ROUTING_V2``).
+
+3.29.11
+=======
+Jun 15, 2026
+
+Features
+--------
+* asyncio backend now supports TLS
+
+Bug Fixes
+---------
+* Race conditions in libev backend resulting in EBADF error have been fixed
+
+Testing / CI
+------------
+* Integration tests now use ``NetworkTopologyStrategy`` instead of ``SimpleStrategy``
+* All actions used in CI are now hash-pinned to decrease risk of supply-chain attacks
+* Various fixes to make CI tests work with various versions of Scylla - mostly related to tablets and LWT
+* Bumped Scylla version used in CI to 2026.1
+
+3.29.10
+=======
+May 10, 2026
+
+Features
+--------
+* Fast-path ``lookup_casstype()`` for simple type names
+* Add ``Session.wait_for_schema_agreement``
+
+Bug Fixes
+---------
+* Fix CQL injection in ``Connection.set_keyspace_blocking`` and ``Connection.set_keyspace_async``
+* Fix libev shutdown crashes by correcting atexit registration
+* Handle ``None`` ``control_connection_timeout`` in ``wait_for_schema_agreement``
+* Clean up failed heartbeat sends
+* Fix ``ExponentialBackoffRetryPolicy.__init__`` super() call
+* Correct ``clustering_key`` to ``clustering`` in column kind filter
+* Fix inverted cooldown check in ``_get_shard_aware_endpoint``
+
+Others
+------
+* Deprecate ``ControlConnection.wait_for_schema_agreement``
+* Add timeout and in-flight observability to ``OperationTimedOut``
+* Drop per-query connection log
+
+3.29.9
+======
+March 18, 2026
+
+Features
+--------
+* Add Private Link support via client routes handler
+* Add optional query_params parameter to QueryMessage
+
+Bug Fixes
+---------
+* Fix segmentation fault in libev prepare_callback during shutdown
+* Add null checks to io_callback and timer_callback in libev wrapper
+* Fix RecursionError in execute_concurrent on synchronous errbacks
+* Fix floating-point precision loss for timestamps far from epoch
+
+Others
+------
+* Cache parsed tablet routing type in ResponseFuture
+* Remove deprecated setup_requires in favor of PEP 517 build-system.requires
+* Update dependency hatchling to v1.29.0
+
 3.29.8
 ======
 February 09, 2026

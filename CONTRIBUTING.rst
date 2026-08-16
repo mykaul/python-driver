@@ -40,6 +40,19 @@ When modifying driver files, rebuilding Cython modules is often necessary.
 Without caching, each such rebuild may take over a minute. Caching usually brings it
 down to about 2-3 seconds.
 
+**Important:** After modifying any ``.py`` file under ``cassandra/`` that is
+Cython-compiled (such as ``query.py``, ``protocol.py``, ``cluster.py``, etc.),
+extensions must be rebuilt before running tests. If you always use ``uv run``
+(e.g. ``uv run pytest``), this is handled automatically via the ``cache-keys``
+configuration in ``pyproject.toml``. If you invoke ``pytest`` directly, you can
+rebuild with::
+
+    uv sync --reinstall-package scylla-driver
+
+Without rebuilding, Python will load the stale compiled extension (``.so`` / ``.pyd``)
+instead of your modified ``.py`` source, and your changes will not actually be tested.
+The test suite will emit a warning if it detects this situation.
+
 Building the Docs
 =================
 
@@ -79,12 +92,6 @@ environment variable::
 Or you can specify a scylla/cassandra directory (to test unreleased versions)::
 
     SCYLLA_VERSION=/path/to/scylla uv run pytest tests/integration/standard/
-
-Specifying the usage of an already running Scylla cluster
-------------------------------------------------------------
-The test will start the appropriate Scylla clusters when necessary  but if you don't want this to happen because a Scylla cluster is already running the flag ``USE_CASS_EXTERNAL`` can be used, for example::
-
-    USE_CASS_EXTERNAL=1 SCYLLA_VERSION='release:5.1' uv run pytest tests/integration/standard
 
 Specify a Protocol Version for Tests
 ------------------------------------
