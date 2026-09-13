@@ -23,13 +23,14 @@ from cassandra import ConsistencyLevel, Unavailable, InvalidRequest, cluster
 from cassandra.query import (PreparedStatement, BoundStatement, SimpleStatement,
                              BatchStatement, BatchType, dict_factory, TraceUnavailable)
 from cassandra.cluster import NoHostAvailable, ExecutionProfile, EXEC_PROFILE_DEFAULT, Cluster
-from cassandra.policies import HostDistance, RoundRobinPolicy, WhiteListRoundRobinPolicy
+from cassandra.policies import RoundRobinPolicy, WhiteListRoundRobinPolicy
 from tests.integration import use_singledc, PROTOCOL_VERSION, BasicSharedKeyspaceUnitTestCase, \
     greaterthanprotocolv3, MockLoggingHandler, get_supported_protocol_versions, local, get_cluster, setup_keyspace, \
-    USE_CASS_EXTERNAL, greaterthanorequalcass40, TestCluster, xfail_scylla
+    greaterthanorequalcass40, TestCluster, xfail_scylla, xfail_scylla_version_lt, \
+    get_tablets_disabled_ddl_suffix, execute_with_long_wait_retry
 from tests import notwindows
 from tests.integration import greaterthanorequalcass30, get_node
-from tests.util import assertListEqual
+from tests.util import assertListEqual, wait_until
 
 import time
 import random
@@ -42,15 +43,14 @@ log = logging.getLogger(__name__)
 
 
 def setup_module():
-    if not USE_CASS_EXTERNAL:
-        use_singledc(start=False)
-        ccm_cluster = get_cluster()
-        ccm_cluster.stop()
-        # This is necessary because test_too_many_statements may
-        # timeout otherwise
-        config_options = {'write_request_timeout_in_ms': '20000'}
-        ccm_cluster.set_configuration_options(config_options)
-        ccm_cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
+    use_singledc(start=False)
+    ccm_cluster = get_cluster()
+    ccm_cluster.stop()
+    # This is necessary because test_too_many_statements may
+    # timeout otherwise
+    config_options = {'write_request_timeout_in_ms': '20000'}
+    ccm_cluster.set_configuration_options(config_options)
+    ccm_cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
 
     setup_keyspace()
 
@@ -804,6 +804,9 @@ class SerialConsistencyTests(unittest.TestCase):
     def tearDown(self):
         self.cluster.shutdown()
 
+    @xfail_scylla_version_lt(reason='scylladb/scylladb#18068 - LWT is not yet supported with tablets',
+                             scylla_version='2025.4',
+                             raises=InvalidRequest)
     def test_conditional_update(self):
         self.session.execute("INSERT INTO test3rf.test (k, v) VALUES (0, 0)")
         statement = SimpleStatement(
@@ -828,6 +831,9 @@ class SerialConsistencyTests(unittest.TestCase):
         assert result
         assert result.one().applied
 
+    @xfail_scylla_version_lt(reason='scylladb/scylladb#18068 - LWT is not yet supported with tablets',
+                             scylla_version='2025.4',
+                             raises=InvalidRequest)
     def test_conditional_update_with_prepared_statements(self):
         self.session.execute("INSERT INTO test3rf.test (k, v) VALUES (0, 0)")
         statement = self.session.prepare(
@@ -850,6 +856,9 @@ class SerialConsistencyTests(unittest.TestCase):
         assert result
         assert result.one().applied
 
+    @xfail_scylla_version_lt(reason='scylladb/scylladb#18068 - LWT is not yet supported with tablets',
+                             scylla_version='2025.4',
+                             raises=InvalidRequest)
     def test_conditional_update_with_batch_statements(self):
         self.session.execute("INSERT INTO test3rf.test (k, v) VALUES (0, 0)")
         statement = BatchStatement(serial_consistency_level=ConsistencyLevel.SERIAL)
@@ -915,6 +924,9 @@ class LightweightTransactionTests(unittest.TestCase):
         self.session.execute("DROP TABLE test3rf.lwt_clustering")
         self.cluster.shutdown()
 
+    @xfail_scylla_version_lt(reason='scylladb/scylladb#18068 - LWT is not yet supported with tablets',
+                             scylla_version='2025.4',
+                             raises=AttributeError)
     def test_no_connection_refused_on_timeout(self):
         """
         Test for PYTHON-91 "Connection closed after LWT timeout"
@@ -1156,6 +1168,12 @@ class BatchStatementDefaultRoutingKeyTests(unittest.TestCase):
 @greaterthanorequalcass30
 class MaterializedViewQueryTest(BasicSharedKeyspaceUnitTestCase):
 
+    @classmethod
+    def create_keyspace(cls, rf):
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}{2}".format(
+            cls.ks_name, rf, get_tablets_disabled_ddl_suffix())
+        execute_with_long_wait_retry(cls.session, ddl)
+
     def test_mv_filtering(self):
         """
         Test to ensure that cql filtering where clauses are properly supported in the python driver.
@@ -1359,12 +1377,12 @@ class BaseKeyspaceTests():
         cls.table_name = "table_query_keyspace_tests"
 
         ddl = """CREATE KEYSPACE {0} WITH replication =
-                        {{'class': 'SimpleStrategy',
+                        {{'class': 'NetworkTopologyStrategy',
                         'replication_factor': '{1}'}}""".format(cls.ks_name, 1)
         cls.session.execute(ddl)
 
         ddl = """CREATE KEYSPACE {0} WITH replication =
-                                {{'class': 'SimpleStrategy',
+                                {{'class': 'NetworkTopologyStrategy',
                                 'replication_factor': '{1}'}}""".format(cls.alternative_ks, 1)
         cls.session.execute(ddl)
 
@@ -1571,9 +1589,10 @@ class PreparedWithKeyspaceTests(BaseKeyspaceTests, unittest.TestCase):
 
             get_node(1).start(wait_for_binary_proto=True, wait_other_notice=True)
 
-            # We wait for cluster._prepare_all_queries to be called
-            time.sleep(5)
-            assert 1 == mock_handler.get_message_count('debug', 'Preparing all known prepared statements')
+            # Wait for cluster._prepare_all_queries to be called
+            wait_until(
+                lambda: mock_handler.get_message_count('debug', 'Preparing all known prepared statements') >= 1,
+                delay=0.5, max_attempts=20)
 
             results = self.session.execute(prepared_statement, (1,), execution_profile="only_first")
             assert results.one() == (1, )

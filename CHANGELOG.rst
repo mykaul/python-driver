@@ -1,3 +1,151 @@
+Unreleased
+==========
+
+Features
+--------
+* Report the driver's identity and configuration in the ``STARTUP`` options, where
+  ScyllaDB exposes them in the ``client_options`` column of its clients table
+  (DRIVER-950). Every connection now sends ``SESSION_ID``, a UUID identifying the
+  ``Cluster`` it belongs to and readable from the new ``Cluster.session_id``, so all of
+  a client's connections can be correlated with each other and with its own logs. The
+  control connection additionally sends ``DRIVER_CONFIG``, a JSON description of the
+  effective configuration, which for now carries only the schema version it follows.
+  Reporting the configuration can be turned off with the new
+  ``Cluster(driver_config_reporting_enabled=False)``; ``SESSION_ID`` is unaffected by
+  that setting. Reporting is best effort and never prevents a connection from being
+  established.
+* ``DRIVER_CONFIG`` now describes the configuration itself rather than only the schema
+  version it follows (DRIVER-379). The report covers connection settings (timeouts,
+  request capacity, shard awareness, socket options, reconnection policy, TLS hostname
+  verification), the driver's own control-plane query timeouts, and the query defaults
+  and policies a statement gets when it overrides none of them. It follows the JSON
+  schema shared with the other ScyllaDB drivers, so the same document describes a
+  client whichever driver wrote it. Custom policies are reported by type name only and
+  never by their attributes, so a policy holding a credential does not leak it into the
+  clients table.
+* ``Cluster.sockopts`` is now materialized at construction, so a one-shot iterable is
+  applied to every connection the cluster opens rather than only to the first one.
+* Negotiate and implement the ``SCYLLA_USE_METADATA_ID`` protocol extension: prepared
+  statements skip re-sending result metadata on EXECUTE, and the driver automatically
+  refreshes cached metadata when the server detects a schema change (DRIVER-153)
+
+Others
+------
+* ``DCAwareRoundRobinPolicy.local_dc`` is now read-only. It is set by the constructor,
+  and filled in by the policy itself when the constructor was given none, from the first
+  host to come up. Assigning it afterwards was indistinguishable from that inference,
+  and the two mean different things: a datacenter the application chose against one the
+  driver guessed. Code that assigned it should pass ``local_dc`` to the constructor
+  instead.
+* ``Connection.max_request_id`` and ``Connection.orphaned_threshold`` now follow the
+  ``max_in_flight`` actually in force. Both were computed in the class body, which runs
+  once, so a subclass that set its own ``max_in_flight`` inherited values derived from the
+  base class -- leaving, for example, a ``max_in_flight`` of 256 with a threshold of
+  24576, which a connection holding at most 256 orphaned stream ids can never reach, so
+  orphan-based connection replacement never happened for such a subclass. Each connection
+  now derives both in ``__init__`` from the limit in force when it is built, which
+  overrides a value a subclass sets in its class body. ``orphaned_threshold`` is also
+  capped at three quarters of the CQL stream id range, as ``max_request_id`` already was:
+  a ``max_in_flight`` raised past that range left the threshold above the number of stream
+  ids a connection can hold at all, which is the same bug in the other direction. The two
+  new static methods ``Connection.max_request_id_for()`` and
+  ``Connection.orphaned_threshold_for()`` expose the derivation, so that both limits can
+  be read for a given ``max_in_flight`` before any connection exists.
+* The ``STARTUP`` options that describe the driver itself are no longer the
+  application's to set. An ``ApplicationInfoBase.add_startup_options`` that sets
+  ``DRIVER_NAME``, ``DRIVER_VERSION``, ``SESSION_ID`` or ``DRIVER_CONFIG`` now has that
+  value dropped, with a warning naming the option; keys the driver does not own still
+  come through unchanged. Previously ``DRIVER_NAME`` and ``DRIVER_VERSION`` could be
+  overridden, which misreported the driver to the server for the life of the connection
+  and, in the clients table, to the operator reading the row.
+* ``PreparedStatement.result_metadata`` and ``PreparedStatement.result_metadata_id`` are
+  now read-only. They are replaced together by
+  ``PreparedStatement.update_result_metadata()``, so a request can never observe a metadata
+  id paired with result metadata from a different schema version. Code that assigned either
+  attribute directly must call ``update_result_metadata()`` instead.
+* Message serialization now receives the connection's negotiated ``ProtocolFeatures``:
+  ``Connection.send_msg`` passes ``protocol_features`` to the encoder, and
+  ``_ProtocolHandler.encode_message`` forwards it to each message's ``send_body``.
+  This changes the contracted signature of ``encode_message`` (and of ``send_body``).
+  Custom protocol handlers that override ``encode_message`` must accept a required
+  ``protocol_features`` keyword argument (adding ``**kwargs`` is recommended for
+  future-proofing), and custom encoders that delegate to ``msg.send_body`` should
+  forward it. There is deliberately no compatibility fallback: protocol extensions
+  are negotiated per connection at STARTUP, so an encoder unaware of
+  ``protocol_features`` could silently omit fields a negotiated extension requires.
+  This release emits no new bytes on the wire; the parameter is groundwork for
+  upcoming protocol extensions (``SCYLLA_USE_METADATA_ID``, ``TABLETS_ROUTING_V2``).
+* Python 3.15 is now supported: wheels are published for it (cibuildwheel builds
+  ``cp315`` since 4.2.0, against a release candidate that is ABI compatible with the
+  final release) and the integration tests run on 3.15 and on free-threaded 3.15t.
+  As for 3.14, no free-threaded wheels are published; ``3.15t`` is tested only.
+
+3.29.11
+=======
+Jun 15, 2026
+
+Features
+--------
+* asyncio backend now supports TLS
+
+Bug Fixes
+---------
+* Race conditions in libev backend resulting in EBADF error have been fixed
+
+Testing / CI
+------------
+* Integration tests now use ``NetworkTopologyStrategy`` instead of ``SimpleStrategy``
+* All actions used in CI are now hash-pinned to decrease risk of supply-chain attacks
+* Various fixes to make CI tests work with various versions of Scylla - mostly related to tablets and LWT
+* Bumped Scylla version used in CI to 2026.1
+
+3.29.10
+=======
+May 10, 2026
+
+Features
+--------
+* Fast-path ``lookup_casstype()`` for simple type names
+* Add ``Session.wait_for_schema_agreement``
+
+Bug Fixes
+---------
+* Fix CQL injection in ``Connection.set_keyspace_blocking`` and ``Connection.set_keyspace_async``
+* Fix libev shutdown crashes by correcting atexit registration
+* Handle ``None`` ``control_connection_timeout`` in ``wait_for_schema_agreement``
+* Clean up failed heartbeat sends
+* Fix ``ExponentialBackoffRetryPolicy.__init__`` super() call
+* Correct ``clustering_key`` to ``clustering`` in column kind filter
+* Fix inverted cooldown check in ``_get_shard_aware_endpoint``
+
+Others
+------
+* Deprecate ``ControlConnection.wait_for_schema_agreement``
+* Add timeout and in-flight observability to ``OperationTimedOut``
+* Drop per-query connection log
+
+3.29.9
+======
+March 18, 2026
+
+Features
+--------
+* Add Private Link support via client routes handler
+* Add optional query_params parameter to QueryMessage
+
+Bug Fixes
+---------
+* Fix segmentation fault in libev prepare_callback during shutdown
+* Add null checks to io_callback and timer_callback in libev wrapper
+* Fix RecursionError in execute_concurrent on synchronous errbacks
+* Fix floating-point precision loss for timestamps far from epoch
+
+Others
+------
+* Cache parsed tablet routing type in ResponseFuture
+* Remove deprecated setup_requires in favor of PEP 517 build-system.requires
+* Update dependency hatchling to v1.29.0
+
 3.29.8
 ======
 February 09, 2026

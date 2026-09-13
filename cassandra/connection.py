@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import  # to enable import io from stdlib
 from collections import defaultdict, deque
 import errno
 from functools import wraps, partial, total_ordering
@@ -25,18 +24,19 @@ import sys
 from threading import Thread, Event, RLock, Condition
 import time
 import ssl
+import uuid
 import weakref
 import random
 import itertools
-from typing import Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from cassandra.application_info import ApplicationInfoBase
+from cassandra.driver_config import (DriverConfigReporter, DRIVER_CONFIG_OPTION,
+                                     SESSION_ID_OPTION)
+from cassandra.client_routes import _ClientRoutesHandler
 from cassandra.protocol_features import ProtocolFeatures
 
-if 'gevent.monkey' in sys.modules:
-    from gevent.queue import Queue, Empty
-else:
-    from queue import Queue, Empty  # noqa
+from queue import Queue, Empty  # noqa
 
 from cassandra import ConsistencyLevel, AuthenticationFailed, OperationTimedOut, ProtocolVersion
 from cassandra.marshal import int32_pack
@@ -49,7 +49,7 @@ from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessag
                                 RegisterMessage, ReviseRequestMessage)
 from cassandra.segment import SegmentCodec, CrcException
 from cassandra.util import OrderedDict
-from cassandra.shard_info import ShardingInfo
+from cassandra.shard_info import ShardingInfo  # noqa: F401  # re-exported for cassandra.connection.ShardingInfo
 
 log = logging.getLogger(__name__)
 
@@ -64,8 +64,7 @@ locally_supported_compressions = OrderedDict()
 try:
     import lz4
 except ImportError:
-    log.debug("lz4 package could not be imported. LZ4 Compression will not be available")
-    pass
+    lz4 = None
 else:
     # The compress and decompress functions we need were moved from the lz4 to
     # the lz4.block namespace, so we try both here.
@@ -99,6 +98,19 @@ else:
 
     locally_supported_compressions['lz4'] = (lz4_compress, lz4_decompress)
     segment_codec_lz4 = SegmentCodec(lz4_compress, lz4_decompress)
+
+# Prefer the Cython wrappers that call liblz4 directly (no Python object
+# allocation overhead for the byte-order conversion).  This also enables
+# LZ4 support when the Cython extension is available but the Python lz4
+# package is not installed.
+try:
+    from cassandra.cython_lz4 import lz4_compress, lz4_decompress
+    locally_supported_compressions['lz4'] = (lz4_compress, lz4_decompress)
+    segment_codec_lz4 = SegmentCodec(lz4_compress, lz4_decompress)
+except ImportError:
+    if lz4 is None:
+        log.debug("Neither the lz4 package nor the cython_lz4 extension could "
+                  "be imported. LZ4 Compression will not be available")
 
 try:
     import snappy
@@ -230,7 +242,7 @@ class DefaultEndPointFactory(EndPointFactory):
     port = None
     """
     If no port is discovered in the row, this is the default port
-    used for endpoint creation. 
+    used for endpoint creation.
     """
 
     def __init__(self, port=None):
@@ -328,6 +340,50 @@ class SniEndPointFactory(EndPointFactory):
         return SniEndPoint(self._proxy_address, sni, self._port)
 
 
+class ClientRoutesEndPointFactory(EndPointFactory):
+    """
+    EndPointFactory for Client Routes (Private Link) support.
+
+    Creates ClientRoutesEndPoint instances that defer both address translation
+    (host_id -> hostname lookup) and DNS resolution until connection time.
+    This ensures immediate reaction to infrastructure changes.
+    """
+
+    client_routes_handler: _ClientRoutesHandler
+    default_port: int
+
+    def __init__(self, client_routes_handler: _ClientRoutesHandler, default_port: int = None) -> None:
+        """
+        :param client_routes_handler: _ClientRoutesHandler instance to lookup routes
+        :param default_port: Default port if none found in row
+        """
+        self.client_routes_handler = client_routes_handler
+        self.default_port = default_port
+
+    def create(self, row: Dict[str, Any]) -> 'ClientRoutesEndPoint':
+        """
+        Create a ClientRoutesEndPoint from a system.peers row.
+
+        Stores only the host_id and handler reference. Both translation
+        (route lookup) and DNS resolution happen later in resolve().
+        """
+        from cassandra.metadata import _NodeInfo
+        host_id = row.get("host_id")
+
+        if host_id is None:
+            raise ValueError("No host_id to create ClientRoutesEndPoint")
+
+        addr = _NodeInfo.get_broadcast_rpc_address(row)
+        port = _NodeInfo.get_broadcast_rpc_port(row) or _NodeInfo.get_broadcast_port(row) or self.default_port
+
+        return ClientRoutesEndPoint(
+            host_id=host_id,
+            handler=self.client_routes_handler,
+            original_address=addr,
+            original_port=port,
+        )
+
+
 @total_ordering
 class UnixSocketEndPoint(EndPoint):
     """
@@ -367,6 +423,76 @@ class UnixSocketEndPoint(EndPoint):
 
     def __repr__(self):
         return "<%s: %s>" % (self.__class__.__name__, self._unix_socket_path)
+
+
+@total_ordering
+class ClientRoutesEndPoint(EndPoint):
+    """
+    Client Routes (Private Link) EndPoint implementation.
+
+    Defers both address translation (route lookup) and DNS resolution
+    until resolve() is called at connection time. This ensures immediate
+    reaction to infrastructure changes and CLIENT_ROUTES_CHANGE events.
+    """
+
+    _host_id: uuid.UUID
+    _handler: _ClientRoutesHandler
+    _original_address: str
+    _original_port: int
+
+    def __init__(self, host_id: uuid.UUID, handler: _ClientRoutesHandler, original_address: str, original_port: int = None) -> None:
+        """
+        :param host_id: Host UUID for route lookup
+        :param handler: _ClientRoutesHandler instance
+        :param original_address: Original address from system.peers (for identification)
+        :param original_port: Original port if route doesn't specify one
+        """
+        self._host_id = host_id
+        self._handler = handler
+        self._original_address = original_address
+        self._original_port = original_port
+
+    @property
+    def address(self) -> str:
+        """Returns the original address (updated by resolve())."""
+        return self._original_address
+
+    @property
+    def port(self) -> Optional[int]:
+        return self._original_port
+
+    @property
+    def host_id(self) -> uuid.UUID:
+        return self._host_id
+
+    def resolve(self) -> Tuple[str, int]:
+        """
+        Resolve endpoint by delegating to the handler.
+        Falls back to original address/port if no route mapping is available.
+        """
+        result = self._handler.resolve_host(self._host_id)
+        if result is None:
+            return self._original_address, self._original_port
+        return result
+
+    def __eq__(self, other):
+        return (isinstance(other, ClientRoutesEndPoint) and
+                self._host_id == other._host_id and
+                self._original_address == other._original_address)
+
+    def __hash__(self):
+        return hash((self._host_id, self._original_address))
+
+    def __lt__(self, other):
+        return ((self._host_id, self._original_address) <
+                (other._host_id, other._original_address))
+
+    def __str__(self):
+        return str("%s (host_id=%s)" % (self._original_address, self._host_id))
+
+    def __repr__(self):
+        return "<%s: host_id=%s, original_addr=%s>" % (
+            self.__class__.__name__, self._host_id, self._original_address)
 
 
 class _Frame(object):
@@ -718,10 +844,50 @@ class Connection(object):
     # and the connection will be replaced
     orphaned_threshold_reached = False
 
+    # The CQL stream id space, which is all the protocol can address however high
+    # max_in_flight is set. Both limits below are capped to it.
+    _MAX_STREAM_IDS = 2 ** 15
+
     # If the number of orphaned streams reaches this threshold, this connection
     # will become marked and will be replaced with a new connection by the
-    # owning pool (currently, only HostConnection supports this)
-    orphaned_threshold = 3  * max_in_flight // 4
+    # owning pool (currently, only HostConnection supports this). The default
+    # for this class's max_in_flight; a connection derives its own in __init__.
+    orphaned_threshold = 3 * min(max_in_flight, _MAX_STREAM_IDS) // 4
+
+    @staticmethod
+    def max_request_id_for(max_in_flight):
+        """
+        The highest request id a connection with this limit will hand out.
+
+        Request ids run from zero to this inclusive, and borrow_connection
+        admits a request only while in_flight is below it. Capped at the CQL
+        stream id range, which is all the protocol can address however high
+        max_in_flight is set.
+        """
+        return min(max_in_flight, Connection._MAX_STREAM_IDS) - 1
+
+    @staticmethod
+    def orphaned_threshold_for(max_in_flight):
+        """
+        The orphaned stream count at which a connection with this limit is
+        marked for replacement.
+
+        Three quarters of the stream ids a connection can actually hold, which
+        is max_in_flight capped the way :meth:`max_request_id_for` caps it.
+        Taken off that capped pool rather than off max_in_flight itself: a
+        connection holds at most max_request_id + 1 ids, so a threshold above
+        that is one `len(orphaned_request_ids) >= orphaned_threshold` never
+        reaches, leaving orphan-based replacement dead for a max_in_flight
+        raised past the stream id range.
+        """
+        return 3 * min(max_in_flight, Connection._MAX_STREAM_IDS) // 4
+
+    # Both limits are derived, and both are asked for rather than stored on the
+    # class, because max_in_flight is tuned at runtime -- assigned on the class,
+    # or patched in a test -- and a value derived once does not follow it. A
+    # connection derives both in __init__ from the limit in force when it is
+    # built, and the configuration report, which has to describe them before any
+    # connection exists, asks with the class's current limit.
 
     is_defunct = False
     is_closed = False
@@ -733,6 +899,8 @@ class Connection(object):
     is_unsupported_proto_version = False
 
     is_control_connection = False
+    # Stable identity learned from system.local for control connections.
+    _control_connection_host_id = None
     signaled_error = False  # used for flagging at the pool level
 
     allow_beta_protocol_version = False
@@ -754,6 +922,16 @@ class Connection(object):
     features = None
     _application_info: Optional[ApplicationInfoBase] = None
 
+    # Identifier of the cluster this connection belongs to, reported in the
+    # SESSION_ID startup option so that all of a cluster's connections can be
+    # correlated with each other in the clients table.
+    _session_id = None
+
+    # Set on every connection, but only used by the control connection, which is
+    # the only one reporting the driver configuration. Left as None when the
+    # cluster has configuration reporting disabled.
+    _driver_config_reporter: Optional[DriverConfigReporter] = None
+
     @property
     def _iobuf(self):
         # backward compatibility, to avoid any change in the reactors
@@ -764,7 +942,8 @@ class Connection(object):
                  cql_version=None, protocol_version=ProtocolVersion.MAX_SUPPORTED, is_control_connection=False,
                  user_type_map=None, connect_timeout=None, allow_beta_protocol_version=False, no_compact=False,
                  ssl_context=None, owning_pool=None, shard_id=None, total_shards=None,
-                 on_orphaned_stream_released=None, application_info: Optional[ApplicationInfoBase] = None):
+                 on_orphaned_stream_released=None, application_info: Optional[ApplicationInfoBase] = None,
+                 session_id=None, driver_config_reporter: Optional[DriverConfigReporter] = None):
         # TODO next major rename host to endpoint and remove port kwarg.
         self.endpoint = host if isinstance(host, EndPoint) else DefaultEndPoint(host, port)
 
@@ -788,6 +967,8 @@ class Connection(object):
         self.orphaned_request_ids = set()
         self._on_orphaned_stream_released = on_orphaned_stream_released
         self._application_info = application_info
+        self._session_id = session_id
+        self._driver_config_reporter = driver_config_reporter
 
         if ssl_options:
             self.ssl_options.update(self.endpoint.ssl_options or {})
@@ -805,7 +986,9 @@ class Connection(object):
         if not self.ssl_context and self.ssl_options:
             self.ssl_context = self._build_ssl_context_from_options()
 
-        self.max_request_id = min(self.max_in_flight - 1, (2 ** 15) - 1)
+        self.max_request_id = self.max_request_id_for(self.max_in_flight)
+        self.orphaned_threshold = self.orphaned_threshold_for(self.max_in_flight)
+
         # Don't fill the deque with 2**15 items right away. Start with some and add
         # more if needed.
         initial_size = min(300, self.max_in_flight)
@@ -868,7 +1051,10 @@ class Connection(object):
             raise conn.last_error
         elif not conn.connected_event.is_set():
             conn.close()
-            raise OperationTimedOut("Timed out creating connection (%s seconds)" % timeout)
+            raise OperationTimedOut("Timed out creating connection (%s seconds)" % timeout,
+                                    timeout=timeout)
+        elif conn.is_closed:
+            raise ConnectionShutdown("Connection to %s was closed by server" % conn.endpoint)
         else:
             return conn
 
@@ -1103,7 +1289,8 @@ class Connection(object):
         # this allows us to inject custom functions per request to encode, decode messages
         self._requests[request_id] = (cb, decoder, result_metadata)
         msg = encoder(msg, request_id, self.protocol_version, compressor=self.compressor,
-                      allow_beta_protocol_version=self.allow_beta_protocol_version)
+                      allow_beta_protocol_version=self.allow_beta_protocol_version,
+                      protocol_features=self.features)
 
         if self._is_checksumming_enabled:
             buffer = io.BytesIO()
@@ -1131,6 +1318,7 @@ class Connection(object):
                 msg += ": %s" % (self.last_error,)
             raise ConnectionShutdown(msg)
         timeout = kwargs.get('timeout')
+        original_timeout = timeout  # preserve for exception reporting
         fail_on_error = kwargs.get('fail_on_error', True)
         waiter = ResponseWaiter(self, len(msgs), fail_on_error)
 
@@ -1155,7 +1343,8 @@ class Connection(object):
                 if timeout is not None:
                     timeout -= 0.01
                     if timeout <= 0.0:
-                        raise OperationTimedOut()
+                        raise OperationTimedOut(timeout=original_timeout,
+                                                in_flight=self.in_flight)
                 time.sleep(0.01)
 
         try:
@@ -1377,6 +1566,55 @@ class Connection(object):
             self._application_info.add_startup_options(options)
         self.features.add_startup_options(options)
 
+        # Driver-owned options go in after the application's, so that they can
+        # overwrite them and never the other way round. An application that set
+        # SESSION_ID would break correlating a cluster's connections in the
+        # clients table, which is the only reason the option exists; one that set
+        # DRIVER_CONFIG would have an operator read its value as the driver's
+        # description of itself; and one that set DRIVER_NAME or DRIVER_VERSION
+        # would misreport the driver for the life of the connection, to the same
+        # operator and in the same row.
+        #
+        # They are cleared rather than merely overwritten, so that ownership does
+        # not depend on this connection having something to say: a pool
+        # connection reports no configuration at all, and neither does a control
+        # connection whose report was dropped or turned off. DRIVER_NAME and
+        # DRIVER_VERSION are then put back by _send_startup_message, the only
+        # place that knows them. CQL_VERSION needs no entry here: StartupMessage
+        # writes it after the options map, so it cannot be overridden either.
+        for owned_key in (SESSION_ID_OPTION, DRIVER_CONFIG_OPTION,
+                          'DRIVER_NAME', 'DRIVER_VERSION'):
+            if options.pop(owned_key, None) is not None:
+                # The application info is one object shared by every connection of
+                # a cluster, so an offending key is seen on all of them: warning
+                # on each would mean hosts x shards + 1 lines per connect(), and
+                # as many again on every pool replacement or control connection
+                # reconnect, for a misconfiguration that is in the application's
+                # code and identical on all of them.
+                #
+                # Warn on the control connection, which is established once per
+                # cluster and before the pools, and keep the rest at debug for
+                # whoever is looking at a specific connection.
+                level = logging.WARNING if self.is_control_connection else logging.DEBUG
+                log.log(level,
+                        "Ignoring the application-supplied %s startup option on %s: "
+                        "the option is reserved for the driver", owned_key, self.endpoint)
+
+        if self._session_id is not None:
+            options[SESSION_ID_OPTION] = str(self._session_id)
+
+        # The configuration is the same for every connection of a cluster, so
+        # only the control connection reports it. A reporter left as None means
+        # the cluster has configuration reporting disabled.
+        if self.is_control_connection and self._driver_config_reporter is not None:
+            # Whether this is a ScyllaDB node is already known: the features
+            # above were parsed from the SUPPORTED response, and sharding info
+            # is what the driver itself keys ScyllaDB-only behaviour off (see
+            # ControlConnection._try_connect), so the report describes what the
+            # driver will actually do rather than only what it was configured to.
+            self._driver_config_reporter.add_startup_options(
+                options, is_scylla=self.features.sharding_info is not None)
+
         if self.cql_version:
             if self.cql_version not in supported_cql_versions:
                 raise ProtocolError(
@@ -1435,7 +1673,7 @@ class Connection(object):
         log.debug("Sending StartupMessage on %s", self)
         opts = {'DRIVER_NAME': DRIVER_NAME,
                 'DRIVER_VERSION': DRIVER_VERSION,
-                **extra_options}
+                **(extra_options or {})}
         if compression:
             opts['COMPRESSION'] = compression
         if no_compact:
@@ -1542,7 +1780,8 @@ class Connection(object):
         if not keyspace or keyspace == self.keyspace:
             return
 
-        query = QueryMessage(query='USE "%s"' % (keyspace,),
+        from cassandra.metadata import escape_name
+        query = QueryMessage(query='USE %s' % (escape_name(keyspace),),
                              consistency_level=ConsistencyLevel.ONE)
         try:
             result = self.wait_for_response(query)
@@ -1596,7 +1835,8 @@ class Connection(object):
             callback(self, None)
             return
 
-        query = QueryMessage(query='USE "%s"' % (keyspace,),
+        from cassandra.metadata import escape_name
+        query = QueryMessage(query='USE %s' % (escape_name(keyspace),),
                              consistency_level=ConsistencyLevel.ONE)
 
         def process_result(result):
@@ -1678,7 +1918,8 @@ class ResponseWaiter(object):
         if self.error:
             raise self.error
         elif not self.event.is_set():
-            raise OperationTimedOut()
+            raise OperationTimedOut(timeout=timeout,
+                                    in_flight=self.connection.in_flight)
         else:
             return self.responses
 
@@ -1694,18 +1935,33 @@ class HeartbeatFuture(object):
         with connection.lock:
             if connection.in_flight < connection.max_request_id:
                 connection.in_flight += 1
-                connection.send_msg(OptionsMessage(), connection.get_request_id(), self._options_callback)
+                request_id = connection.get_request_id()
+                try:
+                    connection.send_msg(OptionsMessage(), request_id, self._options_callback)
+                except Exception as exc:
+                    if connection.is_control_connection:
+                        connection.in_flight -= 1
+                    # send_msg() registers the callback before writing to the socket,
+                    # so a write failure must unwind that registration here.
+                    connection._requests.pop(request_id, None)
+                    if request_id not in connection.request_ids:
+                        connection.request_ids.append(request_id)
+                    self._exception = exc
+                    self._event.set()
             else:
                 self._exception = Exception("Failed to send heartbeat because connection 'in_flight' exceeds threshold")
                 self._event.set()
 
-    def wait(self, timeout):
+    def wait(self, timeout, original_timeout):
         self._event.wait(timeout)
         if self._event.is_set():
             if self._exception:
                 raise self._exception
         else:
-            raise OperationTimedOut("Connection heartbeat timeout after %s seconds" % (timeout,), self.connection.endpoint)
+            raise OperationTimedOut("Connection heartbeat timeout (total wait=%s seconds, this wait call=%s seconds)" % (original_timeout, timeout),
+                                    self.connection.endpoint,
+                                    timeout=original_timeout,
+                                    in_flight=self.connection.in_flight)
 
     def _options_callback(self, response):
         if isinstance(response, SupportedMessage):
@@ -1763,13 +2019,13 @@ class ConnectionHeartbeat(Thread):
                     self._raise_if_stopped()
 
                 # Wait max `self._timeout` seconds for all HeartbeatFutures to complete
-                timeout = self._timeout
+                timeout_left = self._timeout
                 start_time = time.time()
                 for f in futures:
                     self._raise_if_stopped()
                     connection = f.connection
                     try:
-                        f.wait(timeout)
+                        f.wait(timeout_left, self._timeout)
                         # TODO: move this, along with connection locks in pool, down into Connection
                         with connection.lock:
                             connection.in_flight -= 1
@@ -1779,7 +2035,7 @@ class ConnectionHeartbeat(Thread):
                                     id(connection), connection.endpoint)
                         failed_connections.append((f.connection, f.owner, e))
 
-                    timeout = self._timeout - (time.time() - start_time)
+                    timeout_left = self._timeout - (time.time() - start_time)
 
                 for connection, owner, exc in failed_connections:
                     self._raise_if_stopped()

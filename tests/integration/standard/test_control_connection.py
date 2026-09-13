@@ -68,7 +68,7 @@ class ControlConnectionTests(unittest.TestCase):
         self.session = self.cluster.connect()
         self.session.execute("""
             CREATE KEYSPACE keyspacetodrop
-            WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor': '1' }
+            WITH replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor': '1' }
             """)
         self.session.set_keyspace("keyspacetodrop")
         self.session.execute("CREATE TYPE user (age int, name text)")
@@ -135,7 +135,7 @@ class ControlConnectionTests(unittest.TestCase):
             assert 7000 == host.broadcast_port
 
     @xfail_scylla_version_lt(reason='scylladb/scylladb#26992 - system.client_routes is not yet supported',
-                             oss_scylla_version="7.0", ent_scylla_version="2026.1.0")
+                             scylla_version="2026.1.0")
     def test_client_routes_change_event(self):
         cluster = TestCluster()
 

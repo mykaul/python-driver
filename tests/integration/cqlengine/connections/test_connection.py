@@ -23,7 +23,7 @@ from cassandra.cluster import ExecutionProfile, _clusters_for_shutdown, _ConfigM
 from cassandra.policies import RoundRobinPolicy
 from cassandra.query import dict_factory
 
-from tests.integration import CASSANDRA_IP, PROTOCOL_VERSION, execute_with_long_wait_retry, local, TestCluster
+from tests.integration import CASSANDRA_IP, execute_with_long_wait_retry, local, TestCluster
 from tests.integration.cqlengine.base import BaseCassEngTestCase
 from tests.integration.cqlengine import DEFAULT_KEYSPACE, setup_connection
 
@@ -76,9 +76,9 @@ class SeveralConnectionsTest(BaseCassEngTestCase):
         super(SeveralConnectionsTest, cls).setUpClass()
         cls.setup_cluster = TestCluster()
         cls.setup_session = cls.setup_cluster.connect()
-        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '{1}'}}".format(cls.keyspace1, 1)
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}".format(cls.keyspace1, 1)
         execute_with_long_wait_retry(cls.setup_session, ddl)
-        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '{1}'}}".format(cls.keyspace2, 1)
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}".format(cls.keyspace2, 1)
         execute_with_long_wait_retry(cls.setup_session, ddl)
 
     @classmethod
