@@ -20,7 +20,6 @@ from cassandra.cqlengine.management import sync_table, drop_table, create_keyspa
 from cassandra.cqlengine import models
 from cassandra.cqlengine.models import Model, ModelDefinitionException
 from uuid import uuid1
-from tests.integration import pypy
 from tests.integration.cqlengine.base import TestQueryUpdateModel
 import pytest
 
@@ -259,10 +258,8 @@ class TestDeprecationWarning(unittest.TestCase):
             rows[-1]
             rows[-1:]
 
-            # ignore DeprecationWarning('The loop argument is deprecated since Python 3.8, and scheduled for removal in Python 3.10.')
-            relevant_warnings = [warn for warn in w if "The loop argument is deprecated" not in str(warn.message)]
+            warning_messages = [str(warn.message) for warn in w]
 
-            assert "__table_name_case_sensitive__ will be removed in 4.0." in str(relevant_warnings[0].message)
-            assert "__table_name_case_sensitive__ will be removed in 4.0." in str(relevant_warnings[1].message)
-            assert "ModelQuerySet indexing with negative indices support will be removed in 4.0." in str(relevant_warnings[2].message)
-            assert "ModelQuerySet slicing with negative indices support will be removed in 4.0." in str(relevant_warnings[3].message)
+            assert sum("__table_name_case_sensitive__ will be removed in 4.0." in message for message in warning_messages) == 2
+            assert sum("ModelQuerySet indexing with negative indices support will be removed in 4.0." in message for message in warning_messages) == 1
+            assert sum("ModelQuerySet slicing with negative indices support will be removed in 4.0." in message for message in warning_messages) == 1

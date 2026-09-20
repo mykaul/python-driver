@@ -13,16 +13,20 @@
 # limitations under the License.
 import unittest
 
+from concurrent.futures import Future
 import logging
 import socket
+from types import SimpleNamespace
 
 from unittest.mock import patch, Mock
 import uuid
 
 from cassandra import ConsistencyLevel, DriverException, Timeout, Unavailable, RequestExecutionException, ReadTimeout, WriteTimeout, CoordinationFailure, ReadFailure, WriteFailure, FunctionFailure, AlreadyExists,\
     InvalidRequest, Unauthorized, AuthenticationFailed, OperationTimedOut, UnsupportedOperation, RequestValidationException, ConfigurationException, ProtocolVersion
-from cassandra.cluster import _Scheduler, Session, Cluster, default_lbp_factory, \
+from cassandra.cluster import _Scheduler, Session, Cluster, ResultSet, SchemaAgreementScope, ControlConnectionQueryFallback, default_lbp_factory, \
     ExecutionProfile, _ConfigMode, EXEC_PROFILE_DEFAULT
+from cassandra.connection import ConnectionBusy, ConnectionException
+from cassandra.driver_config import DriverConfigReporter
 from cassandra.pool import Host
 from cassandra.policies import HostDistance, RetryPolicy, RoundRobinPolicy, DowngradingConsistencyRetryPolicy, SimpleConvictionPolicy
 from cassandra.query import SimpleStatement, named_tuple_factory, tuple_factory
@@ -87,11 +91,73 @@ class ExceptionTypeTest(unittest.TestCase):
         assert issubclass(UnsupportedOperation, DriverException)
 
 
+class OperationTimedOutTest(unittest.TestCase):
+
+    def test_message_without_timeout(self):
+        """Default message format when no timeout info is provided."""
+        exc = OperationTimedOut(errors={'host1': 'some error'}, last_host='host1')
+        msg = str(exc)
+        assert "errors={'host1': 'some error'}" in msg
+        assert "last_host=host1" in msg
+        assert "timeout=" not in msg
+        assert "in_flight=" not in msg
+
+    def test_message_with_timeout_and_in_flight(self):
+        """Message includes timeout and in_flight when both are provided."""
+        exc = OperationTimedOut(errors={'host1': 'err'}, last_host='host1',
+                                timeout=10.0, in_flight=42)
+        msg = str(exc)
+        assert "(timeout=10.0s, in_flight=42)" in msg
+
+    def test_message_with_timeout_no_in_flight(self):
+        """Message includes timeout but not in_flight when only timeout is set."""
+        exc = OperationTimedOut(timeout=5.0)
+        msg = str(exc)
+        assert "(timeout=5.0s)" in msg
+        assert "in_flight=" not in msg
+
+    def test_message_no_args(self):
+        """No-argument form should not crash and should have clean message."""
+        exc = OperationTimedOut()
+        msg = str(exc)
+        assert "errors=None, last_host=None" in msg
+        assert "timeout=" not in msg
+
+    def test_attributes_accessible(self):
+        """New and existing attributes should be readable."""
+        exc = OperationTimedOut(errors={'h': 'e'}, last_host='h',
+                                timeout=10.0, in_flight=42)
+        assert exc.errors == {'h': 'e'}
+        assert exc.last_host == 'h'
+        assert exc.timeout == 10.0
+        assert exc.in_flight == 42
+
+    def test_attributes_default_none(self):
+        """New attributes should default to None when not provided."""
+        exc = OperationTimedOut()
+        assert exc.timeout is None
+        assert exc.in_flight is None
+        assert exc.errors is None
+        assert exc.last_host is None
+
+    def test_backward_compat_positional(self):
+        """Existing two-positional-arg form should still work."""
+        exc = OperationTimedOut({'h': 'err'}, 'host1')
+        assert exc.errors == {'h': 'err'}
+        assert exc.last_host == 'host1'
+        assert exc.timeout is None
+        assert exc.in_flight is None
+
+
 class ClusterTest(unittest.TestCase):
 
     def test_tuple_for_contact_points(self):
         cluster = Cluster(contact_points=[('localhost', 9045), ('127.0.0.2', 9046), '127.0.0.3'], port=9999)
-        localhost_addr = set([addr[0] for addr in [t for (_,_,_,_,t) in socket.getaddrinfo("localhost",80)]])
+        self.addCleanup(cluster.shutdown)
+        # Refactored for clarity
+        addr_info = socket.getaddrinfo("localhost", 80)
+        sockaddr_tuples = [info[4] for info in addr_info]  # info[4] is sockaddr
+        localhost_addr = set([sockaddr[0] for sockaddr in sockaddr_tuples])
         for cp in cluster.endpoints_resolved:
             if cp.address in localhost_addr:
                 assert cp.port == 9045
@@ -108,8 +174,9 @@ class ClusterTest(unittest.TestCase):
             Cluster(contact_points="not a sequence", protocol_version=4, connect_timeout=1)
 
     def test_port_str(self):
-        """Check port passed as tring is converted and checked properly"""
+        """Check port passed as string is converted and checked properly"""
         cluster = Cluster(contact_points=['127.0.0.1'], port='1111')
+        self.addCleanup(cluster.shutdown)
         for cp in cluster.endpoints_resolved:
             if cp.address in ('::1', '127.0.0.1'):
                 assert cp.port == 1111
@@ -123,10 +190,61 @@ class ClusterTest(unittest.TestCase):
             with pytest.raises(ValueError):
                 cluster = Cluster(contact_points=['127.0.0.1'], port=invalid_port)
 
+    def test_control_connection_query_fallback_modes(self):
+        default_cluster = Cluster()
+        self.addCleanup(default_cluster.shutdown)
+        assert default_cluster.allow_control_connection_query_fallback is ControlConnectionQueryFallback.Disabled
+        with pytest.raises(TypeError):
+            Cluster(allow_control_connection_query_fallback=False)
+        with pytest.raises(TypeError):
+            Cluster(allow_control_connection_query_fallback=True)
+        fallback_cluster = Cluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.Fallback)
+        self.addCleanup(fallback_cluster.shutdown)
+        assert fallback_cluster.allow_control_connection_query_fallback \
+            is ControlConnectionQueryFallback.Fallback
+        skip_pool_cluster = Cluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation)
+        self.addCleanup(skip_pool_cluster.shutdown)
+        assert skip_pool_cluster.allow_control_connection_query_fallback \
+            is ControlConnectionQueryFallback.SkipPoolCreation
+
+    def test_control_connection_query_fallback_no_node_pool_mode_skips_pool_creation(self):
+        cluster = Cluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation,
+        )
+        self.addCleanup(cluster.shutdown)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())
+
+        with patch.object(Session, "add_or_renew_pool") as mocked_add_or_renew_pool:
+            session = Session(cluster, [host])
+
+        mocked_add_or_renew_pool.assert_not_called()
+        assert session._initial_connect_futures == set()
+        assert session._pools == {}
+        assert session.update_created_pools() == set()
+
+    def test_control_connection_query_fallback_fallback_tolerates_empty_initial_pools(self):
+        cluster = Cluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.Fallback,
+        )
+        self.addCleanup(cluster.shutdown)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())
+        future = Future()
+        future.set_result(False)
+
+        with patch.object(Session, "add_or_renew_pool", return_value=future) as mocked_add_or_renew_pool:
+            session = Session(cluster, [host])
+
+        mocked_add_or_renew_pool.assert_called_once_with(host, is_host_addition=False)
+        assert session._initial_connect_futures == {future}
+        assert session._pools == {}
+
     def test_compression_autodisabled_without_libraries(self):
         with patch.dict('cassandra.cluster.locally_supported_compressions', {}, clear=True):
             with patch('cassandra.cluster.log') as patched_logger:
                 cluster = Cluster(compression=True)
+                self.addCleanup(cluster.shutdown)
 
         patched_logger.error.assert_called_once()
         assert cluster.compression is False
@@ -139,6 +257,7 @@ class ClusterTest(unittest.TestCase):
         with patch.dict('cassandra.cluster.locally_supported_compressions', {'lz4': ('c', 'd')}, clear=True):
             with patch('cassandra.cluster.log') as patched_logger:
                 cluster = Cluster(compression='lz4')
+                self.addCleanup(cluster.shutdown)
 
         patched_logger.error.assert_not_called()
         assert cluster.compression == 'lz4'
@@ -161,12 +280,145 @@ class ClusterTest(unittest.TestCase):
             with patch.dict('cassandra.cluster.locally_supported_compressions', supported, clear=True):
                 with patch.object(Cluster.connection_class, 'factory', autospec=True, return_value='connection') as factory:
                     cluster = Cluster(compression=configured)
+                    self.addCleanup(cluster.shutdown)
                     conn = cluster.connection_factory(endpoint)
 
                 assert conn == 'connection'
                 assert factory.call_count == 1
                 assert factory.call_args.kwargs['compression'] == expected
                 assert cluster.compression == expected
+
+    def test_session_id_is_stable_and_unique_per_cluster(self):
+        cluster = Cluster()
+        other = Cluster()
+        self.addCleanup(cluster.shutdown)
+        self.addCleanup(other.shutdown)
+
+        assert isinstance(cluster.session_id, uuid.UUID)
+        assert cluster.session_id == cluster.session_id
+        assert cluster.session_id != other.session_id
+
+    def test_session_id_is_read_only(self):
+        """
+        Every connection reports it at STARTUP, so it cannot change once any of
+        them is open without breaking the correlation it exists for.
+        """
+        cluster = Cluster()
+        self.addCleanup(cluster.shutdown)
+
+        with pytest.raises(AttributeError):
+            cluster.session_id = uuid.uuid4()
+
+    def test_connection_factory_reports_the_session_id_and_the_configuration(self):
+        endpoint = Mock(address='127.0.0.1')
+        with patch.object(Cluster.connection_class, 'factory', autospec=True, return_value='connection') as factory:
+            cluster = Cluster()
+            self.addCleanup(cluster.shutdown)
+            cluster.connection_factory(endpoint)
+
+        assert factory.call_args.kwargs['session_id'] == cluster.session_id
+        assert isinstance(factory.call_args.kwargs['driver_config_reporter'], DriverConfigReporter)
+
+    def test_sockopts_are_materialized(self):
+        """
+        They are applied to every socket the cluster opens and are read again to
+        build the configuration report, so a one-shot iterable would leave
+        whichever consumer ran second with nothing -- the report claiming an
+        option is on while guaranteeing no connection ever sets it.
+        """
+        cluster = Cluster(sockopts=((6, 1, 1) for _ in range(1)))
+        self.addCleanup(cluster.shutdown)
+
+        # Twice: an iterable would be empty the second time round.
+        assert cluster.sockopts == [(6, 1, 1)]
+        assert cluster.sockopts == [(6, 1, 1)]
+
+        unset = Cluster(sockopts=None)
+        self.addCleanup(unset.shutdown)
+        assert unset.sockopts is None
+
+    def test_something_that_is_not_a_list_of_options_still_fails_at_connect(self):
+        """
+        sockopts is documented and public, and this constructor used to take
+        anything: what is wrong with it showed up on the socket, at connect time.
+        Materializing must not move that failure forward into a constructor that
+        used to build.
+        """
+        cluster = Cluster(sockopts=42)
+        self.addCleanup(cluster.shutdown)
+
+        assert cluster.sockopts == 42
+
+    def test_the_reporter_describes_the_cluster_that_owns_it(self):
+        """
+        The reporter reads its configuration off the cluster when a connection
+        asks for the report, so it has to be pointed at the one that owns it.
+        """
+        cluster = Cluster()
+        self.addCleanup(cluster.shutdown)
+
+        assert cluster._driver_config_reporter._cluster() is cluster
+
+    def test_driver_config_reporting_can_be_toggled_after_construction(self):
+        """
+        The flag is a plain published attribute, so it is read when a connection
+        is opened rather than captured at construction: setting it either way
+        used to be silently inert, in both directions.
+        """
+        endpoint = Mock(address='127.0.0.1')
+
+        def reporter_for(cluster):
+            with patch.object(Cluster.connection_class, 'factory', autospec=True,
+                              return_value='connection') as factory:
+                cluster.connection_factory(endpoint)
+            return factory.call_args.kwargs['driver_config_reporter']
+
+        cluster = Cluster()
+        self.addCleanup(cluster.shutdown)
+        assert reporter_for(cluster) is not None
+        cluster.driver_config_reporting_enabled = False
+        assert reporter_for(cluster) is None
+
+        # And back on again: a cluster built with reporting off must not be
+        # permanently unable to report. Registered before the rebinding, since
+        # afterwards the first cluster is no longer reachable to shut down.
+        cluster = Cluster(driver_config_reporting_enabled=False)
+        self.addCleanup(cluster.shutdown)
+        assert reporter_for(cluster) is None
+        cluster.driver_config_reporting_enabled = True
+        assert isinstance(reporter_for(cluster), DriverConfigReporter)
+
+    def test_connection_factory_passes_no_reporter_when_reporting_is_disabled(self):
+        """
+        A reporter left as None is how the setting reaches the connections. The
+        session id is documented not to be affected by it.
+        """
+        endpoint = Mock(address='127.0.0.1')
+        with patch.object(Cluster.connection_class, 'factory', autospec=True, return_value='connection') as factory:
+            cluster = Cluster(driver_config_reporting_enabled=False)
+            self.addCleanup(cluster.shutdown)
+            cluster.connection_factory(endpoint)
+
+        assert cluster.driver_config_reporting_enabled is False
+        assert factory.call_args.kwargs['driver_config_reporter'] is None
+        assert factory.call_args.kwargs['session_id'] == cluster.session_id
+
+    def test_connection_factory_ignores_a_caller_supplied_session_id_and_reporter(self):
+        """
+        Both describe the Cluster to the server, so they are assigned rather than
+        defaulted from the caller's kwargs: nothing may substitute the id that
+        correlates this cluster's connections, nor a reporter the cluster's own
+        setting turned off.
+        """
+        endpoint = Mock(address='127.0.0.1')
+        with patch.object(Cluster.connection_class, 'factory', autospec=True, return_value='connection') as factory:
+            cluster = Cluster(driver_config_reporting_enabled=False)
+            self.addCleanup(cluster.shutdown)
+            cluster.connection_factory(endpoint, session_id=uuid.uuid4(),
+                                       driver_config_reporter=DriverConfigReporter(cluster))
+
+        assert factory.call_args.kwargs['session_id'] == cluster.session_id
+        assert factory.call_args.kwargs['driver_config_reporter'] is None
 
 
 class SchedulerTest(unittest.TestCase):
@@ -182,14 +434,127 @@ class SchedulerTest(unittest.TestCase):
         """
         sched = _Scheduler(None)
         sched.schedule(0, lambda: None)
-        sched.schedule(0, lambda: None)  # pre-473: "TypeError: unorderable types: function() < function()"t
+        sched.schedule(0, lambda: None)  # pre-473: "TypeError: unorderable types: function() < function()"
 
 
 class SessionTest(unittest.TestCase):
+    class FakeTime(object):
+
+        def __init__(self):
+            self.clock = 0
+
+        def time(self):
+            return self.clock
+
+        def sleep(self, amount):
+            self.clock += amount
+
+    class MockPool(object):
+
+        def __init__(self, host, connection):
+            self.host = host
+            self.host_distance = HostDistance.LOCAL
+            self.is_shutdown = False
+            self.connection = connection
+
+        def _get_connection_for_routing_key(self):
+            return self.connection
+
+    class MockSchemaVersionFuture(object):
+
+        def __init__(self, outcome, auto_complete=True):
+            self._outcome = outcome
+            self._auto_complete = auto_complete
+            self._delivered = False
+            self._callback_state = None
+            self._col_names = ("schema_version",)
+            self._col_types = None
+            self.has_more_pages = False
+            self._continuous_paging_session = None
+
+        def _deliver(self):
+            if self._delivered or self._callback_state is None:
+                return
+
+            self._delivered = True
+            callback, errback, callback_args, callback_kwargs, errback_args, errback_kwargs = self._callback_state
+            if isinstance(self._outcome, Exception):
+                errback(self._outcome, *errback_args, **errback_kwargs)
+            else:
+                row = SimpleNamespace(schema_version=self._outcome)
+                callback([row], *callback_args, **callback_kwargs)
+
+        def add_callbacks(self, callback, errback,
+                          callback_args=(), callback_kwargs=None,
+                          errback_args=(), errback_kwargs=None):
+            self._callback_state = (
+                callback,
+                errback,
+                callback_args,
+                callback_kwargs or {},
+                errback_args,
+                errback_kwargs or {},
+            )
+            if self._auto_complete:
+                self._deliver()
+            return self
+
+        def complete(self):
+            self._deliver()
+
+        def result(self):
+            if isinstance(self._outcome, Exception):
+                raise self._outcome
+            return ResultSet(self, [SimpleNamespace(schema_version=self._outcome)])
+
     def setUp(self):
         if connection_class is None:
             raise unittest.SkipTest('libev does not appear to be installed correctly')
         connection_class.initialize_reactor()
+
+    def _mock_schema_future(self, outcome):
+        return self.MockSchemaVersionFuture(outcome)
+
+    def _host_query_count(self, session, target_host):
+        return sum(1 for call in session.execute_async.call_args_list if call.kwargs.get('host') is target_host)
+
+    def _new_schema_agreement_session(self, schema_versions, distances=None):
+        hosts = []
+        connections = {}
+        distance_map = {}
+        if distances is None:
+            distances = [HostDistance.LOCAL] * len(schema_versions)
+
+        for index, schema_version in enumerate(schema_versions):
+            host = Host("127.0.0.%d" % (index + 1), SimpleConvictionPolicy, host_id=uuid.uuid4())
+            host.set_up()
+            hosts.append(host)
+            distance_map[host] = distances[index]
+
+        cluster = Cluster(protocol_version=4)
+        self.addCleanup(cluster.shutdown)
+        for host in hosts:
+            cluster.metadata.add_or_return_host(host)
+
+        session = Session(cluster, hosts)
+        session._profile_manager.distance = Mock(side_effect=lambda host: distance_map.get(host, HostDistance.LOCAL))
+        session._pools = {}
+        for host, schema_version in zip(hosts, schema_versions):
+            connection = Mock(endpoint=host.endpoint)
+            connection.future_outcomes = [schema_version]
+            session._pools[host] = self.MockPool(host, connection)
+            connections[host] = connection
+
+        def execute_async(query, parameters=None, trace=False,
+                            custom_payload=None, execution_profile=None,
+                            paging_state=None, timeout=None, host=None, execute_as=None):
+            connection = connections[host]
+            outcome = connection.future_outcomes.pop(0) if len(connection.future_outcomes) > 1 else connection.future_outcomes[0]
+            return self._mock_schema_future(outcome)
+
+        session.execute_async = Mock(side_effect=execute_async)
+
+        return session, hosts, connections
 
     # TODO: this suite could be expanded; for now just adding a test covering a PR
     @mock_session_pools
@@ -201,6 +566,7 @@ class SessionTest(unittest.TestCase):
         PR #510
         """
         c = Cluster(protocol_version=4)
+        self.addCleanup(c.shutdown)
         s = Session(c, [Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
         c.connection_class.initialize_reactor()
 
@@ -230,6 +596,7 @@ class SessionTest(unittest.TestCase):
         PR #510
         """
         c = Cluster(protocol_version=4)
+        self.addCleanup(c.shutdown)
         s = Session(c, [Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
         c.connection_class.initialize_reactor()
         # default is None
@@ -250,6 +617,159 @@ class SessionTest(unittest.TestCase):
                 assert s.default_serial_consistency_level == cl
                 assert f.message.serial_consistency_level == cl_override
 
+
+
+    @mock_session_pools
+    def test_set_keyspace_escapes_quotes(self, *_):
+        """
+        Test that Session.set_keyspace properly escapes double quotes in
+        keyspace names to prevent CQL injection.
+        Requested in review of PR #758.
+        """
+        c = Cluster(protocol_version=4)
+        self.addCleanup(c.shutdown)
+        s = Session(c, [Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
+        c.connection_class.initialize_reactor()
+
+        s.execute = Mock()
+
+        s.set_keyspace('my"ks')
+        query = s.execute.call_args[0][0]
+        assert query == 'USE "my""ks"', (
+            "Double quotes in keyspace name must be escaped as double-double quotes, "
+            "got: %r" % query)
+
+        # Also verify a simple keyspace name doesn't get unnecessarily quoted
+        s.execute.reset_mock()
+        s.set_keyspace('simple_ks')
+        query = s.execute.call_args[0][0]
+        assert query == 'USE simple_ks', (
+            "Simple keyspace names should not be quoted, got: %r" % query)
+
+    @mock_session_pools
+    def test_wait_for_schema_agreement_default_scope_queries_all_connected_hosts(self, *_):
+        session, hosts, _ = self._new_schema_agreement_session(
+            ["a", "a"],
+            distances=[HostDistance.LOCAL_RACK, HostDistance.REMOTE])
+
+        assert session.wait_for_schema_agreement(wait_time=1)
+
+        for host in hosts:
+            assert self._host_query_count(session, host) == 1
+
+    @mock_session_pools
+    def test_wait_for_schema_agreement_retries_until_local_hosts_match(self, *_):
+        session, hosts, connections = self._new_schema_agreement_session(["a", "b"])
+        clock = self.FakeTime()
+        connections[hosts[1]].future_outcomes = ["b", "a"]
+
+        with patch('cassandra.cluster.time', new=clock):
+            assert session.wait_for_schema_agreement(wait_time=1)
+        for host in hosts:
+            assert self._host_query_count(session, host) == 2
+        assert clock.clock == 0.2
+
+    @mock_session_pools
+    def test_wait_for_schema_agreement_retries_when_local_connection_is_busy(self, *_):
+        session, hosts, connections = self._new_schema_agreement_session(["a", "a"])
+        clock = self.FakeTime()
+        connections[hosts[1]].future_outcomes = [
+            ConnectionBusy("connection overloaded"),
+            "a"]
+
+        with patch('cassandra.cluster.time', new=clock):
+            assert session.wait_for_schema_agreement(wait_time=1)
+        for host in hosts:
+            assert self._host_query_count(session, host) == 2
+        assert clock.clock == 0.2
+
+    @mock_session_pools
+    def test_wait_for_schema_agreement_ignores_local_hosts_without_session_pool(self, *_):
+        session, hosts, _ = self._new_schema_agreement_session(["a"])
+
+        unconnected_host = Host("127.0.0.2", SimpleConvictionPolicy, host_id=uuid.uuid4())
+        unconnected_host.set_up()
+        session.cluster.metadata.add_or_return_host(unconnected_host)
+
+        assert session.wait_for_schema_agreement(wait_time=1)
+        assert self._host_query_count(session, hosts[0]) == 1
+
+    @mock_session_pools
+    def test_wait_for_schema_agreement_queries_hosts_in_order(self, *_):
+        session, hosts, _ = self._new_schema_agreement_session(["a"] * 11)
+
+        assert session.wait_for_schema_agreement(wait_time=1)
+        assert [call.kwargs['host'] for call in session.execute_async.call_args_list] == list(hosts)
+
+    @mock_session_pools
+    def test_wait_for_schema_agreement_rack_scope_only_queries_local_rack_connections(self, *_):
+        session, hosts, _ = self._new_schema_agreement_session(
+            ["a", "a", "a"],
+            distances=[HostDistance.LOCAL_RACK, HostDistance.LOCAL, HostDistance.REMOTE])
+
+        assert session.wait_for_schema_agreement(wait_time=1, scope=SchemaAgreementScope.RACK)
+
+        assert self._host_query_count(session, hosts[0]) == 1
+        assert self._host_query_count(session, hosts[1]) == 0
+        assert self._host_query_count(session, hosts[2]) == 0
+
+    @mock_session_pools
+    def test_wait_for_schema_agreement_cluster_scope_skips_ignored_hosts(self, *_):
+        session, hosts, _ = self._new_schema_agreement_session(
+            ["a", "a"],
+            distances=[HostDistance.IGNORED, HostDistance.LOCAL])
+
+        assert session.wait_for_schema_agreement(wait_time=1, scope=SchemaAgreementScope.CLUSTER)
+
+        assert self._host_query_count(session, hosts[0]) == 0
+        assert self._host_query_count(session, hosts[1]) == 1
+
+    @mock_session_pools
+    def test_wait_for_schema_agreement_cluster_scope_excludes_hosts_with_unknown_status(self, *_):
+        session, hosts, _ = self._new_schema_agreement_session(
+            ["a", "a"],
+            distances=[HostDistance.LOCAL_RACK, HostDistance.LOCAL])
+
+        hosts[0].is_up = None
+
+        assert session.wait_for_schema_agreement(wait_time=1, scope=SchemaAgreementScope.CLUSTER)
+
+        assert self._host_query_count(session, hosts[0]) == 0
+        assert self._host_query_count(session, hosts[1]) == 1
+
+    @mock_session_pools
+    def test_wait_for_schema_agreement_rejects_unknown_scope(self, *_):
+        session, _, _ = self._new_schema_agreement_session(["a"])
+
+        with pytest.raises(ValueError):
+            session.wait_for_schema_agreement(wait_time=1, scope='planet')
+
+    @mock_session_pools
+    def test_set_keyspace_for_all_pools_reports_all_errors(self, *_):
+        cluster = Cluster()
+        self.addCleanup(cluster.shutdown)
+        session = Session(
+            cluster,
+            [Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())],
+        )
+
+        pool1 = Mock(host='host1')
+        pool2 = Mock(host='host2')
+        keyspace_error = ConnectionException("boom")
+
+        pool1._set_keyspace_for_all_conns.side_effect = (
+            lambda keyspace, callback: callback(pool1, [keyspace_error])
+        )
+        pool2._set_keyspace_for_all_conns.side_effect = (
+            lambda keyspace, callback: callback(pool2, [])
+        )
+        session._pools = {'host1': pool1, 'host2': pool2}
+
+        callback = Mock()
+        session._set_keyspace_for_all_pools('ks', callback)
+
+        callback.assert_called_once()
+        assert callback.call_args.args[0] == {'host1': [keyspace_error]}
 
 class ProtocolVersionTests(unittest.TestCase):
 
@@ -282,6 +802,7 @@ class ExecutionProfileTest(unittest.TestCase):
     @mock_session_pools
     def test_default_exec_parameters(self):
         cluster = Cluster()
+        self.addCleanup(cluster.shutdown)
         assert cluster._config_mode == _ConfigMode.UNCOMMITTED
         assert cluster.load_balancing_policy.__class__ == default_lbp_factory().__class__
         assert cluster.profile_manager.default.load_balancing_policy.__class__ == default_lbp_factory().__class__
@@ -292,14 +813,15 @@ class ExecutionProfileTest(unittest.TestCase):
         assert cluster.profile_manager.default.request_timeout == 10.0
         assert session.default_consistency_level == ConsistencyLevel.LOCAL_ONE
         assert cluster.profile_manager.default.consistency_level == ConsistencyLevel.LOCAL_ONE
-        assert session.default_serial_consistency_level == None
-        assert cluster.profile_manager.default.serial_consistency_level == None
+        assert session.default_serial_consistency_level is None
+        assert cluster.profile_manager.default.serial_consistency_level is None
         assert session.row_factory == named_tuple_factory
         assert cluster.profile_manager.default.row_factory == named_tuple_factory
 
     @mock_session_pools
     def test_default_legacy(self):
         cluster = Cluster(load_balancing_policy=RoundRobinPolicy(), default_retry_policy=DowngradingConsistencyRetryPolicy())
+        self.addCleanup(cluster.shutdown)
         assert cluster._config_mode == _ConfigMode.LEGACY
         session = Session(cluster, hosts=[Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
         session.default_timeout = 3.7
@@ -315,6 +837,7 @@ class ExecutionProfileTest(unittest.TestCase):
     def test_default_profile(self):
         non_default_profile = ExecutionProfile(RoundRobinPolicy(), *[object() for _ in range(2)])
         cluster = Cluster(execution_profiles={'non-default': non_default_profile})
+        self.addCleanup(cluster.shutdown)
         session = Session(cluster, hosts=[Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
 
         assert cluster._config_mode == _ConfigMode.PROFILES
@@ -347,6 +870,7 @@ class ExecutionProfileTest(unittest.TestCase):
     @mock_session_pools
     def test_statement_params_override_legacy(self):
         cluster = Cluster(load_balancing_policy=RoundRobinPolicy(), default_retry_policy=DowngradingConsistencyRetryPolicy())
+        self.addCleanup(cluster.shutdown)
         assert cluster._config_mode == _ConfigMode.LEGACY
         session = Session(cluster, hosts=[Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
 
@@ -369,6 +893,7 @@ class ExecutionProfileTest(unittest.TestCase):
     def test_statement_params_override_profile(self):
         non_default_profile = ExecutionProfile(RoundRobinPolicy(), *[object() for _ in range(2)])
         cluster = Cluster(execution_profiles={'non-default': non_default_profile})
+        self.addCleanup(cluster.shutdown)
         session = Session(cluster, hosts=[Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
 
         assert cluster._config_mode == _ConfigMode.PROFILES
@@ -402,11 +927,13 @@ class ExecutionProfileTest(unittest.TestCase):
 
         # can't add after
         cluster = Cluster(load_balancing_policy=RoundRobinPolicy())
+        self.addCleanup(cluster.shutdown)
         with pytest.raises(ValueError):
             cluster.add_execution_profile('name', ExecutionProfile())
 
         # session settings lock out profiles
         cluster = Cluster()
+        self.addCleanup(cluster.shutdown)
         session = Session(cluster, hosts=[Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
         for attr, value in (('default_timeout', 1),
                             ('default_consistency_level', ConsistencyLevel.ANY),
@@ -425,6 +952,8 @@ class ExecutionProfileTest(unittest.TestCase):
     def test_no_legacy_with_profile(self):
         cluster_init = Cluster(execution_profiles={'name': ExecutionProfile()})
         cluster_add = Cluster()
+        self.addCleanup(cluster_init.shutdown)
+        self.addCleanup(cluster_add.shutdown)
         cluster_add.add_execution_profile('name', ExecutionProfile())
         # for clusters with profiles added either way...
         for cluster in (cluster_init, cluster_init):
@@ -446,6 +975,7 @@ class ExecutionProfileTest(unittest.TestCase):
 
         internalized_profile = ExecutionProfile(RoundRobinPolicy(), *[object() for _ in range(2)])
         cluster = Cluster(execution_profiles={'by-name': internalized_profile})
+        self.addCleanup(cluster.shutdown)
         session = Session(cluster, hosts=[Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
         assert cluster._config_mode == _ConfigMode.PROFILES
 
@@ -460,6 +990,7 @@ class ExecutionProfileTest(unittest.TestCase):
     def test_exec_profile_clone(self):
 
         cluster = Cluster(execution_profiles={EXEC_PROFILE_DEFAULT: ExecutionProfile(), 'one': ExecutionProfile()})
+        self.addCleanup(cluster.shutdown)
         session = Session(cluster, hosts=[Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())])
 
         profile_attrs = {'request_timeout': 1,
@@ -491,6 +1022,7 @@ class ExecutionProfileTest(unittest.TestCase):
     def test_no_profiles_same_name(self):
         # can override default in init
         cluster = Cluster(execution_profiles={EXEC_PROFILE_DEFAULT: ExecutionProfile(), 'one': ExecutionProfile()})
+        self.addCleanup(cluster.shutdown)
 
         # cannot update default
         with pytest.raises(ValueError):
@@ -542,7 +1074,8 @@ class ExecutionProfileTest(unittest.TestCase):
     @mock_session_pools
     def _check_warning_on_no_lbp_with_contact_points(self, cluster_kwargs):
         with patch('cassandra.cluster.log') as patched_logger:
-            Cluster(**cluster_kwargs)
+            cluster = Cluster(**cluster_kwargs)
+        self.addCleanup(cluster.shutdown)
         patched_logger.warning.assert_called_once()
         warning_message = patched_logger.warning.call_args[0][0]
         assert 'please specify a load-balancing policy' in warning_message
@@ -597,7 +1130,8 @@ class ExecutionProfileTest(unittest.TestCase):
         @test_category configuration
         """
         with patch('cassandra.cluster.log') as patched_logger:
-            Cluster(**cluster_kwargs)
+            cluster = Cluster(**cluster_kwargs)
+        self.addCleanup(cluster.shutdown)
         patched_logger.warning.assert_not_called()
 
     @mock_session_pools
@@ -606,6 +1140,7 @@ class ExecutionProfileTest(unittest.TestCase):
         cluster = Cluster(
             contact_points=['127.0.0.1'],
             execution_profiles={EXEC_PROFILE_DEFAULT: ep_with_lbp})
+        self.addCleanup(cluster.shutdown)
         with patch('cassandra.cluster.log') as patched_logger:
             cluster.add_execution_profile(
                 name='no_lbp',
@@ -624,6 +1159,7 @@ class ExecutionProfileTest(unittest.TestCase):
         cluster = Cluster(
             contact_points=['127.0.0.1'],
             execution_profiles={EXEC_PROFILE_DEFAULT: ep_with_lbp})
+        self.addCleanup(cluster.shutdown)
         with patch('cassandra.cluster.log') as patched_logger:
             cluster.add_execution_profile(
                 name='with_lbp',
