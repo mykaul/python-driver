@@ -14,10 +14,21 @@ from tests.integration import use_cluster, PROTOCOL_VERSION, local
 
 LOGGER = logging.getLogger(__name__)
 
+_saved_scylla_ext_opts = None
+
 
 def setup_module():
+    global _saved_scylla_ext_opts
+    _saved_scylla_ext_opts = os.environ.get('SCYLLA_EXT_OPTS')
     os.environ['SCYLLA_EXT_OPTS'] = "--smp 2 --memory 2048M"
     use_cluster('shared_aware', [3], start=True)
+
+
+def teardown_module():
+    if _saved_scylla_ext_opts is None:
+        os.environ.pop('SCYLLA_EXT_OPTS', None)
+    else:
+        os.environ['SCYLLA_EXT_OPTS'] = _saved_scylla_ext_opts
 
 
 @local
@@ -54,7 +65,7 @@ class TestUseKeyspace(unittest.TestCase):
             return original_set_keyspace_blocking(*args, **kwargs)
 
         with patch.object(Connection, "set_keyspace_blocking", patched_set_keyspace_blocking):
-            self.session.execute("CREATE KEYSPACE test_set_keyspace WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+            self.session.execute("CREATE KEYSPACE test_set_keyspace WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}")
             self.session.execute("CREATE TABLE test_set_keyspace.set_keyspace_slow_connection(pk int, PRIMARY KEY(pk))")
 
             session2 = self.cluster.connect()

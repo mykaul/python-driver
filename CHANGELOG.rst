@@ -1,3 +1,247 @@
+3.29.12
+========
+Sep 26, 2026
+
+Features
+--------
+* Report the driver's identity and configuration in the ``STARTUP`` options, where
+  ScyllaDB exposes them in the ``client_options`` column of its clients table
+  (DRIVER-950). Every connection now sends ``SESSION_ID``, a UUID identifying the
+  ``Cluster`` it belongs to and readable from the new ``Cluster.session_id``, so all of
+  a client's connections can be correlated with each other and with its own logs. The
+  control connection additionally sends ``DRIVER_CONFIG``, a JSON description of the
+  effective configuration, which for now carries only the schema version it follows.
+  Reporting the configuration can be turned off with the new
+  ``Cluster(driver_config_reporting_enabled=False)``; ``SESSION_ID`` is unaffected by
+  that setting. Reporting is best effort and never prevents a connection from being
+  established.
+* ``DRIVER_CONFIG`` now describes the configuration itself rather than only the schema
+  version it follows (DRIVER-379). The report covers connection settings (timeouts,
+  request capacity, shard awareness, socket options, reconnection policy, TLS hostname
+  verification), the driver's own control-plane query timeouts, and the query defaults
+  and policies a statement gets when it overrides none of them. It follows the JSON
+  schema shared with the other ScyllaDB drivers, so the same document describes a
+  client whichever driver wrote it. Custom policies are reported by type name only and
+  never by their attributes, so a policy holding a credential does not leak it into the
+  clients table.
+* ``Cluster.sockopts`` is now materialized at construction, so a one-shot iterable is
+  applied to every connection the cluster opens rather than only to the first one.
+* Negotiate and implement the ``SCYLLA_USE_METADATA_ID`` protocol extension: prepared
+  statements skip re-sending result metadata on EXECUTE, and the driver automatically
+  refreshes cached metadata when the server detects a schema change (DRIVER-153, #770).
+* Negotiate ``TABLETS_ROUTING_V2``, track tablet versions, and prefer tablet leaders for
+  strongly consistent tables (#913).
+* Resume TLS sessions through the new per-endpoint ``SSLSessionCache``, with cache
+  lifetime and security controls exposed by ``Cluster`` (#789, DRIVER-165).
+* Use a Cython LZ4 fast path linked directly to the C library for CQL v4 compression
+  (#809).
+
+Compatibility Changes
+---------------------
+* Python 3.10 or newer is now required (#1043). Python 3.15 is supported, including
+  published CPython 3.15 wheels; free-threaded 3.15t is tested but does not receive
+  wheels (#1005). Wheels are no longer published for 32-bit Windows (#916).
+* The eventlet, gevent, and Twisted reactors and their public modules have been removed
+  (#969, CASSPYTHON-13).
+* The Insights package and its ``Cluster`` configuration API have been removed
+  (#968, CASSPYTHON-24).
+* ``DCAwareRoundRobinPolicy.local_dc`` is now read-only. It is set by the constructor,
+  and filled in by the policy itself when the constructor was given none, from the first
+  host to come up. Code that assigned it should pass ``local_dc`` to the constructor
+  instead.
+* ``PreparedStatement.result_metadata`` and ``PreparedStatement.result_metadata_id`` are
+  now read-only. They are replaced together by
+  ``PreparedStatement.update_result_metadata()``, so a request cannot observe metadata
+  and its id from different schema versions. Code that assigned either attribute
+  directly must call ``update_result_metadata()`` instead.
+* Message serialization now receives the connection's negotiated ``ProtocolFeatures``.
+  Custom protocol handlers that override ``encode_message`` must accept a required
+  ``protocol_features`` keyword argument, and custom encoders that delegate to
+  ``msg.send_body`` must forward it. This enables the connection-specific serialization
+  required by ``SCYLLA_USE_METADATA_ID`` and ``TABLETS_ROUTING_V2``.
+
+Bug Fixes
+---------
+* Prevent sessions from leaking keyspace state when application queries fall back to
+  the shared control connection. The first fallback session binds that connection to
+  its keyspace (including no keyspace); other fallback sessions with a different
+  keyspace are rejected while that binding is held. The binding is released once
+  every session holding it has been shut down or garbage collected and its fallback
+  requests have drained, so a later session can take it over. Taking it over from a
+  session without a keyspace is rejected when the previous holder left the shared
+  connection in a keyspace, since CQL offers no way back to "no keyspace". An explicit
+  ``USE`` statement -- including the one ``Session.set_keyspace()`` executes -- is now
+  rejected with ``InvalidRequest`` on the fallback path, since it would change the
+  keyspace of the shared connection under every other session using it; the keyspace
+  has to be chosen when the session is created (#1013).
+* Fix the client-side timeout never firing for a request on the control-connection
+  fallback path while the driver's own ``USE`` is in flight. The ``USE`` is sent
+  without recording a host attempt, and ``_on_speculative_execute`` checked its
+  "no attempt recorded yet" guard before the deadline, so with a speculative
+  execution policy configured a repeatedly failing ``USE`` rescheduled the callback
+  every 10ms instead of ever timing the request out. The deadline is now checked
+  first (#1013).
+* Fix ``ResponseFuture._req_id`` being left pointing at the driver's own ``USE``
+  instead of the request actually in flight, when the ``SET_KEYSPACE`` reply is
+  processed before ``send_msg()`` returns. On a later timeout the driver then
+  orphaned the wrong stream id and left the real request in the connection's
+  request map (#1013).
+* A host reconnection handler now releases the host's reconnection slot when
+  authentication fails or its retry schedule is exhausted. A later DOWN event can
+  therefore start a new handler after credentials recover or another reconnection
+  opportunity appears, instead of treating the stopped handler as an active one (#1026).
+* A defunct control connection is no longer left unreconnected when the cluster does not
+  run DOWN handling for its host (#847). ``ControlConnection._signal_error()`` treated the
+  conviction policy accepting a failure as a guarantee that a DOWN callback would
+  reconnect it, but the two are not the same: ``Cluster.on_down()`` deliberately skips
+  DOWN handling when a session pool to the host is still open, when the host is already
+  down or already reconnecting, and when pool creation is disabled -- and the default
+  ``SimpleConvictionPolicy`` rejects the conviction outright for ``OperationTimedOut``.
+  In all of those cases the control connection stayed defunct with nothing scheduled to
+  replace it. ``Cluster.on_down()`` and ``Cluster.signal_connection_failure()`` now return
+  whether DOWN handling was actually dispatched, and the control connection reconnects
+  directly whenever it was not. This applies uniformly to TCP, Unix socket,
+  alternate-route and stable host-ID connections, and does not duplicate the reconnect
+  that an accepted DOWN transition already performs. Two related cases are fixed with
+  it: a control connection whose reconnection attempts are already backing off no longer
+  has that schedule cancelled and restarted from its initial delay by every further
+  error, and a reconnection handler that has stopped for good -- once its retry schedule
+  is exhausted -- now releases the slot it occupies, so a later error starts a fresh
+  reconnection instead of mistaking the dead handler for one still retrying. The slot is
+  likewise released once a connection is installed, so a handler whose backoff outlived
+  the reconnection that succeeded without it no longer blocks the next one. Every release
+  is identity-checked, so a handler that stops can only ever clear itself: it cannot evict
+  a replacement another thread installed while it was handing its connection over, which
+  would have left that replacement retrying where nothing could find it. An attempt that
+  fails while an overlapping one succeeds no longer parks a handler in the slot the
+  successful attempt emptied, which would have blocked reconnection for the length of its
+  backoff and then replaced a healthy control connection. Once retry handling begins, its
+  cadence follows ``reconnection_policy`` up to ``max_reconnection_delay`` instead of
+  being restarted by each ``idle_heartbeat_interval``. Operators that need a shorter
+  recovery bound should configure a lower maximum delay. A finite schedule gives up after
+  its configured attempts only when its final attempt does not overlap another reconnect
+  trigger. A trigger received while the final attempt is running starts a fresh schedule if
+  that attempt fails, so reconnection can be retriggered indefinitely when attempts outlast
+  ``idle_heartbeat_interval``. Heartbeat returns after exhaustion for the same failed
+  connection do not re-arm it; an infinite schedule provides timing-independent recovery.
+* The control connection is no longer closed immediately after a reconnection handler
+  restores it. ``_ReconnectionHandler.run()`` closed the connection it had just opened,
+  which is right for the host handler that only uses it to probe the host, but left the
+  control connection dead the moment its backoff finally succeeded -- until a heartbeat
+  noticed, or forever with ``idle_heartbeat_interval=0``.
+* Preserve SERIAL and LOCAL_SERIAL semantics during routing and retries: LWT replicas
+  are no longer shuffled, and retries cannot downgrade to a non-serial consistency
+  level (#887).
+* The default constant and exponential reconnection schedules no longer stop after 64
+  attempts, and heartbeat failures report the configured timeout correctly (#834).
+* Treat an explicit empty ``ssl_options`` mapping as SSL configuration when selecting a
+  shard-aware endpoint (#936).
+* Invalidate cached tablet metadata when a table is deleted through a schema event
+  (#975).
+* Stop schedulers before executor teardown and fail pending retry work cleanly during
+  interpreter shutdown (#392).
+* Preserve Unix-socket control endpoints for local hosts (#944), and restore local
+  listen and broadcast metadata when token metadata is disabled (#1012).
+* Mark compatibility MD5 operations as non-security uses so they work in FIPS-enabled
+  environments (#970).
+* Use portable, precision-preserving shard-id arithmetic in the Cython implementation,
+  fixing MSVC builds and matching the Python implementation (#950).
+* Report errors from every pool when ``Session.set_keyspace()`` fails, rather than only
+  the final error (#911), and validate the scope passed to
+  ``Session.wait_for_schema_agreement()`` (#917).
+* Reject secure-connect-bundle archive paths that escape their extraction directory
+  (#969).
+
+Others
+------
+* ``Connection.max_request_id`` and ``Connection.orphaned_threshold`` now follow the
+  ``max_in_flight`` actually in force. Both were computed in the class body, which runs
+  once, so a subclass that set its own ``max_in_flight`` inherited values derived from the
+  base class -- leaving, for example, a ``max_in_flight`` of 256 with a threshold of
+  24576, which a connection holding at most 256 orphaned stream ids can never reach, so
+  orphan-based connection replacement never happened for such a subclass. Each connection
+  now derives both in ``__init__`` from the limit in force when it is built, which
+  overrides a value a subclass sets in its class body. ``orphaned_threshold`` is also
+  capped at three quarters of the CQL stream id range, as ``max_request_id`` already was:
+  a ``max_in_flight`` raised past that range left the threshold above the number of stream
+  ids a connection can hold at all, which is the same bug in the other direction. The two
+  new static methods ``Connection.max_request_id_for()`` and
+  ``Connection.orphaned_threshold_for()`` expose the derivation, so that both limits can
+  be read for a given ``max_in_flight`` before any connection exists.
+* The ``STARTUP`` options that describe the driver itself are no longer the
+  application's to set. An ``ApplicationInfoBase.add_startup_options`` that sets
+  ``DRIVER_NAME``, ``DRIVER_VERSION``, ``SESSION_ID`` or ``DRIVER_CONFIG`` now has that
+  value dropped, with a warning naming the option; keys the driver does not own still
+  come through unchanged. Previously ``DRIVER_NAME`` and ``DRIVER_VERSION`` could be
+  overridden, which misreported the driver to the server for the life of the connection
+  and, in the clients table, to the operator reading the row.
+
+3.29.11
+=======
+Jun 15, 2026
+
+Features
+--------
+* asyncio backend now supports TLS
+
+Bug Fixes
+---------
+* Race conditions in libev backend resulting in EBADF error have been fixed
+
+Testing / CI
+------------
+* Integration tests now use ``NetworkTopologyStrategy`` instead of ``SimpleStrategy``
+* All actions used in CI are now hash-pinned to decrease risk of supply-chain attacks
+* Various fixes to make CI tests work with various versions of Scylla - mostly related to tablets and LWT
+* Bumped Scylla version used in CI to 2026.1
+
+3.29.10
+=======
+May 10, 2026
+
+Features
+--------
+* Fast-path ``lookup_casstype()`` for simple type names
+* Add ``Session.wait_for_schema_agreement``
+
+Bug Fixes
+---------
+* Fix CQL injection in ``Connection.set_keyspace_blocking`` and ``Connection.set_keyspace_async``
+* Fix libev shutdown crashes by correcting atexit registration
+* Handle ``None`` ``control_connection_timeout`` in ``wait_for_schema_agreement``
+* Clean up failed heartbeat sends
+* Fix ``ExponentialBackoffRetryPolicy.__init__`` super() call
+* Correct ``clustering_key`` to ``clustering`` in column kind filter
+* Fix inverted cooldown check in ``_get_shard_aware_endpoint``
+
+Others
+------
+* Deprecate ``ControlConnection.wait_for_schema_agreement``
+* Add timeout and in-flight observability to ``OperationTimedOut``
+* Drop per-query connection log
+
+3.29.9
+======
+March 18, 2026
+
+Features
+--------
+* Add Private Link support via client routes handler
+* Add optional query_params parameter to QueryMessage
+
+Bug Fixes
+---------
+* Fix segmentation fault in libev prepare_callback during shutdown
+* Add null checks to io_callback and timer_callback in libev wrapper
+* Fix RecursionError in execute_concurrent on synchronous errbacks
+* Fix floating-point precision loss for timestamps far from epoch
+
+Others
+------
+* Cache parsed tablet routing type in ResponseFuture
+* Remove deprecated setup_requires in favor of PEP 517 build-system.requires
+* Update dependency hatchling to v1.29.0
+
 3.29.8
 ======
 February 09, 2026

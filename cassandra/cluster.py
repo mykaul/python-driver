@@ -16,42 +16,50 @@
 This module houses the main classes you will interact with,
 :class:`.Cluster` and :class:`.Session`.
 """
-from __future__ import absolute_import
 
 import atexit
 import datetime
+from enum import Enum
 from binascii import hexlify
 from collections import defaultdict
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as wait_futures
+from concurrent.futures import Future, ThreadPoolExecutor, FIRST_COMPLETED, wait as wait_futures
 from copy import copy
 from functools import partial, reduce, wraps
 from itertools import groupby, count, chain
+import enum
 import json
 import logging
-from typing import Optional, Union
+import os
+from typing import Any, Dict, Optional, Union, Tuple
 from warnings import warn
 from random import random
 import re
 import queue
 import socket
-import sys
 import time
-from threading import Lock, RLock, Thread, Event
+from threading import get_ident, Lock, RLock, Thread, Event
 import uuid
+
+try:
+    from threading import _register_atexit as _register_threading_atexit
+except ImportError:
+    _register_threading_atexit = None
 
 import weakref
 from weakref import WeakValueDictionary
 
-from cassandra import (ConsistencyLevel, AuthenticationFailed, InvalidRequest,
-                       OperationTimedOut, UnsupportedOperation,
+from cassandra import (ConsistencyLevel, AuthenticationFailed, OperationTimedOut, UnsupportedOperation,
                        SchemaTargetType, DriverException, ProtocolVersion,
-                       UnresolvableContactPoints, DependencyException)
+                       UnresolvableContactPoints, DependencyException, InvalidRequest)
 from cassandra.auth import _proxy_execute_key, PlainTextAuthProvider
-from cassandra.connection import (ConnectionException, ConnectionShutdown,
+from cassandra.client_routes import ClientRoutesChangeType, ClientRoutesConfig, _ClientRoutesHandler
+from cassandra.connection import (ClientRoutesEndPointFactory, ConnectionException, ConnectionShutdown,
                                   ConnectionHeartbeat, ProtocolVersionUnsupported,
                                   EndPoint, DefaultEndPoint, DefaultEndPointFactory,
-                                  SniEndPointFactory, ConnectionBusy, locally_supported_compressions)
+                                  SniEndPointFactory, UnixSocketEndPoint,
+                                  ConnectionBusy, locally_supported_compressions)
+from cassandra.ssl_session_cache import SSLSessionCache
 from cassandra.cqltypes import UserType
 import cassandra.cqltypes as types
 from cassandra.encoder import Encoder
@@ -68,7 +76,7 @@ from cassandra.protocol import (QueryMessage, ResultMessage,
                                 RESULT_KIND_SET_KEYSPACE, RESULT_KIND_ROWS,
                                 RESULT_KIND_SCHEMA_CHANGE, ProtocolHandler,
                                 RESULT_KIND_VOID, ProtocolException)
-from cassandra.metadata import Metadata, protect_name, murmur3, _NodeInfo
+from cassandra.metadata import Metadata, Token, protect_name, murmur3, _NodeInfo
 from cassandra.policies import (TokenAwarePolicy, DCAwareRoundRobinPolicy, SimpleConvictionPolicy,
                                 ExponentialReconnectionPolicy, HostDistance,
                                 RetryPolicy, IdentityTranslator, NoSpeculativeExecutionPlan,
@@ -82,12 +90,9 @@ from cassandra.query import (SimpleStatement, PreparedStatement, BoundStatement,
                              named_tuple_factory, dict_factory, tuple_factory, FETCH_SIZE_UNSET,
                              HostTargetingStatement)
 from cassandra.marshal import int64_pack
-from cassandra.tablets import Tablet, Tablets
+from cassandra.tablets import Tablet, choose_tablet_version_block, random_tablet_version_block
 from cassandra.timestamps import MonotonicTimestampGenerator
 from cassandra.util import _resolve_contact_points_to_string_map, Version, maybe_add_timeout_to_query
-
-from cassandra.datastax.insights.reporter import MonitorReporter
-from cassandra.datastax.insights.util import version_supports_insights
 
 from cassandra.datastax.graph import (graph_object_row_factory, GraphOptions, GraphSON1Serializer,
                                       GraphProtocol, GraphSON2Serializer, GraphStatement, SimpleGraphStatement,
@@ -96,57 +101,12 @@ from cassandra.datastax.graph import (graph_object_row_factory, GraphOptions, Gr
 from cassandra.datastax.graph.query import _request_timeout_key, _GraphSONContextRowFactory
 from cassandra.datastax import cloud as dscloud
 from cassandra.application_info import ApplicationInfoBase
-
-try:
-    from cassandra.io.twistedreactor import TwistedConnection
-except ImportError:
-    TwistedConnection = None
-
-try:
-    from cassandra.io.eventletreactor import EventletConnection
-except (ImportError, AttributeError):
-    # AttributeError was add for handling python 3.12 https://github.com/eventlet/eventlet/issues/812
-    # TODO: remove it when eventlet issue would be fixed
-    EventletConnection = None
+from cassandra.driver_config import DriverConfigReporter
 
 try:
     from weakref import WeakSet
 except ImportError:
     from cassandra.util import WeakSet  # NOQA
-
-def _is_gevent_monkey_patched():
-    if 'gevent.monkey' not in sys.modules:
-        return False
-    try:
-        import gevent.socket
-        return socket.socket is gevent.socket.socket    # Another case related to PYTHON-1364
-    except (AttributeError, ImportError):
-        return False
-
-def _try_gevent_import():
-    if _is_gevent_monkey_patched():
-        from cassandra.io.geventreactor import GeventConnection
-        return (GeventConnection,None)
-    else:
-        return (None,None)
-
-def _is_eventlet_monkey_patched():
-    if 'eventlet.patcher' not in sys.modules:
-        return False
-    try:
-        import eventlet.patcher
-        return eventlet.patcher.is_monkey_patched('socket')
-    except (ImportError, AttributeError):
-        # AttributeError was add for handling python 3.12 https://github.com/eventlet/eventlet/issues/812
-        # TODO: remove it when eventlet issue would be fixed
-        return False
-
-def _try_eventlet_import():
-    if _is_eventlet_monkey_patched():
-        from cassandra.io.eventletreactor import EventletConnection
-        return (EventletConnection,None)
-    else:
-        return (None,None)
 
 def _try_libev_import():
     try:
@@ -176,7 +136,7 @@ def _connection_reduce_fn(val,import_fn):
         excs.append(exc)
     return (rv or import_result, excs)
 
-conn_fns = (_try_gevent_import, _try_eventlet_import, _try_libev_import, _try_asyncore_import, _try_asyncio_import)
+conn_fns = (_try_libev_import, _try_asyncore_import, _try_asyncio_import)
 (conn_class, excs) = reduce(_connection_reduce_fn, conn_fns, (None,[]))
 if not conn_class:
     raise DependencyException("Exception loading connection class dependencies", excs)
@@ -189,7 +149,6 @@ DefaultConnection = conn_class
 "".encode('utf8')
 
 log = logging.getLogger(__name__)
-
 
 _GRAPH_PAGING_MIN_DSE_VERSION = Version('6.8.0')
 
@@ -214,6 +173,14 @@ class NoHostAvailable(Exception):
         self.errors = errors
 
 
+class SchemaAgreementScope(str, Enum):
+    """Scope selectors for :meth:`.Session.wait_for_schema_agreement`."""
+
+    RACK = 'rack'
+    DC = 'dc'
+    CLUSTER = 'cluster'
+
+
 def _future_completed(future):
     """ Helper for run_in_executor() """
     exc = future.exception()
@@ -224,6 +191,10 @@ def _future_completed(future):
 def run_in_executor(f):
     """
     A decorator to run the given method in the ThreadPoolExecutor.
+
+    The wrapper returns the submitted Future, or None when the cluster is
+    shutting down or the executor rejected the submission, in which case the
+    wrapped method never runs.
     """
 
     @wraps(f)
@@ -234,6 +205,7 @@ def run_in_executor(f):
         try:
             future = self.executor.submit(f, self, *args, **kwargs)
             future.add_done_callback(_future_completed)
+            return future
         except Exception:
             log.exception("Failed to submit task to executor")
 
@@ -241,22 +213,81 @@ def run_in_executor(f):
 
 
 _clusters_for_shutdown = set()
+_clusters_for_shutdown_lock = Lock()
+_cluster_scheduler_shutdown_started = False
+
+
+def _clear_clusters_for_shutdown_after_fork():
+    """Forget parent-owned clusters and locks in a fork child."""
+    global _clusters_for_shutdown_lock, _cluster_scheduler_shutdown_started
+    _clusters_for_shutdown_lock = Lock()
+    _cluster_scheduler_shutdown_started = False
+    _clusters_for_shutdown.clear()
 
 
 def _register_cluster_shutdown(cluster):
-    _clusters_for_shutdown.add(cluster)
+    """Track a cluster unless scheduler shutdown has already started."""
+    with _clusters_for_shutdown_lock:
+        if not _cluster_scheduler_shutdown_started:
+            _clusters_for_shutdown.add(cluster)
+            return True
+        return False
 
 
 def _discard_cluster_shutdown(cluster):
-    _clusters_for_shutdown.discard(cluster)
+    """Stop tracking a cluster after explicit shutdown."""
+    with _clusters_for_shutdown_lock:
+        _clusters_for_shutdown.discard(cluster)
+
+
+def _shutdown_cluster_schedulers():
+    """Stop registered schedulers without aborting interpreter shutdown."""
+    global _cluster_scheduler_shutdown_started
+    with _clusters_for_shutdown_lock:
+        _cluster_scheduler_shutdown_started = True
+        clusters = _clusters_for_shutdown.copy()
+    for cluster in clusters:
+        try:
+            cluster.scheduler.shutdown()
+        except Exception:
+            # Exceptions from threading atexit callbacks prevent the remaining
+            # callbacks and non-daemon thread joins from running.
+            log.exception("Failed to shut down Cluster scheduler")
 
 
 def _shutdown_clusters():
-    clusters = _clusters_for_shutdown.copy()  # copy because shutdown modifies the global set "discard"
+    """Shut down registered clusters during normal atexit processing."""
+    with _clusters_for_shutdown_lock:
+        # Copy because shutdown removes clusters from the global set.
+        clusters = _clusters_for_shutdown.copy()
     for cluster in clusters:
         cluster.shutdown()
 
 
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_clear_clusters_for_shutdown_after_fork)
+
+
+# concurrent.futures is imported before this registration and installs its
+# _python_exit callback first. threading runs callbacks in reverse order, so
+# schedulers stop before ThreadPoolExecutor disables submissions. Full cluster
+# shutdown remains an ordinary atexit callback so application threads finish
+# before their connections close.
+if _register_threading_atexit is not None:
+    try:
+        _register_threading_atexit(_shutdown_cluster_schedulers)
+    except RuntimeError:
+        # Keep imports from failing when concurrent.futures was initialized before
+        # threading shutdown started. No scheduler cleanup callback can run now,
+        # so reject clusters through the same path as completed cleanup.
+        with _clusters_for_shutdown_lock:
+            _cluster_scheduler_shutdown_started = True
+        log.warning("Could not register Cluster scheduler shutdown during interpreter shutdown")
+else:
+    # Unknown runtimes may not expose CPython's pre-thread-shutdown hook. Keep
+    # the driver importable there, but make the loss of early cleanup visible.
+    log.warning("Cluster schedulers cannot be stopped before executor teardown: "
+                "threading._register_atexit is unavailable")
 atexit.register(_shutdown_clusters)
 
 
@@ -505,8 +536,9 @@ class GraphAnalyticsExecutionProfile(GraphExecutionProfile):
 
 class ProfileManager(object):
 
-    def __init__(self):
+    def __init__(self, pools_allowed: bool=True):
         self.profiles = dict()
+        self.pools_allowed = pools_allowed
 
     def _profiles_without_explicit_lbps(self):
         names = (profile_name for
@@ -518,6 +550,8 @@ class ProfileManager(object):
         )
 
     def distance(self, host):
+        if not self.pools_allowed:
+            return HostDistance.IGNORED
         distances = set(p.load_balancing_policy.distance(host) for p in self.profiles.values())
         return HostDistance.LOCAL_RACK if HostDistance.LOCAL_RACK in distances else \
             HostDistance.LOCAL if HostDistance.LOCAL in distances else \
@@ -533,10 +567,14 @@ class ProfileManager(object):
             p.load_balancing_policy.check_supported()
 
     def on_up(self, host):
+        if not self.pools_allowed:
+            return
         for p in self.profiles.values():
             p.load_balancing_policy.on_up(host)
 
     def on_down(self, host):
+        if not self.pools_allowed:
+            return
         for p in self.profiles.values():
             p.load_balancing_policy.on_down(host)
 
@@ -608,6 +646,47 @@ class _ConfigMode(object):
     UNCOMMITTED = 0
     LEGACY = 1
     PROFILES = 2
+
+
+class ControlConnectionQueryFallback(enum.Enum):
+    """
+    Controls how application queries use the control connection when node pools
+    are unavailable.
+
+    ``Disabled`` requires a usable node pool for application queries. If the
+    driver cannot establish one during session startup, it raises
+    :class:`NoHostAvailable`.
+
+    ``Fallback`` still attempts to create node pools, but allows application
+    queries to fall back to the control connection when no usable node pool is
+    available. Session startup is allowed to proceed even if the initial pool
+    attempts all fail.
+
+    ``SkipPoolCreation`` disables node-pool creation for the session and uses
+    the control-connection fallback path for application queries.
+
+    The first session using fallback binds the shared control connection to its
+    keyspace, including :const:`None`. Other sessions may use fallback only
+    while their keyspace matches that binding; a different keyspace is
+    rejected. The binding is released once every session holding it has been
+    shut down or garbage collected and its fallback requests have drained,
+    after which a later session may take it over. A session without a keyspace
+    cannot take over a binding that left the shared connection in a keyspace,
+    because CQL offers no way back to "no keyspace"; that case is rejected with
+    :class:`.InvalidRequest`.
+
+    An explicit ``USE`` statement -- including the one
+    :meth:`.Session.set_keyspace` executes -- is rejected with
+    :class:`.InvalidRequest` on the fallback path, because it would change the
+    keyspace of the shared connection under every other session using it. The
+    keyspace has to be chosen when the session is created.
+
+    The fallback path is not used for requests targeted to an explicit host.
+    """
+
+    Disabled = "Disabled"
+    Fallback = "Fallback"
+    SkipPoolCreation = "SkipPoolCreation"
 
 
 class Cluster(object):
@@ -875,6 +954,8 @@ class Cluster(object):
     .. versionadded:: 3.17.0
     """
 
+    # ssl_session_cache is a property, defined with the rest of the TLS
+    # session resumption code below.
     sockopts = None
     """
     An optional list of tuples which will be used as arguments to
@@ -904,18 +985,12 @@ class Cluster(object):
 
     * :class:`cassandra.io.asyncorereactor.AsyncoreConnection`
     * :class:`cassandra.io.libevreactor.LibevConnection`
-    * :class:`cassandra.io.eventletreactor.EventletConnection` (requires monkey-patching - see doc for details)
-    * :class:`cassandra.io.geventreactor.GeventConnection` (requires monkey-patching - see doc for details)
-    * :class:`cassandra.io.twistedreactor.TwistedConnection`
     * EXPERIMENTAL: :class:`cassandra.io.asyncioreactor.AsyncioConnection`
 
     By default, ``AsyncoreConnection`` will be used, which uses
     the ``asyncore`` module in the Python standard library.
 
     If ``libev`` is installed, ``LibevConnection`` will be used instead.
-
-    If ``gevent`` or ``eventlet`` monkey-patching is detected, the corresponding
-    connection class will be used automatically.
 
     ``AsyncioConnection``, which uses the ``asyncio`` module in the Python
     standard library, is also available, but currently experimental. Note that
@@ -928,6 +1003,18 @@ class Cluster(object):
     A timeout, in seconds, for queries made by the control connection, such
     as querying the current schema and information about nodes in the cluster.
     If set to :const:`None`, there will be no timeout for these queries.
+    """
+
+    allow_control_connection_query_fallback: ControlConnectionQueryFallback = ControlConnectionQueryFallback.Disabled
+    """
+    Controls whether application queries may fall back to the control connection.
+
+    ``Disabled`` keeps the old behavior.
+    ``Fallback`` enables control-connection fallback when no usable node pools exist.
+    ``SkipPoolCreation`` skips node-pool creation and uses the control connection fallback path.
+    The first fallback session binds the shared control connection to its keyspace;
+    later fallback sessions must use the same keyspace.
+    This fallback is still not used for requests targeted to an explicit host.
     """
 
     idle_heartbeat_interval = 30
@@ -1026,33 +1113,46 @@ class Cluster(object):
     documentation for :meth:`Session.timestamp_generator`.
     """
 
-    monitor_reporting_enabled = False
+    driver_config_reporting_enabled = True
     """
-    A boolean indicating if monitor reporting, which sends gathered data to
-    Insights when running against DSE 6.8 and higher.
+    A boolean indicating whether the driver describes its effective
+    configuration to the cluster while setting up the control connection, so
+    that operators can inspect the settings of a client while investigating an
+    incident. The description is sent as the ``DRIVER_CONFIG`` startup option
+    and ScyllaDB exposes it in the ``client_options`` column of its clients
+    table.
+
+    :attr:`~.Cluster.session_id`, which every connection reports, is not
+    affected by this setting.
+
+    Read when a connection is opened, so changing it takes effect on the
+    connections established afterwards and leaves the open ones alone.
+
+    Defaults to :const:`True`.
     """
 
-    monitor_reporting_interval = 30
-    """
-    A boolean indicating if monitor reporting, which sends gathered data to
-    Insights when running against DSE 6.8 and higher.
-    """
+    _session_id = None
 
-    client_id = None
-    """
-    A UUID that uniquely identifies this Cluster object to Insights. This will
-    be generated automatically unless the user provides one.
-    """
+    @property
+    def session_id(self):
+        """
+        A :class:`uuid.UUID` identifying this ``Cluster``, generated when it is
+        created and never changing afterwards.
 
-    application_name = ''
-    """
-    A string identifying this application to Insights.
-    """
+        Every connection this ``Cluster`` opens -- the control connection as
+        well as the pools of each of its :class:`~.Session` objects -- reports
+        it to the cluster as the ``SESSION_ID`` startup option, where ScyllaDB
+        exposes it in the ``client_options`` column of its clients table.
+        Logging it, or attaching it to a support bundle, is what allows
+        client-side observations to be matched against those rows instead of
+        correlating them by address and port.
 
-    application_version = ''
-    """
-    A string identifiying this application's version to Insights
-    """
+        The option is named after the convention shared with the other ScyllaDB
+        drivers, where a "session" is what this driver calls a ``Cluster``. It is
+        unrelated to :attr:`.Session.session_id`, which identifies a ``Session``
+        within the client and is never reported to the cluster.
+        """
+        return self._session_id
 
     cloud = None
     """
@@ -1158,6 +1258,12 @@ class Cluster(object):
     _prepared_statements = None
     _prepared_statement_lock = None
     _idle_heartbeat = None
+    _ssl_session_cache = _NOT_SET
+    _ssl_session_cache_created = None
+    # Held only while the cache above is constructed, and nothing else is held
+    # underneath it: making one is not something that can take part in an
+    # ordering with the pool locks, which self._lock would.
+    _ssl_session_cache_lock = None
     _protocol_version_explicit = False
     _discount_down_events = True
 
@@ -1205,17 +1311,16 @@ class Cluster(object):
                  no_compact=False,
                  ssl_context=None,
                  endpoint_factory=None,
-                 application_name=None,
-                 application_version=None,
-                 monitor_reporting_enabled=True,
-                 monitor_reporting_interval=30,
-                 client_id=None,
                  cloud=None,
                  scylla_cloud=None,
                  shard_aware_options=None,
                  metadata_request_timeout: Optional[float] = None,
                  column_encryption_policy=None,
-                 application_info:Optional[ApplicationInfoBase]=None
+                 application_info:Optional[ApplicationInfoBase]=None,
+                 client_routes_config:Optional[ClientRoutesConfig]=None,
+                 allow_control_connection_query_fallback:Optional[ControlConnectionQueryFallback]=ControlConnectionQueryFallback.Disabled,
+                 driver_config_reporting_enabled=True,
+                 ssl_session_cache=_NOT_SET
                  ):
         """
         ``executor_threads`` defines the number of threads in a pool for handling asynchronous tasks such as
@@ -1233,6 +1338,10 @@ class Cluster(object):
         if port < 1 or port > 65535:
             raise ValueError("Invalid port number (%s) (1-65535)" % port)
 
+        if not isinstance(allow_control_connection_query_fallback, ControlConnectionQueryFallback):
+            raise TypeError(
+                "allow_control_connection_query_fallback must be a ControlConnectionQueryFallback value")
+
         if connection_class is not None:
             self.connection_class = connection_class
 
@@ -1245,9 +1354,7 @@ class Cluster(object):
                 raise ValueError("contact_points, endpoint_factory, ssl_context, and ssl_options "
                                  "cannot be specified with a cloud configuration")
 
-            uses_twisted = TwistedConnection and issubclass(self.connection_class, TwistedConnection)
-            uses_eventlet = EventletConnection and issubclass(self.connection_class, EventletConnection)
-            cloud_config = dscloud.get_cloud_config(cloud, create_pyopenssl_context=uses_twisted or uses_eventlet)
+            cloud_config = dscloud.get_cloud_config(cloud)
 
             ssl_context = cloud_config.ssl_context
             ssl_options = {'check_hostname': True}
@@ -1280,6 +1387,45 @@ class Cluster(object):
         if column_encryption_policy is not None:
             self.column_encryption_policy = column_encryption_policy
 
+        if client_routes_config is not None and endpoint_factory is not None:
+            raise ValueError("client_routes_config and endpoint_factory are mutually exclusive")
+
+        self._client_routes_handler = None
+        if client_routes_config is not None:
+            if not isinstance(client_routes_config, ClientRoutesConfig):
+                raise TypeError("client_routes_config must be a ClientRoutesConfig instance")
+
+            # SSL hostname verification is incompatible with client routes:
+            # connections go through NLB proxies whose addresses won't match
+            # server certificates.
+            _check_hostname_enabled = False
+            if ssl_context is not None and ssl_context.check_hostname:
+                _check_hostname_enabled = True
+            if ssl_options is not None and ssl_options.get('check_hostname', False):
+                _check_hostname_enabled = True
+            if _check_hostname_enabled:
+                raise ValueError(
+                    "SSL hostname verification (check_hostname=True) is currently incompatible "
+                    "with client_routes_config. When using client routes, connections "
+                    "go through NLB proxies whose addresses won't match server "
+                    "certificates. Disable hostname verification by setting "
+                    "ssl_context.check_hostname = False."
+                )
+
+            ssl_enabled = ssl_context is not None or ssl_options is not None
+            self._client_routes_handler = _ClientRoutesHandler(client_routes_config, ssl_enabled=ssl_enabled)
+
+            if contact_points is _NOT_SET or not self._contact_points_explicit:
+                seed_addrs = [dep.connection_addr_override for dep in client_routes_config.proxies
+                             if dep.connection_addr_override]
+                if seed_addrs:
+                    self.contact_points = seed_addrs
+                    self._contact_points_explicit = True
+                    log.info("[client routes] Using %d deployment connection addresses as contact points",
+                            len(seed_addrs))
+
+        if self._client_routes_handler is not None:
+            endpoint_factory = ClientRoutesEndPointFactory(self._client_routes_handler, self.port)
         self.endpoint_factory = endpoint_factory or DefaultEndPointFactory(port=self.port)
         self.endpoint_factory.configure(self)
 
@@ -1355,7 +1501,8 @@ class Cluster(object):
         else:
             self.timestamp_generator = MonotonicTimestampGenerator()
 
-        self.profile_manager = ProfileManager()
+        self.profile_manager = ProfileManager(
+            pools_allowed=allow_control_connection_query_fallback != ControlConnectionQueryFallback.SkipPoolCreation)
         self.profile_manager.profiles[EXEC_PROFILE_DEFAULT] = ExecutionProfile(
             self.load_balancing_policy,
             self.default_retry_policy,
@@ -1420,10 +1567,25 @@ class Cluster(object):
 
         self.ssl_options = ssl_options
         self.ssl_context = ssl_context
-        self.sockopts = sockopts
+
+        self._ssl_session_cache_lock = Lock()
+        self._ssl_session_cache = ssl_session_cache
+
+        # Materialized once: these are applied to every socket the cluster opens
+        # and are read again to build the configuration report, so a one-shot
+        # iterable would leave whichever consumer ran second with nothing at all.
+        # Something that is not a sequence of options at all is kept as it was
+        # given, so that it still fails where it always did -- on the socket, at
+        # connect time -- rather than turning a constructor that used to build
+        # into one that raises.
+        try:
+            self.sockopts = list(sockopts) if sockopts is not None else None
+        except TypeError:
+            self.sockopts = sockopts
         self.cql_version = cql_version
         self.max_schema_agreement_wait = max_schema_agreement_wait
         self.control_connection_timeout = control_connection_timeout
+        self.allow_control_connection_query_fallback = allow_control_connection_query_fallback
         self.metadata_request_timeout = self.control_connection_timeout if metadata_request_timeout is None else metadata_request_timeout
         self.idle_heartbeat_interval = idle_heartbeat_interval
         self.idle_heartbeat_timeout = idle_heartbeat_timeout
@@ -1433,9 +1595,11 @@ class Cluster(object):
         self.connect_timeout = connect_timeout
         self.prepare_on_all_hosts = prepare_on_all_hosts
         self.reprepare_on_up = reprepare_on_up
-        self.monitor_reporting_enabled = monitor_reporting_enabled
-        self.monitor_reporting_interval = monitor_reporting_interval
         self.shard_aware_options = ShardAwareOptions(opts=shard_aware_options)
+
+        if (client_routes_config is not None
+                and not client_routes_config.advanced_shard_awareness):
+            self.shard_aware_options.disable_shardaware_port = True
 
         self._listeners = set()
         self._listener_lock = Lock()
@@ -1459,6 +1623,18 @@ class Cluster(object):
             from cassandra.metrics import Metrics
             self.metrics = Metrics(weakref.proxy(self))
 
+        # Both are read by _make_connection_kwargs, so they have to be in place
+        # before anything can open a connection.
+        #
+        # The session id is generated unconditionally: every connection reports
+        # it, whatever driver_config_reporting_enabled is set to.
+        self._session_id = uuid.uuid4()
+        self.driver_config_reporting_enabled = driver_config_reporting_enabled
+        # Built whatever the flag says, so that the flag is the only thing that
+        # decides whether a connection reports: see _make_connection_kwargs. The
+        # reporter holds no state, so an unused one costs nothing.
+        self._driver_config_reporter = DriverConfigReporter(self)
+
         self.control_connection = ControlConnection(
             self, self.control_connection_timeout,
             self.schema_event_refresh_window, self.topology_event_refresh_window,
@@ -1466,21 +1642,14 @@ class Cluster(object):
             schema_metadata_enabled, token_metadata_enabled,
             schema_meta_page_size=schema_metadata_page_size)
 
-        if client_id is None:
-            self.client_id = uuid.uuid4()
-        if application_name is not None:
-            self.application_name = application_name
-        if application_version is not None:
-            self.application_version = application_version
-
     def _resolve_hostnames(self):
         raw_contact_points = []
         for cp in [cp for cp in self.contact_points if not isinstance(cp, EndPoint)]:
             raw_contact_points.append(cp if isinstance(cp, tuple) else (cp, self.port))
 
         self.endpoints_resolved = [cp for cp in self.contact_points if isinstance(cp, EndPoint)]
-        self._endpoint_map_for_insights = {repr(ep): '{ip}:{port}'.format(ip=ep.address, port=ep.port)
-                                           for ep in self.endpoints_resolved}
+        endpoint_map = {repr(ep): '{ip}:{port}'.format(ip=ep.address, port=ep.port)
+                        for ep in self.endpoints_resolved}
         strs_resolved_map = _resolve_contact_points_to_string_map(raw_contact_points)
         self.endpoints_resolved.extend(list(chain(
             *[
@@ -1489,50 +1658,23 @@ class Cluster(object):
             ]
         )))
 
-        self._endpoint_map_for_insights.update(
+        endpoint_map.update(
             {key: ['{ip}:{port}'.format(ip=ip, port=port) for ip, port in value]
              for key, value in strs_resolved_map.items() if value is not None}
         )
 
         if self.contact_points and (not self.endpoints_resolved):
             # only want to raise here if the user specified CPs but resolution failed
-            raise UnresolvableContactPoints(self._endpoint_map_for_insights)
+            raise UnresolvableContactPoints(endpoint_map)
 
     def _create_thread_pool_executor(self, **kwargs):
         """
-        Create a ThreadPoolExecutor for the cluster. In most cases, the built-in
-        `concurrent.futures.ThreadPoolExecutor` is used.
-
-        Python 3.7+ and Eventlet cause the `concurrent.futures.ThreadPoolExecutor`
-        to hang indefinitely. In that case, the user needs to have the `futurist`
-        package so we can use the `futurist.GreenThreadPoolExecutor` class instead.
+        Create a ThreadPoolExecutor for the cluster.
 
         :param kwargs: All keyword args are passed to the ThreadPoolExecutor constructor.
         :return: A ThreadPoolExecutor instance.
         """
-        tpe_class = ThreadPoolExecutor
-        if sys.version_info[0] >= 3 and sys.version_info[1] >= 7:
-            try:
-                from cassandra.io.eventletreactor import EventletConnection
-                is_eventlet = issubclass(self.connection_class, EventletConnection)
-            except:
-                # Eventlet is not available or can't be detected
-                return tpe_class(**kwargs)
-
-            if is_eventlet:
-                try:
-                    from futurist import GreenThreadPoolExecutor
-                    tpe_class = GreenThreadPoolExecutor
-                except ImportError:
-                    # futurist is not available
-                    raise ImportError(
-                        ("Python 3.7+ and Eventlet cause the `concurrent.futures.ThreadPoolExecutor` "
-                         "to hang indefinitely. If you want to use the Eventlet reactor, you "
-                         "need to install the `futurist` package to allow the driver to use "
-                         "the GreenThreadPoolExecutor. See https://github.com/eventlet/eventlet/issues/508 "
-                         "for more details."))
-
-        return tpe_class(**kwargs)
+        return ThreadPoolExecutor(**kwargs)
 
     def register_user_type(self, keyspace, user_type, klass):
         """
@@ -1638,7 +1780,127 @@ class Cluster(object):
             futures.update(session.update_created_pools())
         _, not_done = wait_futures(futures, pool_wait_timeout)
         if not_done:
-            raise OperationTimedOut("Failed to create all new connection pools in the %ss timeout.")
+            raise OperationTimedOut("Failed to create all new connection pools in the %ss timeout." % pool_wait_timeout,
+                                    timeout=pool_wait_timeout)
+
+    @property
+    def ssl_session_cache(self):
+        """
+        A :class:`~cassandra.ssl_session_cache.SSLSessionCache` shared by every
+        connection this cluster opens, letting them resume TLS sessions instead of
+        performing a full handshake each time.  This matters most for the group of
+        per-shard connections opened to a node at once, and for reconnections.
+
+        One is created on first use when :attr:`~Cluster.ssl_context` is set.
+        Nothing is settled before then: this answers against whatever
+        :attr:`~Cluster.ssl_context` and :attr:`~Cluster.connection_class` are in
+        force when it is read, so configuring TLS at any point still gets a cache,
+        and swapping in a connection class that cannot resume turns resumption off
+        rather than handing that class a keyword it does not take.
+
+        A cache created here is reachable only through this attribute, so it and
+        the sessions in it go when the cluster does.  A cache passed in stays the
+        caller's: :meth:`~.Cluster.shutdown` leaves its entries alone, so several
+        clusters -- at the same time or one after another -- can share the
+        sessions in it.  Its entries hold the ``SSLContext`` they were established
+        with, bounded by the cache's
+        :attr:`~cassandra.ssl_session_cache.SSLSessionCache.max_size`; call
+        :meth:`~cassandra.ssl_session_cache.SSLSessionCache.clear` to release
+        them.
+
+        Assigning it is honoured whenever, and a cache that cannot be used reads
+        back as :const:`None` rather than being left to fill with nothing.  Why
+        it cannot be used is said once, by :meth:`~.Cluster.connect`, which is
+        the only place that says it: a cache assigned after that reads back as
+        :const:`None` just the same, without a second word about it.
+
+        Pass ``ssl_session_cache=None`` to :class:`.Cluster` to turn resumption
+        off, or pass your own instance to size it or to share it between
+        clusters::
+
+            from cassandra.ssl_session_cache import SSLSessionCache
+
+            cluster = Cluster(ssl_context=ssl_context,
+                              ssl_session_cache=SSLSessionCache(max_size=64))
+
+        What resumption asks of the reactor, and of the server -- Scylla issues
+        session tickets only when told to, before 2026.3 -- is described under
+        :ref:`security`.  Where any of that is missing no cache is created and
+        this reads as :const:`None`, and connections handshake in full as they
+        did before.  Over TLS 1.2 a server that issues no tickets still assigns
+        a session id, so the cache may hold an entry it will not honour;
+        offering that costs nothing and the handshake simply completes in
+        full."""
+        if not self._tls_session_resumption_available():
+            return None
+        if self._ssl_session_cache is not _NOT_SET:
+            return self._ssl_session_cache
+        if self._ssl_session_cache_created is None:
+            # Reached from whichever threads are opening connections, which for
+            # a cluster configured with TLS after connect() is several pools at
+            # once.  Two of them both finding nothing here would each make a
+            # cache and the later one would win, leaving the connections of the
+            # other to fill an object nothing can reach and never resume from.
+            with self._ssl_session_cache_lock:
+                if self._ssl_session_cache_created is None:
+                    self._ssl_session_cache_created = SSLSessionCache()
+        return self._ssl_session_cache_created
+
+    @ssl_session_cache.setter
+    def ssl_session_cache(self, cache):
+        self._ssl_session_cache = cache
+
+    def _tls_session_resumption_available(self):
+        """
+        Whether a session could be resumed at all: it has to be replayable onto
+        the same ``SSLContext``, and the reactor has to give the driver a chance
+        to offer it before the handshake.  connection_class is not required to
+        derive from Connection, so one that does not report the capability is
+        treated as lacking it rather than raising.
+        """
+        return (self.ssl_context is not None and
+                getattr(self.connection_class,
+                        'supports_tls_session_resumption', False))
+
+    def _report_tls_session_resumption(self):
+        """
+        Say, once, why a cluster configured for TLS will not resume sessions.
+
+        A cache the caller asked for and cannot have is a warning: asking for
+        resumption and silently getting none is worse than not having it, since
+        the attribute reads as None and nothing is ever cached, which is also
+        what a server that issues no tickets looks like.
+
+        Where nothing was asked for it is only a note.  Resumption is on by
+        default wherever it works, so a cluster that configured TLS and will
+        not get it has something worth finding -- a Python 3.12 or newer
+        without the libev extension resolves to the asyncio reactor, which
+        cannot restore a session -- but nobody asked, so this is not news to
+        interrupt anyone with.  A cluster with no TLS at all is told nothing:
+        there is nothing there to resume.
+        """
+        if self._tls_session_resumption_available():
+            return
+        if self.ssl_context is None and self.ssl_options is None:
+            return
+
+        if self.ssl_context is None:
+            reason = ('no ssl_context is configured, and a session cannot be '
+                      'replayed onto the fresh context each connection builds '
+                      'from ssl_options')
+        else:
+            reason = ('%s cannot restore a session before the handshake' %
+                      getattr(self.connection_class, '__name__',
+                              self.connection_class))
+
+        if (self._ssl_session_cache is _NOT_SET
+                or self._ssl_session_cache is None):
+            log.debug('TLS session resumption is unavailable here, so every '
+                      'connection will perform a full handshake: %s.', reason)
+        else:
+            log.warning('ssl_session_cache is set but TLS session resumption '
+                        'is unavailable here, so no sessions will be cached: '
+                        '%s.', reason)
 
     def connection_factory(self, endpoint, host_conn = None, *args, **kwargs):
         """
@@ -1661,12 +1923,29 @@ class Cluster(object):
         kwargs_dict.setdefault('sockopts', self.sockopts)
         kwargs_dict.setdefault('ssl_options', self.ssl_options)
         kwargs_dict.setdefault('ssl_context', self.ssl_context)
+        ssl_session_cache = self.ssl_session_cache
+        if ssl_session_cache is not None:
+            # Set only where resumption is possible, so this is also the test
+            # for that: a connection class that does not accept the keyword
+            # should not have to grow one for a cluster that will never cache a
+            # session.
+            kwargs_dict.setdefault('ssl_session_cache', ssl_session_cache)
         kwargs_dict.setdefault('cql_version', self.cql_version)
         kwargs_dict.setdefault('protocol_version', self.protocol_version)
         kwargs_dict.setdefault('user_type_map', self._user_types)
         kwargs_dict.setdefault('allow_beta_protocol_version', self.allow_beta_protocol_version)
         kwargs_dict.setdefault('no_compact', self.no_compact)
         kwargs_dict.setdefault('application_info', self.application_info)
+
+        # Assigned rather than defaulted, unlike everything above: both describe
+        # this Cluster to the server, so a caller must not be able to substitute
+        # them. A connection reports whatever session id it is handed, which
+        # would break the correlation the option exists for, and a reporter
+        # passed in here would report a configuration that
+        # driver_config_reporting_enabled turned off.
+        kwargs_dict['session_id'] = self.session_id
+        kwargs_dict['driver_config_reporter'] = \
+            self._driver_config_reporter if self.driver_config_reporting_enabled else None
 
         return kwargs_dict
 
@@ -1701,6 +1980,8 @@ class Cluster(object):
         established or attempted. Default is `False`, which means it will return when the first
         successful connection is established. Remaining pools are added asynchronously.
         """
+        reject_late_connect = False
+        shutdown_rejected_cluster = False
         with self._lock:
             if self.is_shutdown:
                 raise DriverException("Cluster is already shut down")
@@ -1709,7 +1990,21 @@ class Cluster(object):
                 log.debug("Connecting to cluster, contact points: %s; protocol version: %s",
                           self.contact_points, self.protocol_version)
                 self.connection_class.initialize_reactor()
-                _register_cluster_shutdown(self)
+
+            if not _register_cluster_shutdown(self):
+                # threading shutdown callbacks run before non-daemon
+                # application threads are joined. A thread can therefore
+                # reach connect() after scheduler cleanup. Existing clusters
+                # remain registered for ordinary atexit cleanup. A new cluster
+                # must claim shutdown here, but cleanup cannot wait for its
+                # executor while this call may itself be running on a worker.
+                reject_late_connect = True
+                if not self._is_setup:
+                    self.is_shutdown = True
+                    shutdown_rejected_cluster = True
+
+            elif not self._is_setup:
+                self._report_tls_session_resumption()
 
                 try:
                     self.control_connection.connect()
@@ -1731,6 +2026,12 @@ class Cluster(object):
                         timeout=self.idle_heartbeat_timeout
                     )
                 self._is_setup = True
+
+        if reject_late_connect:
+            if shutdown_rejected_cluster:
+                self._shutdown(wait_for_executor=False)
+            raise DriverException(
+                "Cannot connect a Cluster during interpreter shutdown")
 
         session = self._new_session(keyspace)
         if wait_for_all_pools:
@@ -1761,7 +2062,8 @@ class Cluster(object):
         return pools
 
     def is_shard_aware(self):
-        return bool(self.get_all_pools()[0].host.sharding_info)
+        pools = self.get_all_pools()
+        return bool(pools and pools[0].host.sharding_info)
 
     def shard_aware_stats(self):
         if self.is_shard_aware():
@@ -1783,6 +2085,14 @@ class Cluster(object):
             else:
                 self.is_shutdown = True
 
+        # Once interpreter scheduler cleanup has begun, executor teardown is
+        # imminent and this call may itself be running on an executor worker.
+        self._shutdown(
+            wait_for_executor=not _cluster_scheduler_shutdown_started)
+
+    def _shutdown(self, wait_for_executor):
+        """Finish cleanup after shutdown has been claimed under ``self._lock``."""
+
         if self._idle_heartbeat:
             self._idle_heartbeat.stop()
 
@@ -1793,11 +2103,16 @@ class Cluster(object):
         for session in tuple(self.sessions):
             session.shutdown()
 
-        self.executor.shutdown()
+        self.executor.shutdown(wait=wait_for_executor)
 
         if self.metrics_enabled and self.metrics:
             self.metrics.shutdown()
 
+        # Nothing to do here for ssl_session_cache: a cache created for this
+        # cluster is reachable only through it and goes when it does, and a
+        # cache the caller supplied is the caller's to empty -- deleting rows
+        # in it here would defeat sharing one so that sessions outlive a
+        # cluster.  See the attribute's documentation.
         _discard_cluster_shutdown(self)
 
     def __enter__(self):
@@ -1851,7 +2166,9 @@ class Cluster(object):
 
             log.info("Connection pools established for node %s", host)
             # mark the host as up and notify all listeners
-            host.set_up()
+            with host.lock:
+                host.set_up()
+                host._pending_host_addition = False
             for listener in self.listeners:
                 listener.on_up(host)
         finally:
@@ -1866,7 +2183,7 @@ class Cluster(object):
         """
         Intended for internal use only.
         """
-        if self.is_shutdown:
+        if self.is_shutdown or self.allow_control_connection_query_fallback == ControlConnectionQueryFallback.SkipPoolCreation:
             return
 
         log.debug("Waiting to acquire lock for handling up status of node %s", host)
@@ -1929,6 +2246,7 @@ class Cluster(object):
             if not have_future:
                 with host.lock:
                     host.set_up()
+                    host._pending_host_addition = False
                     host._currently_handling_node_up = False
 
         # for testing purposes
@@ -1945,12 +2263,15 @@ class Cluster(object):
         # of the current Cluster attributes to create new Connections with
         conn_factory = self._make_connection_factory(host)
 
-        reconnector = _HostReconnectionHandler(
-            host, conn_factory, is_host_addition, self.on_add, self.on_up,
-            self.scheduler, schedule, host.get_and_set_reconnection_handler,
-            new_handler=None)
-
-        old_reconnector = host.get_and_set_reconnection_handler(reconnector)
+        with host.lock:
+            if is_host_addition:
+                host._pending_host_addition = True
+            is_host_addition = host._pending_host_addition
+            reconnector = _HostReconnectionHandler(
+                host, conn_factory, is_host_addition, self.on_add, self.on_up,
+                self.scheduler, schedule,
+                host.get_and_set_reconnection_handler, new_handler=None)
+            old_reconnector = host.get_and_set_reconnection_handler(reconnector)
         if old_reconnector:
             log.debug("Old host reconnector found for %s, cancelling", host)
             old_reconnector.cancel()
@@ -1959,24 +2280,76 @@ class Cluster(object):
         reconnector.start()
 
     @run_in_executor
-    def on_down_potentially_blocking(self, host, is_host_addition):
-        self.profile_manager.on_down(host)
-        self.control_connection.on_down(host)
-        for session in tuple(self.sessions):
-            session.on_down(host)
+    def on_down_potentially_blocking(self, host, is_host_addition,
+                                     down_event_generation):
+        try:
+            with host.lock:
+                if down_event_generation != host._down_event_generation:
+                    return
 
-        for listener in self.listeners:
-            listener.on_down(host)
+            # The load balancing policies go first, so that the query plan the
+            # control connection's reconnect walks no longer offers the host
+            # that just went down; otherwise the reconnect submitted below can
+            # start before the policies have dropped it and burn a
+            # connect_timeout on a dead node. Both calls are guarded because
+            # on_down() reports successful dispatch to callers that rely on a
+            # reconnection being started.
+            try:
+                self.profile_manager.on_down(host)
+            except Exception:
+                log.exception("Error in load balancing policy down handler for host %s", host)
+            try:
+                self.control_connection.on_down(host)
+            except Exception:
+                log.exception("Error in control connection down handler for host %s", host)
+            for session in tuple(self.sessions):
+                try:
+                    session.on_down(host)
+                except Exception:
+                    log.exception("Error marking host %s down in session", host)
 
-        self._start_reconnector(host, is_host_addition)
+            for listener in self.listeners:
+                try:
+                    listener.on_down(host)
+                except Exception:
+                    log.exception("Error in host state listener down handler for host %s", host)
+
+            self._start_reconnector(host, is_host_addition)
+        finally:
+            with host.lock:
+                if down_event_generation == host._down_event_generation:
+                    host._currently_handling_node_down = False
+
+    @run_in_executor
+    def _restart_reconnector(self, host, is_host_addition,
+                             down_event_generation):
+        try:
+            # Match the old synchronous path's ordering with on_up(): if the
+            # host recovered or is still being brought up while this task was
+            # queued, there is nothing to restart. A failed UP transition
+            # starts its own reconnector before releasing the UP guard, which
+            # must not be replaced by this stale task.
+            with host.lock:
+                if (down_event_generation == host._down_event_generation and
+                        host.is_up is False and
+                        not host._currently_handling_node_up and
+                        not host.is_currently_reconnecting()):
+                    self._start_reconnector(host, is_host_addition)
+        finally:
+            with host.lock:
+                if down_event_generation == host._down_event_generation:
+                    host._currently_handling_node_down = False
 
     def on_down(self, host, is_host_addition, expect_host_to_be_down=False):
         """
         Intended for internal use only.
-        """
-        if self.is_shutdown:
-            return
 
+        Returns whether DOWN handling was dispatched.
+        """
+        if self.is_shutdown or self.allow_control_connection_query_fallback == ControlConnectionQueryFallback.SkipPoolCreation:
+            return False
+
+        restart_reconnector = False
         with host.lock:
             was_up = host.is_up
 
@@ -1990,18 +2363,51 @@ class Cluster(object):
                     if pool_state:
                         connected |= pool_state['open_count'] > 0
                 if connected:
-                    return
+                    return False
 
             host.set_down()
-            if (not was_up and not expect_host_to_be_down) or host.is_currently_reconnecting():
-                return
+            if (not was_up and
+                    (host.is_currently_reconnecting() or
+                     host._currently_handling_node_down)):
+                return False
+
+            if not was_up and not expect_host_to_be_down:
+                # A terminal failure may have released this down host's old
+                # handler. Start a new retry cycle without repeating the DOWN
+                # notifications that were sent on the original transition.
+                restart_reconnector = True
+
+            host._currently_handling_node_down = True
+            host._down_event_generation += 1
+            down_event_generation = host._down_event_generation
+
+        if restart_reconnector:
+            future = self._restart_reconnector(
+                host, is_host_addition, down_event_generation)
+            if future is None:
+                with host.lock:
+                    if down_event_generation == host._down_event_generation:
+                        host._currently_handling_node_down = False
+            # Restarting the host reconnector does not dispatch the DOWN
+            # callbacks that reconnect the control connection.
+            return False
+
         log.warning("Host %s has been marked down", host)
 
-        self.on_down_potentially_blocking(host, is_host_addition)
+        future = self.on_down_potentially_blocking(
+            host, is_host_addition, down_event_generation)
+        if future is None:
+            with host.lock:
+                if down_event_generation == host._down_event_generation:
+                    host._currently_handling_node_down = False
+        return future is not None
 
     def on_add(self, host, refresh_nodes=True):
         if self.is_shutdown:
             return
+
+        with host.lock:
+            host._pending_host_addition = True
 
         log.debug("Handling new host %r and notifying listeners", host)
 
@@ -2059,8 +2465,10 @@ class Cluster(object):
             self._finalize_add(host)
 
     def _finalize_add(self, host, set_up=True):
-        if set_up:
-            host.set_up()
+        with host.lock:
+            if set_up:
+                host.set_up()
+            host._pending_host_addition = False
 
         for listener in self.listeners:
             listener.on_add(host)
@@ -2087,10 +2495,11 @@ class Cluster(object):
             reconnection_handler.cancel()
 
     def signal_connection_failure(self, host, connection_exc, is_host_addition, expect_host_to_be_down=False):
+        """Return whether the failure caused DOWN handling to be dispatched."""
         is_down = host.signal_connection_failure(connection_exc)
-        if is_down:
-            self.on_down(host, is_host_addition, expect_host_to_be_down)
-        return is_down
+        if not is_down:
+            return False
+        return self.on_down(host, is_host_addition, expect_host_to_be_down)
 
     def add_host(self, endpoint, datacenter=None, rack=None, signal=True, refresh_nodes=True, host_id=None):
         """
@@ -2174,8 +2583,7 @@ class Cluster(object):
         Returns the control connection host metadata.
         """
         connection = self.control_connection._connection
-        endpoint = connection.endpoint if connection else None
-        return self.metadata.get_host(endpoint) if endpoint else None
+        return self.control_connection._get_host_for_connection(connection)
 
     def refresh_schema_metadata(self, max_schema_agreement_wait=None):
         """
@@ -2365,7 +2773,6 @@ class Session(object):
     keyspace = None
     is_shutdown = False
     session_id = None
-    _monitor_reporter = None
 
     _row_factory = staticmethod(named_tuple_factory)
     @property
@@ -2552,8 +2959,11 @@ class Session(object):
 
     session_id = None
     """
-    A UUID that uniquely identifies this Session to Insights. This will be
-    generated automatically.
+    A UUID that uniquely identifies this Session. This will be generated automatically.
+
+    This is not the identifier reported to the cluster in the ``SESSION_ID``
+    startup option: that one is per-:class:`~.Cluster` and shared by every
+    connection, see :attr:`.Cluster.session_id`.
     """
 
     _lock = None
@@ -2579,20 +2989,36 @@ class Session(object):
 
         # create connection pools in parallel
         self._initial_connect_futures = set()
-        for host in hosts:
-            future = self.add_or_renew_pool(host, is_host_addition=False)
-            if future:
-                self._initial_connect_futures.add(future)
+        fallback_mode = self.cluster.allow_control_connection_query_fallback
+        if fallback_mode is not ControlConnectionQueryFallback.SkipPoolCreation:
+            for host in hosts:
+                future = self.add_or_renew_pool(host, is_host_addition=False)
+                if future:
+                    self._initial_connect_futures.add(future)
 
-        futures = wait_futures(self._initial_connect_futures, return_when=FIRST_COMPLETED)
-        while futures.not_done and not any(f.result() for f in futures.done):
-            futures = wait_futures(futures.not_done, return_when=FIRST_COMPLETED)
+            futures = wait_futures(self._initial_connect_futures, return_when=FIRST_COMPLETED)
+            while futures.not_done and not any(f.result() for f in futures.done):
+                futures = wait_futures(futures.not_done, return_when=FIRST_COMPLETED)
 
-        if not any(f.result() for f in self._initial_connect_futures):
-            msg = "Unable to connect to any servers"
-            if self.keyspace:
-                msg += " using keyspace '%s'" % self.keyspace
-            raise NoHostAvailable(msg, [h.address for h in hosts])
+            # Only Disabled requires an initial pool to come up.
+            if not any(f.result() for f in self._initial_connect_futures) and \
+                    fallback_mode is ControlConnectionQueryFallback.Disabled:
+                msg = "Unable to connect to any servers"
+                if self.keyspace:
+                    msg += " using keyspace '%s'" % self.keyspace
+                raise NoHostAvailable(msg, [h.address for h in hosts])
+
+        # Only SkipPoolCreation is a fallback Session for its whole life, so
+        # only it takes the binding up front. Under Fallback the pools may well
+        # come up moments later, and _query_control_connection() takes the
+        # binding if and when a query actually needs the shared connection;
+        # claiming it here would fail connect() over a transient blip and then
+        # hold the binding for the Session's lifetime.
+        if fallback_mode is ControlConnectionQueryFallback.SkipPoolCreation:
+            control_connection = self.cluster.control_connection
+            conflict = control_connection._attach_application_session(self.keyspace, self)
+            if conflict is not None:
+                raise InvalidRequest(conflict)
 
         self.session_id = uuid.uuid4()
 
@@ -2607,22 +3033,7 @@ class Session(object):
             raise Exception(
                 "column_encryption_policy is temporary disabled, until https://github.com/scylladb/python-driver/issues/365 is sorted out")
 
-        if self.cluster.monitor_reporting_enabled:
-            cc_host = self.cluster.get_control_connection_host()
-            valid_insights_version = (cc_host and version_supports_insights(cc_host.dse_version))
-            if valid_insights_version:
-                self._monitor_reporter = MonitorReporter(
-                    interval_sec=self.cluster.monitor_reporting_interval,
-                    session=self,
-                )
-            else:
-                if cc_host:
-                    log.debug('Not starting MonitorReporter thread for Insights; '
-                              'not supported by server version {v} on '
-                              'ControlConnection host {c}'.format(v=cc_host.release_version, c=cc_host))
-
-        log.debug('Started Session with client_id {} and session_id {}'.format(self.cluster.client_id,
-                                                                               self.session_id))
+        log.debug('Started Session with session_id {}'.format(self.session_id))
 
     def execute(self, query, parameters=None, timeout=_NOT_SET, trace=False,
                 custom_payload=None, execution_profile=EXEC_PROFILE_DEFAULT,
@@ -2939,6 +3350,31 @@ class Session(object):
         else:
             timestamp = None
 
+        # Snapshot passed to the ResponseFuture for decoding skip_meta responses; only
+        # bound statements carry cached result metadata (set in the BoundStatement branch).
+        bound_result_metadata = _NOT_SET
+
+        # Compute the ring token once, here on the request path, and pass it
+        # explicitly to the two consumers that run while sending: the
+        # tablet_version_block below and shard selection in the pool (via the
+        # ResponseFuture). The token is a pure function of the routing key and
+        # the cluster's partitioner, so computing it here keeps cluster-dependent
+        # state off the statement and avoids races when a statement is shared
+        # across concurrent requests. The load balancing policy computes its own
+        # token from the same routing key when ordering replicas.
+        # can_support_partitioner() is what makes this safe to do unconditionally:
+        # a Murmur3 cluster whose murmur3 helper is unavailable cannot hash a key
+        # at all (Murmur3Token.hash_fn raises NoMurmur3), and the default load
+        # balancing policy drops token awareness in that case. Without the check
+        # this path would raise on every prepared-statement execution instead.
+        routing_token = None
+        routing_key = query.routing_key
+        if routing_key is not None:
+            metadata = self.cluster.metadata
+            token_map = metadata.token_map
+            if token_map is not None and metadata.can_support_partitioner():
+                routing_token = token_map.token_class.from_key(routing_key)
+
         if isinstance(query, SimpleStatement):
             query_string = query.query_string
             statement_keyspace = query.keyspace if ProtocolVersion.uses_keyspace_flag(self._protocol_version) else None
@@ -2950,12 +3386,33 @@ class Session(object):
                 continuous_paging_options, statement_keyspace)
         elif isinstance(query, BoundStatement):
             prepared_statement = query.prepared_statement
+            # Snapshot metadata and its id as one atomic pair so the message never
+            # carries the id of one schema version alongside a skip_meta decision
+            # made for another. skip_meta is requested only when there is both an
+            # id to validate it with and cached metadata to decode against: while
+            # a statement has no cached metadata there is nothing to decode a
+            # metadata-less response with, so the server must send it.
+            # Whether skip_meta and the id actually reach the wire is decided per
+            # connection at serialization time (see ExecuteMessage.send_body).
+            # Continuous paging sessions are excluded: Connection.process_msg hardcodes
+            # result_metadata=None for every page after the first (it isn't threaded
+            # through the paging session), so a skip_meta response has nothing to
+            # decode page 2+ against.
+            result_metadata, result_metadata_id = prepared_statement.result_metadata_and_id
+            bound_result_metadata = result_metadata
+
+            # The tablet_version_block value is connection-independent, so compute
+            # it once here instead of copying the message per send attempt. The
+            # serializer emits it only when the serving connection negotiated
+            # TABLETS_ROUTING_V2 (see ExecuteMessage.send_body).
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size, paging_state, timestamp,
-                skip_meta=bool(prepared_statement.result_metadata),
+                skip_meta=bool(result_metadata) and result_metadata_id is not None
+                          and continuous_paging_options is None,
                 continuous_paging_options=continuous_paging_options,
-                result_metadata_id=prepared_statement.result_metadata_id)
+                result_metadata_id=result_metadata_id,
+                tablet_version_block=self._compute_tablet_version_block(query, routing_key, routing_token))
         elif isinstance(query, BatchStatement):
             if self._protocol_version < 2:
                 raise UnsupportedOperation(
@@ -2982,7 +3439,62 @@ class Session(object):
             self, message, query, timeout, metrics=self._metrics,
             prepared_statement=prepared_statement, retry_policy=retry_policy, row_factory=row_factory,
             load_balancer=load_balancing_policy, start_time=start_time, speculative_execution_plan=spec_exec_plan,
-            continuous_paging_state=None, host=host)
+            continuous_paging_state=None, host=host, bound_result_metadata=bound_result_metadata,
+            routing_token=routing_token)
+
+    def _compute_tablet_version_block(self, query, routing_key: Optional[bytes],
+                                      routing_token: Optional[Token]) -> int:
+        """
+        Compute the tablet_version_block byte for a BoundStatement.
+
+        Always returns an int in [0, 255]. A non-token-aware query (no routing
+        key) can never resolve to a tablet, so the server never version-checks
+        it; we send 0 and skip the work. Otherwise, when no cached tablet is
+        known for the routing key (unknown keyspace/table, vnode table, cold
+        cache, or a missing token map) a random block is returned; the server
+        treats that as a version miss and replies with fresh routing info.
+
+        ``routing_key`` and ``routing_token`` are the statement's routing key and
+        the ring token derived from it, both resolved once per request by the
+        caller (see :meth:`_create_response_future`) and passed in so the send
+        path has a single source of truth for them. ``routing_token`` is ``None``
+        both when there is no routing key and when no token map was available, so
+        telling those two cases apart needs the routing key as well -- taking it
+        as an argument rather than re-reading ``query.routing_key`` keeps the two
+        values here guaranteed to describe the same statement.
+
+        This is computed once per request at message construction; the value is
+        connection-independent, and the serializer emits it only on connections
+        that negotiated TABLETS_ROUTING_V2 (see ExecuteMessage.send_body).
+        """
+        if routing_key is None:
+            # Non-token-aware query: the server won't version-check it, so skip
+            # generating random bits and just send 0.
+            return 0
+
+        keyspace = query.keyspace or self.keyspace
+        table = query.table
+        if not keyspace or not table:
+            # We don't even know which table we're targeting. Don't waste
+            # CPU cycles on generating a random byte.
+            return 0
+
+        if routing_token is None:
+            # We're targeting a specific partition of some table,
+            # so the returned routing information can still be
+            # useful. Make it possible to obtain it.
+            return random_tablet_version_block()
+
+        # A single lookup: get_tablet_for_key already reports a table with no
+        # cached tablets (a vnode table, or a tablet table on cold start) as
+        # None, and going through the mutable cache twice would leave a window
+        # for the tablet to disappear between the checks.
+        tablet = self.cluster.metadata._tablets.get_tablet_for_key(keyspace, table, routing_token)
+        if tablet is None or tablet.tablet_version is None:
+            # A version miss on the server, which replies with fresh routing info.
+            return random_tablet_version_block()
+
+        return choose_tablet_version_block(tablet.tablet_version)
 
     def get_execution_profile(self, name):
         """
@@ -3166,9 +3678,6 @@ class Session(object):
             future.cancel()
         wait_futures(self._initial_connect_futures)
 
-        if self._monitor_reporter:
-            self._monitor_reporter.stop()
-
         for pool in tuple(self._pools.values()):
             pool.shutdown()
 
@@ -3191,6 +3700,9 @@ class Session(object):
         """
         For internal use only.
         """
+        if self.cluster.allow_control_connection_query_fallback is ControlConnectionQueryFallback.SkipPoolCreation:
+            return None
+
         distance = self._profile_manager.distance(host)
         if distance == HostDistance.IGNORED:
             return None
@@ -3261,6 +3773,9 @@ class Session(object):
 
         For internal use only.
         """
+        if self.cluster.allow_control_connection_query_fallback is ControlConnectionQueryFallback.SkipPoolCreation:
+            return set()
+
         futures = set()
         for host in self.cluster.metadata.all_hosts():
             distance = self._profile_manager.distance(host)
@@ -3299,6 +3814,12 @@ class Session(object):
         """
         Set the default keyspace for all queries made through this Session.
         This operation blocks until complete.
+
+        Raises :class:`.InvalidRequest` when the session uses the
+        control-connection fallback path (see
+        :class:`.ControlConnectionQueryFallback`), where the keyspace of the
+        shared connection cannot be changed; create a Session with the wanted
+        keyspace instead.
         """
         self.execute('USE %s' % (protect_name(keyspace),))
 
@@ -3324,10 +3845,194 @@ class Session(object):
                 errors[pool.host] = host_errors
 
             if not remaining_callbacks:
-                callback(host_errors)
+                callback(errors)
 
         for pool in tuple(self._pools.values()):
             pool._set_keyspace_for_all_conns(keyspace, pool_finished_setting_keyspace)
+
+    def wait_for_schema_agreement(self, wait_time: Optional[float] = None,
+                                  scope: SchemaAgreementScope = SchemaAgreementScope.CLUSTER) -> bool:
+        """
+        Wait for connected hosts in the selected scope to report the same
+        schema version from ``system.local``.
+
+        By default, the timeout for this operation is governed by
+        :attr:`~.Cluster.max_schema_agreement_wait` and
+        :attr:`~.Cluster.control_connection_timeout`.
+
+        Passing ``wait_time`` here overrides
+        :attr:`~.Cluster.max_schema_agreement_wait`. If provided, ``wait_time``
+        must be greater than 0.
+
+        ``scope`` determines which connected hosts participate in the check.
+        Pass :attr:`SchemaAgreementScope.RACK`, :attr:`SchemaAgreementScope.DC`,
+        or :attr:`SchemaAgreementScope.CLUSTER`.
+        The default is :attr:`SchemaAgreementScope.CLUSTER`. ``RACK`` narrows
+        the check to connected hosts in the local rack only. ``DC`` checks
+        connected hosts in the local datacenter. ``CLUSTER`` queries every
+        connected host across all datacenters.
+
+        :param wait_time: Override for
+            :attr:`~.Cluster.max_schema_agreement_wait`, should be positive
+            number.
+        :param scope: Restricts the check to connected hosts in the local rack,
+            local datacenter, or whole connected cluster.
+        :returns: ``True`` when the selected connected hosts agree on schema,
+            otherwise ``False``.
+        :raises ValueError: If ``wait_time`` is provided and is not greater
+            than 0.
+        :raises ValueError: If ``scope`` is not one of the schema agreement
+            scope values.
+        """
+
+        if wait_time is not None and wait_time <= 0:
+            raise ValueError("wait_time must be greater than 0")
+
+        if scope not in (SchemaAgreementScope.RACK, SchemaAgreementScope.DC, SchemaAgreementScope.CLUSTER):
+            raise ValueError(
+                "scope must be SchemaAgreementScope.RACK, .DC, or .CLUSTER"
+            )
+
+        total_timeout = wait_time if wait_time is not None else self.cluster.max_schema_agreement_wait
+        if total_timeout <= 0:
+            raise ValueError("total_timeout must be greater than 0")
+
+        deadline = time.time() + total_timeout
+        schema_mismatches = None
+        scope_label = 'local rack' if scope is SchemaAgreementScope.RACK else (
+            'local datacenter' if scope is SchemaAgreementScope.DC else 'cluster')
+
+        while time.time() < deadline:
+            schema_mismatches = self._get_schema_mismatches_for_scope(deadline, scope)
+            if schema_mismatches is None:
+                return True
+
+            log.debug("[session] Connected hosts in the %s still disagree on schema, trying again", scope_label)
+            remaining = deadline - time.time()
+            if remaining > 0:
+                time.sleep(min(0.2, remaining))
+
+        log.warning("[session] Connected hosts in the %s are reporting a schema disagreement: %s",
+                    scope_label, schema_mismatches)
+        return False
+
+    def _get_schema_mismatches_for_scope(self, deadline: float,
+                                         scope: SchemaAgreementScope) -> Optional[Dict[Any, Any]]:
+        hosts = self._get_schema_agreement_hosts(scope)
+        mismatches = defaultdict(list)
+        errors = {}
+        scope_label = 'local rack' if scope is SchemaAgreementScope.RACK else (
+            'local datacenter' if scope is SchemaAgreementScope.DC else 'cluster')
+
+        if not hosts:
+            errors[scope.value] = ConnectionException(
+                "No connected hosts available in the %s" % (scope_label,)
+            )
+            return {'unavailable': errors}
+
+        metadata_request_timeout = self.cluster.control_connection._metadata_request_timeout
+        query = maybe_add_timeout_to_query(ControlConnection._SELECT_SCHEMA_LOCAL, metadata_request_timeout)
+
+        schema_version_futures = []
+        for host in hosts:
+            try:
+                schema_version_future = self._query_local_schema_version(host, query, deadline)
+            except Exception as exc:
+                errors[host.endpoint] = exc
+                continue
+
+            schema_version_futures.append((host, schema_version_future))
+
+        if schema_version_futures:
+            # Start all host queries first, then wait for the whole batch.
+            remaining = max(0.0, deadline - time.time())
+            if remaining > 0:
+                wait_futures([future for _, future in schema_version_futures], timeout=remaining)
+
+            for host, future in schema_version_futures:
+                if future.done():
+                    try:
+                        rows = future.result()
+                    except Exception as exc:
+                        errors[host.endpoint] = exc
+                        continue
+
+                    row = rows.one()
+                    schema_version = getattr(row, "schema_version", None) if row is not None else None
+                    mismatches[schema_version].append(host.endpoint)
+                else:
+                    errors[host.endpoint] = OperationTimedOut(last_host=host, timeout=max(0.0, deadline - time.time()))
+
+        if len(mismatches) == 1 and None not in mismatches and not errors:
+            log.debug("[session] Connected hosts in the %s agree on schema", scope_label)
+            return None
+
+        if errors:
+            mismatches['unavailable'] = errors
+        return dict(mismatches)
+
+    def _get_schema_agreement_hosts(self, scope: SchemaAgreementScope) -> Tuple[Host, ...]:
+        if scope is SchemaAgreementScope.RACK:
+            allowed_distances = (HostDistance.LOCAL_RACK,)
+        elif scope is SchemaAgreementScope.DC:
+            allowed_distances = (HostDistance.LOCAL_RACK, HostDistance.LOCAL)
+        else:
+            allowed_distances = (HostDistance.LOCAL_RACK, HostDistance.LOCAL, HostDistance.REMOTE)
+
+        return tuple(
+            host for host, pool in tuple(self._pools.items())
+            if host.is_up
+            and not pool.is_shutdown
+            and self._profile_manager.distance(host) in allowed_distances)
+
+    def _query_local_schema_version(self, host: Host, query: str, deadline: float) -> Future:
+        remaining = max(0.0, deadline - time.time())
+        try:
+            response_future = self.execute_async(
+                query,
+                timeout=self._schema_agreement_query_timeout(remaining),
+                host=host,
+            )
+        except OperationTimedOut as timeout:
+            log.debug("[session] Timed out waiting for schema version from %s: %s", host, timeout)
+            raise
+        except Exception as exc:
+            log.debug("[session] Error querying schema version from %s: %s", host, exc)
+            raise
+
+        # execute_async returns cassandra.cluster.ResponseFuture, which does not have bulk waiting logic for it.
+        # That is why _query_local_schema_version returns concurrent.futures.Future
+        #  so that schema agreement logic could use concurrent.futures.wait_futures to wait on them.
+        # schema_version_future is an adapter between cassandra.cluster.ResponseFuture and concurrent.futures.Future
+        # to make things work
+        schema_version_future = Future()
+
+        def _set_result(result, result_future=schema_version_future, response_future=response_future):
+            if result_future.done():
+                return
+            try:
+                result_future.set_result(ResultSet(response_future, result))
+            except Exception as exc:
+                result_future.set_exception(exc)
+
+        def _set_exception(exc, result_future=schema_version_future):
+            if result_future.done():
+                return
+            result_future.set_exception(exc)
+
+        try:
+            response_future.add_callbacks(_set_result, _set_exception)
+        except Exception as exc:
+            log.debug("[session] Error registering schema version callback from %s: %s", host, exc)
+            raise
+
+        return schema_version_future
+
+    def _schema_agreement_query_timeout(self, remaining: float) -> float:
+        control_timeout = self.cluster.control_connection._timeout
+        if control_timeout is None:
+            return max(0.0, remaining)
+        return max(0.0, min(control_timeout, remaining))
 
     def user_type_registered(self, keyspace, user_type, klass):
         """
@@ -3389,23 +4094,133 @@ class _ControlReconnectionHandler(_ReconnectionHandler):
     Internal
     """
 
-    def __init__(self, control_connection, *args, **kwargs):
-        _ReconnectionHandler.__init__(self, *args, **kwargs)
+    # on_reconnection() installs the connection as the control connection,
+    # so it must outlive the handler run that opened it.
+    _keeps_connection = True
+
+    def __init__(self, control_connection, scheduler, schedule):
+        # The run-completed callback releases this handler's own slot. It is
+        # identity-checked, so a run that finishes after another thread has
+        # installed a replacement leaves that replacement alone. Anything that
+        # evicts a handler must also cancel it, or the evicted one keeps
+        # retrying where nothing can find it.
+        _ReconnectionHandler.__init__(self, scheduler, schedule, self._release)
         self.control_connection = weakref.proxy(control_connection)
+        # Remember a failed connection that caused this retry run. If the
+        # finite schedule is exhausted without a reconnect trigger retained
+        # from its final running attempt, the heartbeat will keep returning
+        # this same object and must not restart the schedule.
+        # A healthy connection may also be replaced after a topology event;
+        # exhausting that attempt must not suppress recovery if the connection
+        # fails later for an independent reason.
+        connection = control_connection._connection
+        self._failed_connection = connection \
+            if connection is not None and (
+                connection.is_defunct or connection.is_closed) else None
+        # A reconnect trigger that arrives while an attempt is actually
+        # running is normally covered by that attempt. If this turns out to be
+        # the final failed attempt, though, there is no later retry to own the
+        # trigger, so _release() must hand it back to reconnect().
+        self._is_running = False
+        self._run_generation = 0
+        self._reconnect_requested = False
+        # A proactive handler may be waiting while its still-healthy control
+        # connection fails. Its remaining retries own the immediate recovery,
+        # but the failure must receive a fresh schedule if those retries are
+        # exhausted. Unlike a trigger received during a running attempt, this
+        # state therefore survives every non-final handler run.
+        self._new_failure_detected = False
+
+    def run(self):
+        try:
+            control_connection = self.control_connection
+            with control_connection._reconnection_lock:
+                self._run_generation += 1
+                run_generation = self._run_generation
+                self._is_running = True
+        except ReferenceError:
+            return _ReconnectionHandler.run(self)
+
+        try:
+            _ReconnectionHandler.run(self)
+        finally:
+            try:
+                with control_connection._reconnection_lock:
+                    # A zero-delay retry may already be running on another
+                    # worker. Only the invocation that most recently claimed
+                    # the state may clear it.
+                    if self._run_generation == run_generation:
+                        self._is_running = False
+            except ReferenceError:
+                pass
 
     def try_reconnect(self):
         return self.control_connection._reconnect_internal()
 
     def on_reconnection(self, connection):
-        self.control_connection._set_new_connection(connection)
+        try:
+            # Resolving the attribute is what dereferences the weak proxy, so
+            # it is bound here rather than called directly: a ReferenceError
+            # raised from inside _set_new_connection() would mean the
+            # connection was already adopted, and must not be closed.
+            set_new_connection = self.control_connection._set_new_connection
+        except ReferenceError:
+            # The ControlConnection was collected while we were retrying. The
+            # handler has already marked the connection as handed off, so
+            # nothing else would ever close it.
+            connection.close()
+            return
+        set_new_connection(connection)
 
     def on_exception(self, exc, next_delay):
-        # TODO only overridden to add logging, so add logging
-        if isinstance(exc, AuthenticationFailed):
-            return False
+        # Every reason to stop retrying is worth retrying here: an attempt
+        # covers the whole query plan, so an authentication failure is a
+        # failure of the host it happened to reach, not of the cluster.
+        log.debug("Error trying to reconnect control connection: %r", exc)
+
+        if next_delay is None:
+            # The schedule is exhausted, so this handler will never run again.
+            # Release the slot it occupies while remembering the connection
+            # whose retries were exhausted. A trigger retained from this final
+            # running attempt starts a fresh schedule; otherwise heartbeats for
+            # the same defunct connection must not reset the finite schedule.
+            self._release(exhausted=True)
         else:
-            log.debug("Error trying to reconnect control connection: %r", exc)
-            return True
+            # This failure already has another scheduled attempt to own any
+            # trigger that arrived while it was running.
+            try:
+                control_connection = self.control_connection
+                with control_connection._reconnection_lock:
+                    self._is_running = False
+                    self._reconnect_requested = False
+            except ReferenceError:
+                pass
+
+        return True
+
+    def _release(self, exhausted=False):
+        reconnect_requested = False
+        try:
+            control_connection = self.control_connection
+            with control_connection._reconnection_lock:
+                if control_connection._reconnection_handler is self:
+                    control_connection._reconnection_handler = None
+                    reconnect_requested = exhausted and (
+                        self._reconnect_requested or
+                        self._new_failure_detected)
+                    self._reconnect_requested = False
+                    self._new_failure_detected = False
+                    if (exhausted and not reconnect_requested and
+                            self._failed_connection is not None and
+                            control_connection._connection is
+                            self._failed_connection):
+                        control_connection._reconnection_exhausted_connection = \
+                            self._failed_connection
+        except ReferenceError:
+            pass  # our weak reference to the ControlConnection is no good
+
+        if reconnect_requested:
+            control_connection.reconnect()
 
 
 def _watch_callback(obj_weakref, method_name, *args, **kwargs):
@@ -3437,8 +4252,11 @@ class ControlConnection(object):
 
     _SELECT_PEERS = "SELECT peer, data_center, host_id, rack, release_version, rpc_address, schema_version, tokens FROM system.peers"
     _SELECT_PEERS_NO_TOKENS_TEMPLATE = "SELECT host_id, peer, data_center, rack, rpc_address, {nt_col_name}, release_version, schema_version FROM system.peers"
-    _SELECT_LOCAL = "SELECT broadcast_address, cluster_name, data_center, host_id, listen_address, partitioner, rack, release_version, rpc_address, schema_version, tokens FROM system.local WHERE key='local'"
-    _SELECT_LOCAL_NO_TOKENS = "SELECT host_id, cluster_name, data_center, rack, partitioner, release_version, schema_version, rpc_address FROM system.local WHERE key='local'"
+    _SELECT_LOCAL_COLUMNS = ("broadcast_address, cluster_name, data_center, host_id, "
+                             "listen_address, partitioner, rack, release_version, "
+                             "rpc_address, schema_version")
+    _SELECT_LOCAL = "SELECT {0}, tokens FROM system.local WHERE key='local'".format(_SELECT_LOCAL_COLUMNS)
+    _SELECT_LOCAL_NO_TOKENS = "SELECT {0} FROM system.local WHERE key='local'".format(_SELECT_LOCAL_COLUMNS)
     # Used only when token_metadata_enabled is set to False
     _SELECT_LOCAL_NO_TOKENS_RPC_ADDRESS = "SELECT rpc_address FROM system.local WHERE key='local'"
 
@@ -3470,7 +4288,6 @@ class ControlConnection(object):
     _schema_meta_page_size = 1000
 
     _uses_peers_v2 = True
-    _tablets_routing_v1 = False
 
     # for testing purposes
     _time = time
@@ -3500,8 +4317,45 @@ class ControlConnection(object):
 
         self._reconnection_handler = None
         self._reconnection_lock = RLock()
+        # A finite retry schedule may be exhausted while the heartbeat still
+        # owns and returns the same defunct connection. Keep that identity so
+        # heartbeat passes do not create a fresh schedule indefinitely.
+        self._reconnection_exhausted_connection = None
+        self._reconnect_pending = False
+        # Set when reconnect() is called while an attempt is already pending.
+        # If that attempt fails without installing a retry handler, its final
+        # action consumes this flag by queuing one follow-up attempt.
+        self._reconnect_requested = False
+        # Bumped every time _reconnect_pending is raised. An attempt clears the
+        # flag only while it still owns it: _set_new_connection() drops the flag
+        # as the connection goes in, so a newer reconnect() can claim it before
+        # the attempt that installed the connection reaches its finally clause,
+        # and clearing it there would strand the attempt that newer flag owns.
+        self._reconnect_pending_seq = 0
+        # Bumped every time a connection is installed. _reconnect() compares it
+        # across its attempt to tell whether another attempt got there first.
+        self._connection_generation = 0
 
         self._event_schedule_times = {}
+
+        # The first fallback Session binds application use of the shared
+        # control connection to one keyspace (including None). Keeping that
+        # binding stable avoids connection-level USE state leaking between
+        # Sessions without adding a dispatcher to this exceptional path.
+        # The binding is released once every Session holding it is gone and its
+        # requests have drained, so a later Session can take it over. Response
+        # callbacks keep this lock while handing one fallback request off to
+        # the next; it must be re-entrant because some connections deliver a
+        # response synchronously from send_msg().
+        self._application_query_lock = RLock()
+        self._application_keyspace = _NOT_SET
+        self._application_sessions = WeakSet()
+        # A new Session is provisional until one of its fallback sends
+        # succeeds. Count concurrent attempts so one failure cannot discard an
+        # attachment another attempt is about to confirm.
+        self._application_session_claims = {}
+        self._application_requests_in_flight = 0
+        self._application_orphaned_requests = set()
 
     def connect(self):
         if self._is_shutdown:
@@ -3510,19 +4364,181 @@ class ControlConnection(object):
         self._protocol_version = self._cluster.protocol_version
         self._set_new_connection(self._reconnect_internal())
 
-        self._cluster.metadata.dbaas = self._connection._product_type == dscloud.DATASTAX_CLOUD_PRODUCT_TYPE
+        # _set_new_connection declines to install anything once shutdown() has
+        # run, so there may be no connection to ask.
+        if self._connection:
+            self._cluster.metadata.dbaas = self._connection._product_type == dscloud.DATASTAX_CLOUD_PRODUCT_TYPE
 
     def _set_new_connection(self, conn):
         """
-        Replace existing connection (if there is one) and close it.
+        Adopt `conn` as the control connection, closing the one it replaces.
+
+        Also ends any reconnection in progress: a handler parked in the slot is
+        cancelled and cleared, because it would otherwise be mistaken for one
+        still retrying and its next attempt would replace this connection.
+
+        If the ControlConnection has already been shut down, `conn` is not
+        installed at all -- nothing would ever use it or close it on our
+        behalf, so it is closed here instead.
         """
-        with self._lock:
-            old = self._connection
-            self._connection = conn
+        # Whatever put this connection in place, the reconnection is over. A
+        # handler left parked in the slot would be mistaken for one still
+        # retrying, and its next attempt would replace this connection.
+        #
+        # _reconnection_lock is held across the install so that the generation
+        # bump is visible to any _reconnect() that is about to decide whether
+        # another attempt beat it; releasing it first leaves a window where a
+        # failing attempt reads the old generation and parks a handler over
+        # this healthy connection.
+        with self._reconnection_lock:
+            if self._reconnection_handler:
+                self._reconnection_handler.cancel()
+                self._reconnection_handler = None
+
+            # A connection is in place, so an error on it must be able to queue
+            # a fresh attempt rather than be collapsed into the one ending here.
+            self._reconnect_pending = False
+            self._reconnect_requested = False
+
+            with self._lock:
+                if self._is_shutdown:
+                    # shutdown() won the race, so nothing would ever use this
+                    # connection or close it on our behalf.
+                    old, orphan = None, conn
+                else:
+                    old, orphan = self._connection, None
+                    self._connection = conn
+                    self._reconnection_exhausted_connection = None
+                    self._connection_generation += 1
 
         if old:
             log.debug("[control connection] Closing old connection %r, replacing with %r", old, conn)
             old.close()
+
+        if orphan:
+            log.debug("[control connection] Control connection is shut down, closing new connection %r", orphan)
+            orphan.close()
+
+    def _attach_application_session(self, keyspace, session):
+        """Bind application use of the control connection to ``keyspace``.
+
+        The first fallback ``Session`` takes the binding; other Sessions may
+        share it while they use the same keyspace. Once every Session holding
+        the binding has been shut down or collected and its fallback requests
+        have drained, the binding is reclaimed and a later Session can take it
+        over.
+
+        Returns ``None`` when the binding was taken or shared, otherwise a
+        message explaining the conflict.
+        """
+        with self._application_query_lock:
+            self._prune_application_sessions()
+
+            other_sessions = any(
+                other is not session for other in self._application_sessions)
+            current_connection_has_orphans = \
+                self._current_connection_has_application_orphans()
+            binding_is_busy = self._application_requests_in_flight or \
+                current_connection_has_orphans
+
+            # Even the Session that owns the binding cannot change it while a
+            # request is active. A recovered node pool may have changed the
+            # Session keyspace while an earlier control-connection USE or query
+            # is still outstanding, and allowing the next fallback request to
+            # rebind would put both keyspaces on the shared connection at once.
+            if self._application_keyspace is not _NOT_SET and \
+                    self._application_keyspace != keyspace and \
+                    (other_sessions or binding_is_busy):
+                return ("Control-connection fallback is already attached to "
+                        "keyspace %r; cannot use it from a Session using "
+                        "keyspace %r" % (self._application_keyspace, keyspace))
+
+            if keyspace is None:
+                # Reclaiming from a gone Session cannot undo the USE it left on
+                # the shared connection: CQL has no way back to "no keyspace".
+                leftover = self._leftover_application_keyspace()
+                if leftover is not None:
+                    return ("Control-connection fallback was attached to keyspace "
+                            "%r by a Session that is gone, and the shared "
+                            "connection cannot be reset to no keyspace; create a "
+                            "Session using keyspace %r instead" % (leftover, leftover))
+
+            self._application_keyspace = keyspace
+            self._application_sessions.add(session)
+            return None
+
+    def _discard_application_session(self, session):
+        """Undo an attachment when its first fallback request was not sent."""
+        with self._application_query_lock:
+            self._application_session_claims.pop(session, None)
+            self._application_sessions.discard(session)
+            if not self._application_sessions and \
+                    not self._application_requests_in_flight and \
+                    not self._current_connection_has_application_orphans():
+                self._application_keyspace = _NOT_SET
+
+    def _begin_application_session_claim(self, session, new_session):
+        """Track a send that can confirm a provisional Session attachment."""
+        with self._application_query_lock:
+            if new_session:
+                self._application_session_claims[session] = 0
+            if session not in self._application_session_claims:
+                return None
+            self._application_session_claims[session] += 1
+            return session
+
+    def _finish_application_session_claim(self, session, request_sent):
+        """Confirm an attachment, or discard it after all initial sends fail."""
+        if session is None:
+            return
+        with self._application_query_lock:
+            claims = self._application_session_claims.get(session)
+            if claims is None:
+                return
+            if request_sent:
+                del self._application_session_claims[session]
+            elif claims > 1:
+                self._application_session_claims[session] = claims - 1
+            else:
+                self._discard_application_session(session)
+
+    def _prune_application_sessions(self):
+        """Drop shut-down owners after shared-connection requests have drained."""
+        if self._application_requests_in_flight:
+            return
+        for session in tuple(self._application_sessions):
+            if session.is_shutdown:
+                self._application_sessions.discard(session)
+
+    def _leftover_application_keyspace(self):
+        """The keyspace a released binding left the shared connection in, if any."""
+        connection = self._connection
+        # A reconnect replaces the connection, and a fresh one starts out with
+        # no keyspace, so the leftover USE state went away with the old one.
+        if connection is None or connection.keyspace is None:
+            return None
+        return connection.keyspace
+
+    def _current_connection_has_application_orphans(self):
+        return any(
+            connection is self._connection
+            for connection, _ in self._application_orphaned_requests)
+
+    def _get_application_keyspace(self):
+        with self._application_query_lock:
+            return self._application_keyspace
+
+    def _handle_orphaned_application_response(self, connection, request_id,
+                                               response):
+        """Retire a timed-out fallback stream without resuming its request."""
+        try:
+            if isinstance(response, ResultMessage) and \
+                    response.kind == RESULT_KIND_SET_KEYSPACE:
+                connection.keyspace = response.new_keyspace
+        finally:
+            with self._application_query_lock:
+                self._application_orphaned_requests.discard(
+                    (connection, request_id))
 
     def _try_connect_to_hosts(self):
         errors = {}
@@ -3604,19 +4620,27 @@ class ControlConnection(object):
         self._metadata_request_timeout = None if connection.features.sharding_info is None or not self._cluster.metadata_request_timeout \
             else datetime.timedelta(seconds=self._cluster.metadata_request_timeout)
 
-        self._tablets_routing_v1 = connection.features.tablets_routing_v1
-
         # use weak references in both directions
         # _clear_watcher will be called when this ControlConnection is about to be finalized
         # _watch_callback will get the actual callback from the Connection and relay it to
         # this object (after a dereferencing a weakref)
         self_weakref = weakref.ref(self, partial(_clear_watcher, weakref.proxy(connection)))
         try:
-            connection.register_watchers({
+            watchers = {
                 "TOPOLOGY_CHANGE": partial(_watch_callback, self_weakref, '_handle_topology_change'),
                 "STATUS_CHANGE": partial(_watch_callback, self_weakref, '_handle_status_change'),
                 "SCHEMA_CHANGE": partial(_watch_callback, self_weakref, '_handle_schema_change')
-            }, register_timeout=self._timeout)
+            }
+
+            if self._cluster._client_routes_handler is not None:
+                watchers["CLIENT_ROUTES_CHANGE"] = partial(_watch_callback, self_weakref, '_handle_client_routes_change')
+
+            connection.register_watchers(watchers, register_timeout=self._timeout)
+
+            if self._cluster._client_routes_handler is not None:
+                self._cluster._client_routes_handler.initialize(
+                    connection,
+                    self._timeout)
 
             sel_peers = self._get_peers_query(self.PeersQueryType.PEERS, connection)
             sel_local = self._SELECT_LOCAL if self._token_meta_enabled else self._SELECT_LOCAL_NO_TOKENS
@@ -3652,44 +4676,177 @@ class ControlConnection(object):
         if self._is_shutdown:
             return
 
-        self._submit(self._reconnect)
+        # Collapse attempts that are queued but have not started yet. Without
+        # this, a burst of errors queues one _reconnect() each, and every one
+        # of them past the first cancels the reconnection handler the previous
+        # one installed and restarts its backoff schedule.
+        #
+        # An in-flight reconnection handler is already retrying on its own
+        # schedule, and _reconnect() would cancel it and restart that schedule
+        # from its initial delay. The check lives here rather than in the
+        # callers so that it covers every entry point: return_connection() is
+        # driven by the heartbeat and fires once per idle_heartbeat_interval
+        # for as long as the control connection stays defunct, which would
+        # otherwise reset the backoff on every pass and stop it ever growing.
+        # The lock is an RLock, so callers already holding it re-enter safely.
+        with self._reconnection_lock:
+            if self._reconnection_handler is not None:
+                handler = self._reconnection_handler
+                if handler._is_running:
+                    handler._reconnect_requested = True
+
+                # A handler can have been started proactively while the
+                # current connection was healthy. If that connection fails
+                # during the handler's backoff, the remaining proactive retry
+                # still goes first, but exhaustion must hand this independent
+                # failure a fresh schedule. Record it once so recurring
+                # heartbeats for an already-failed connection do not extend a
+                # finite schedule indefinitely.
+                connection = self._connection
+                if (handler._failed_connection is None and
+                        connection is not None and
+                        (connection.is_defunct or connection.is_closed)):
+                    handler._failed_connection = connection
+                    handler._new_failure_detected = True
+                log.debug("[control connection] Reconnection already in progress, "
+                          "not starting another one")
+                return
+            if self._reconnect_pending:
+                log.debug("[control connection] A reconnection attempt is "
+                          "already queued")
+                # Do not discard this trigger. The pending attempt may fail
+                # before it installs a handler that owns future retries.
+                self._reconnect_requested = True
+                return
+            pending_seq = self._raise_reconnect_pending()
+
+        submitted = None
+        try:
+            submitted = self._submit(self._reconnect)
+        finally:
+            if submitted is None:
+                # Nothing was queued, so nothing will clear the flag. This has
+                # to hold even when the submission raised, or no further
+                # reconnection would ever be attempted.
+                self._clear_reconnect_pending(pending_seq)
+
+    def _raise_reconnect_pending(self):
+        """
+        Mark a reconnection attempt as pending and return a token identifying
+        it. Only the holder of the newest token may clear the flag again.
+        """
+        with self._reconnection_lock:
+            self._reconnect_pending = True
+            self._reconnect_pending_seq += 1
+            return self._reconnect_pending_seq
+
+    def _clear_reconnect_pending(self, pending_seq):
+        """
+        Clear the pending flag, unless a newer attempt has claimed it since
+        `pending_seq` was handed out -- that attempt is the one the flag now
+        stands for, and dropping it would let a burst of errors queue several
+        concurrent reconnects.
+        """
+        with self._reconnection_lock:
+            if self._reconnect_pending_seq == pending_seq:
+                self._reconnect_pending = False
+                self._reconnect_requested = False
+
+    def _finish_reconnect(self, pending_seq):
+        """
+        Finish an active attempt, preserving any trigger it collapsed unless
+        a connection or reconnection handler now owns future work.
+        """
+        follow_up_seq = None
+        with self._reconnection_lock:
+            if self._reconnect_pending_seq != pending_seq:
+                return
+
+            if (self._reconnection_handler is not None or
+                    not self._reconnect_requested):
+                self._reconnect_pending = False
+                self._reconnect_requested = False
+                return
+
+            # Keep the pending flag raised while handing the retained trigger
+            # to the executor, so another burst still collapses into this one.
+            self._reconnect_requested = False
+            self._reconnect_pending_seq += 1
+            follow_up_seq = self._reconnect_pending_seq
+
+        submitted = None
+        try:
+            submitted = self._submit(self._reconnect)
+        finally:
+            if submitted is None:
+                self._clear_reconnect_pending(follow_up_seq)
 
     def _reconnect(self):
+        # _reconnect_pending stays set for as long as this attempt runs.
+        # _reconnect_internal() walks the whole query plan twice with a DNS
+        # re-resolution in between, which routinely outlasts
+        # idle_heartbeat_interval when the cluster is unreachable; clearing the
+        # flag here would let every heartbeat in that window queue another
+        # attempt, each one cancelling the handler the previous one installed
+        # and restarting its backoff from the initial delay.
+        pending_seq = self._raise_reconnect_pending()
+
+        with self._lock:
+            generation = self._connection_generation
+
         log.debug("[control connection] Attempting to reconnect")
         try:
             self._set_new_connection(self._reconnect_internal())
-        except NoHostAvailable:
+        except (NoHostAvailable, UnresolvableContactPoints):
             # make a retry schedule (which includes backoff)
             schedule = self._cluster.reconnection_policy.new_schedule()
 
             with self._reconnection_lock:
+                with self._lock:
+                    if self._connection_generation != generation:
+                        # An attempt that overlapped this one installed a
+                        # connection while we were failing. Parking a handler
+                        # now would block every later reconnect() for the whole
+                        # backoff and then replace a healthy connection.
+                        log.debug("[control connection] Reconnect failed but "
+                                  "another attempt succeeded, not scheduling "
+                                  "retries")
+                        return
 
                 # cancel existing reconnection attempts
                 if self._reconnection_handler:
                     self._reconnection_handler.cancel()
 
                 # when a connection is successfully made, _set_new_connection
-                # will be called with the new connection and then our
-                # _reconnection_handler will be cleared out
-                self._reconnection_handler = _ControlReconnectionHandler(
-                    self, self._cluster.scheduler, schedule,
-                    self._get_and_set_reconnection_handler,
-                    new_handler=None)
-                self._reconnection_handler.start()
+                # will be called with the new connection and will clear out
+                # our _reconnection_handler
+                handler = _ControlReconnectionHandler(
+                    self, self._cluster.scheduler, schedule)
+                self._reconnection_handler = handler
+                try:
+                    handler.start()
+                except StopIteration:
+                    # An empty schedule means that the policy permits no
+                    # retries. Treat it like a finite schedule exhausted by a
+                    # failed handler run so heartbeats for the same defunct
+                    # connection do not start it over indefinitely.
+                    handler._release(exhausted=True)
+                except Exception:
+                    # A handler that never started would sit in the slot
+                    # forever, and reconnect() would take it for one still
+                    # retrying.
+                    if self._reconnection_handler is handler:
+                        self._reconnection_handler = None
+                    raise
         except Exception:
             log.debug("[control connection] error reconnecting", exc_info=True)
             raise
-
-    def _get_and_set_reconnection_handler(self, new_handler):
-        """
-        Called by the _ControlReconnectionHandler when a new connection
-        is successfully created.  Clears out the _reconnection_handler on
-        this ControlConnection.
-        """
-        with self._reconnection_lock:
-            old = self._reconnection_handler
-            self._reconnection_handler = new_handler
-            return old
+        finally:
+            # The attempt is over either way: a connection is installed (the
+            # flag was already cleared as it went in), a handler is parked and
+            # collapses later attempts on its own, or a retained trigger queues
+            # one follow-up after a failure that left no durable retry work.
+            self._finish_reconnect(pending_seq)
 
     def _submit(self, *args, **kwargs):
         try:
@@ -3710,11 +4867,12 @@ class ControlConnection(object):
                 return
             else:
                 self._is_shutdown = True
-
             log.debug("Shutting down control connection")
-            if self._connection:
-                self._connection.close()
-                self._connection = None
+            connection = self._connection
+            self._connection = None
+
+        if connection:
+            connection.close()
 
     def refresh_schema(self, force=False, **kwargs):
         try:
@@ -3731,7 +4889,7 @@ class ControlConnection(object):
         if self._cluster.is_shutdown:
             return False
 
-        agreed = self.wait_for_schema_agreement(connection,
+        agreed = self._wait_for_schema_agreement(connection=connection,
                                                 preloaded_results=preloaded_results,
                                                 wait_time=schema_agreement_wait)
 
@@ -3794,6 +4952,7 @@ class ControlConnection(object):
         found_host_ids = set()
         found_endpoints = set()
 
+        local_row = None
         if local_result.parsed_rows:
             local_rows = dict_factory(local_result.column_names, local_result.parsed_rows)
             local_row = local_rows[0]
@@ -3813,11 +4972,13 @@ class ControlConnection(object):
             if not self._is_valid_peer(row):
                 continue
 
-            endpoint = self._cluster.endpoint_factory.create(row)
+            factory_endpoint = self._cluster.endpoint_factory.create(row)
             host_id = row.get("host_id")
 
-            if endpoint in found_endpoints:
-                log.warning("Found multiple hosts with the same endpoint(%s). Excluding peer %s - %s", endpoint, row.get("peer"), host_id)
+            # Use the factory endpoint for duplicate detection even when a Unix
+            # socket is retained as the route to the local host.
+            if factory_endpoint in found_endpoints:
+                log.warning("Found multiple hosts with the same endpoint(%s). Excluding peer %s - %s", factory_endpoint, row.get("peer"), host_id)
                 continue
 
             if host_id in found_host_ids:
@@ -3825,13 +4986,28 @@ class ControlConnection(object):
                 continue
 
             found_host_ids.add(host_id)
-            found_endpoints.add(endpoint)
+            found_endpoints.add(factory_endpoint)
+            existing_host = self._cluster.metadata.get_host_by_host_id(host_id)
+
+            # Host hashes depend on their endpoint, so never replace the route
+            # of an existing Host with or from a Unix socket. A newly discovered
+            # local Host keeps the socket which actually reached the node.
+            if (existing_host is not None and
+                    isinstance(existing_host.endpoint, UnixSocketEndPoint)):
+                endpoint = existing_host.endpoint
+            elif (existing_host is None and row is local_row and
+                    isinstance(connection.original_endpoint,
+                               UnixSocketEndPoint)):
+                endpoint = connection.original_endpoint
+            else:
+                endpoint = factory_endpoint
+
             host = self._cluster.metadata.get_host(endpoint)
             datacenter = row.get("data_center")
             rack = row.get("rack")
 
             if host is None:
-                host = self._cluster.metadata.get_host_by_host_id(host_id)
+                host = existing_host
                 if host and host.endpoint != endpoint:
                     log.debug("[control connection] Updating host ip from %s to %s for (%s)", host.endpoint, endpoint, host_id)
                     reconnector = host.get_and_set_reconnection_handler(None)
@@ -3860,6 +5036,10 @@ class ControlConnection(object):
             host.dse_version = row.get("dse_version")
             host.dse_workload = row.get("workload")
             host.dse_workloads = row.get("workloads")
+
+            if row is local_row:
+                host.listen_address = row.get("listen_address")
+                connection._control_connection_host_id = host_id
 
             tokens = row.get("tokens", None)
             if partitioner and tokens and self._token_meta_enabled:
@@ -3979,6 +5159,44 @@ class ControlConnection(object):
                 # this will be run by the scheduler
                 self._cluster.on_down(host, is_host_addition=False)
 
+    def _handle_client_routes_change(self, event: Dict[str, Any]) -> None:
+        """
+        Handle CLIENT_ROUTES_CHANGE event from the server.
+
+        This event indicates that the system.client_routes table has been updated
+        and we need to refresh our route mappings.
+        """
+        if self._cluster._client_routes_handler is None:
+            log.warning("[control connection] Received CLIENT_ROUTES_CHANGE but no handler configured")
+            return
+
+        raw_change_type = event.get("change_type")
+        try:
+            change_type = ClientRoutesChangeType(raw_change_type)
+        except ValueError:
+            log.warning("[control connection] Unknown CLIENT_ROUTES_CHANGE type: %s", raw_change_type)
+            return
+
+        connection_ids = tuple(event.get("connection_ids", []))
+        host_ids = tuple(event.get("host_ids", []))
+
+        self._cluster.scheduler.schedule_unique(
+            0,
+            self._handle_client_routes_refresh,
+            self._connection, self._timeout, change_type, connection_ids, host_ids
+        )
+
+    def _handle_client_routes_refresh(self, connection, timeout,
+                                      change_type, connection_ids, host_ids):
+        try:
+            self._cluster._client_routes_handler.handle_client_routes_change(
+                connection, timeout, change_type, connection_ids, host_ids)
+        except ReferenceError:
+            pass  # our weak reference to the Cluster is no good
+        except Exception:
+            log.debug("[control connection] Error handling CLIENT_ROUTES_CHANGE", exc_info=True)
+            self._signal_error()
+
     def _handle_schema_change(self, event):
         if self._schema_event_refresh_window < 0:
             return
@@ -3986,7 +5204,30 @@ class ControlConnection(object):
         self._cluster.scheduler.schedule_unique(delay, self.refresh_schema, **event)
 
     def wait_for_schema_agreement(self, connection=None, preloaded_results=None, wait_time=None):
+        """
+        Wait for schema agreement from the control connection's metadata view.
 
+        This method is intended for internal metadata refresh flows. External
+        callers should use :meth:`.Session.wait_for_schema_agreement` instead.
+
+        The control connection observes schema agreement from its own
+        perspective, which may include hosts the session is not using, and it
+        may fail when the control connection itself is transiently unhealthy.
+        That can produce false positives or failures that do not reflect
+        whether a session can safely proceed.
+
+        .. deprecated:: 3.30.0
+           Use :meth:`.Session.wait_for_schema_agreement` instead.
+        """
+        warn("ControlConnection.wait_for_schema_agreement is deprecated and will be removed in 4.0. "
+             "Use Session.wait_for_schema_agreement instead. "
+             "This method is for internal metadata refresh use only.",
+             DeprecationWarning, stacklevel=2)
+        return self._wait_for_schema_agreement(connection=connection,
+                                               preloaded_results=preloaded_results,
+                                               wait_time=wait_time)
+
+    def _wait_for_schema_agreement(self, connection=None, preloaded_results=None, wait_time=None):
         total_timeout = wait_time if wait_time is not None else self._cluster.max_schema_agreement_wait
         if total_timeout <= 0:
             return True
@@ -4024,7 +5265,8 @@ class ControlConnection(object):
                 local_query = QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_SCHEMA_LOCAL, self._metadata_request_timeout),
                                            consistency_level=cl)
                 try:
-                    timeout = min(self._timeout, total_timeout - elapsed)
+                    remaining = total_timeout - elapsed
+                    timeout = min(self._timeout, remaining) if self._timeout is not None else remaining
                     peers_result, local_result = connection.wait_for_responses(
                         peers_query, local_query, timeout=timeout)
                 except OperationTimedOut as timeout:
@@ -4066,14 +5308,49 @@ class ControlConnection(object):
                 continue
             endpoint = self._cluster.endpoint_factory.create(row)
             peer = self._cluster.metadata.get_host(endpoint)
+            if peer is None:
+                peer_by_host_id = self._cluster.metadata.get_host_by_host_id(
+                    row.get('host_id'))
+                if (peer_by_host_id is not None and
+                        isinstance(peer_by_host_id.endpoint,
+                                   UnixSocketEndPoint)):
+                    peer = peer_by_host_id
             if peer and peer.is_up is not False:
-                versions[schema_ver].add(endpoint)
+                versions[schema_ver].add(peer.endpoint)
 
         if len(versions) == 1:
             log.debug("[control connection] Schemas match")
             return None
 
         return dict((version, list(nodes)) for version, nodes in versions.items())
+
+    def _get_host_for_connection(self, connection):
+        if connection is None:
+            return None
+
+        host_id = getattr(connection, '_control_connection_host_id', None)
+        if host_id is not None:
+            host = self._cluster.metadata.get_host_by_host_id(host_id)
+            if host is not None:
+                return host
+
+        original_endpoint = getattr(connection, 'original_endpoint', None)
+        if original_endpoint is not None:
+            host = self._cluster.metadata.get_host(original_endpoint)
+            if host is not None:
+                return host
+
+        return self._cluster.metadata.get_host(connection.endpoint)
+
+    def _connection_matches_host(self, connection, host):
+        if connection is None:
+            return False
+
+        host_id = getattr(connection, '_control_connection_host_id', None)
+        if host_id is not None and host_id == host.host_id:
+            return True
+
+        return self._get_host_for_connection(connection) is host
 
     def _get_peers_query(self, peers_query_type, connection=None):
         """
@@ -4105,9 +5382,10 @@ class ControlConnection(object):
                 query_template = (self._SELECT_SCHEMA_PEERS_TEMPLATE
                                   if peers_query_type == self.PeersQueryType.PEERS_SCHEMA
                                   else self._SELECT_PEERS_NO_TOKENS_TEMPLATE)
-                original_endpoint_host = self._cluster.metadata.get_host(connection.original_endpoint)
-                host_release_version = None if original_endpoint_host is None else original_endpoint_host.release_version
-                host_dse_version = None if original_endpoint_host is None else original_endpoint_host.dse_version
+                connection_host = self._get_host_for_connection(
+                    connection)
+                host_release_version = None if connection_host is None else connection_host.release_version
+                host_dse_version = None if connection_host is None else connection_host.dse_version
                 uses_native_address_query = (
                     host_dse_version and Version(host_dse_version) >= self._MINIMUM_NATIVE_ADDRESS_DSE_VERSION)
 
@@ -4125,19 +5403,19 @@ class ControlConnection(object):
             if self._is_shutdown:
                 return
 
-            # try just signaling the cluster, as this will trigger a reconnect
-            # as part of marking the host down
+            # If DOWN handling is dispatched, its control connection callback
+            # will reconnect. Otherwise reconnect directly.
             if self._connection and self._connection.is_defunct:
-                host = self._cluster.metadata.get_host(self._connection.endpoint)
-                # host may be None if it's already been removed, but that indicates
-                # that errors have already been reported, so we're fine
-                if host:
-                    self._cluster.signal_connection_failure(
-                        host, self._connection.last_error, is_host_addition=False)
+                connection = self._connection
+                host = self._get_host_for_connection(connection)
+                if host and self._cluster.signal_connection_failure(
+                        host, connection.last_error,
+                        is_host_addition=False):
                     return
 
-        # if the connection is not defunct or the host already left, reconnect
-        # manually
+        # If the connection is not defunct, the host is unresolved, or DOWN
+        # handling was suppressed, reconnect manually. reconnect() leaves an
+        # in-flight reconnection handler alone on its own schedule.
         self.reconnect()
 
     def on_up(self, host):
@@ -4146,12 +5424,13 @@ class ControlConnection(object):
     def on_down(self, host):
 
         conn = self._connection
-        if conn and conn.endpoint == host.endpoint and \
-                self._reconnection_handler is None:
-            log.debug("[control connection] Control connection host (%s) is "
-                      "considered down, starting reconnection", host)
-            # this will result in a task being submitted to the executor to reconnect
-            self.reconnect()
+        if not self._connection_matches_host(conn, host):
+            return
+
+        log.debug("[control connection] Control connection host (%s) is "
+                  "considered down, starting reconnection", host)
+        # this will result in a task being submitted to the executor to reconnect
+        self.reconnect()
 
     def on_add(self, host, refresh_nodes=True):
         if refresh_nodes:
@@ -4159,7 +5438,7 @@ class ControlConnection(object):
 
     def on_remove(self, host):
         c = self._connection
-        if c and c.endpoint == host.endpoint:
+        if self._connection_matches_host(c, host):
             log.debug("[control connection] Control connection host (%s) is being removed. Reconnecting", host)
             # refresh will be done on reconnect
             self.reconnect()
@@ -4172,6 +5451,11 @@ class ControlConnection(object):
 
     def return_connection(self, connection):
         if connection is self._connection and (connection.is_defunct or connection.is_closed):
+            with self._reconnection_lock:
+                if connection is self._reconnection_exhausted_connection:
+                    log.debug("[control connection] Reconnection schedule is "
+                              "exhausted for the defunct connection")
+                    return
             self.reconnect()
 
 
@@ -4197,6 +5481,9 @@ class _Scheduler(Thread):
         self._scheduled_tasks = set()
         self._count = count()
         self._executor = executor
+        self._lock = Lock()
+        self._shutdown_complete = Event()
+        self._shutdown_owner = None
 
         Thread.__init__(self, name="Task Scheduler")
         self.daemon = True
@@ -4208,12 +5495,52 @@ class _Scheduler(Thread):
         except AttributeError:
             # this can happen on interpreter shutdown
             pass
-        self.is_shutdown = True
-        self._queue.put_nowait((0, 0, None))
-        self.join()
+        shutdown_owner = get_ident()
+        with self._lock:
+            if self.is_shutdown:
+                if self._shutdown_complete.is_set() or \
+                        self._shutdown_owner == shutdown_owner:
+                    return
+                wait_for_shutdown = True
+            else:
+                self.is_shutdown = True
+                self._shutdown_owner = shutdown_owner
+                wait_for_shutdown = False
+
+        if wait_for_shutdown:
+            self._shutdown_complete.wait()
+            return
+
+        try:
+            self._queue.put_nowait((0, 0, None, None))
+            self.join()
+            self._drain_shutdown_callbacks()
+        finally:
+            self._shutdown_complete.set()
+
+    def _drain_shutdown_callbacks(self):
+        shutdown_callbacks = []
+        with self._lock:
+            while True:
+                try:
+                    _, _, task, on_shutdown = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if task is not None:
+                    self._scheduled_tasks.discard(task)
+                    if on_shutdown is not None:
+                        shutdown_callbacks.append(on_shutdown)
+
+        for callback in shutdown_callbacks:
+            self._run_shutdown_callback(callback)
 
     def schedule(self, delay, fn, *args, **kwargs):
-        self._insert_task(delay, (fn, args, tuple(kwargs.items())))
+        return self._insert_task(delay, (fn, args, tuple(kwargs.items())))
+
+    def schedule_with_shutdown(self, delay, on_shutdown, fn, *args, **kwargs):
+        """Schedule a task and notify it if shutdown prevents it from running."""
+        return self._insert_task(
+            delay, (fn, args, tuple(kwargs.items())), on_shutdown=on_shutdown)
 
     def schedule_unique(self, delay, fn, *args, **kwargs):
         task = (fn, args, tuple(kwargs.items()))
@@ -4222,13 +5549,34 @@ class _Scheduler(Thread):
         else:
             log.debug("Ignoring schedule_unique for already-scheduled task: %r", task)
 
-    def _insert_task(self, delay, task):
-        if not self.is_shutdown:
-            run_at = time.time() + delay
-            self._scheduled_tasks.add(task)
-            self._queue.put_nowait((run_at, next(self._count), task))
-        else:
+    def _insert_task(self, delay, task, on_shutdown=None):
+        with self._lock:
+            if not self.is_shutdown:
+                run_at = time.time() + delay
+                self._scheduled_tasks.add(task)
+                self._queue.put_nowait(
+                    (run_at, next(self._count), task, on_shutdown))
+                return True
+
+        if on_shutdown is not None:
+            self._run_shutdown_callback(on_shutdown)
+        try:
             log.debug("Ignoring scheduled task after shutdown: %r", task)
+        except AttributeError:
+            # this can happen on interpreter shutdown
+            pass
+        return False
+
+    @staticmethod
+    def _run_shutdown_callback(callback):
+        try:
+            callback()
+        except Exception:
+            try:
+                log.exception("Scheduled task shutdown callback failed")
+            except AttributeError:
+                # this can happen on interpreter shutdown
+                pass
 
     def run(self):
         while True:
@@ -4237,19 +5585,33 @@ class _Scheduler(Thread):
 
             try:
                 while True:
-                    run_at, i, task = self._queue.get(block=True, timeout=None)
-                    if self.is_shutdown:
-                        if task:
-                            log.debug("Not executing scheduled task due to Scheduler shutdown")
+                    run_at, i, task, on_shutdown = self._queue.get(block=True, timeout=None)
+                    task_to_submit = None
+                    stop = False
+                    with self._lock:
+                        if self.is_shutdown:
+                            stop = True
+                            if task is not None:
+                                # Leave shutdown callbacks to shutdown(), after
+                                # this thread has stopped. Running one here can
+                                # deadlock if it re-enters scheduler shutdown
+                                # while the shutdown owner is joining us.
+                                self._queue.put_nowait(
+                                    (run_at, i, task, on_shutdown))
+                        elif run_at <= time.time():
+                            self._scheduled_tasks.discard(task)
+                            task_to_submit = task
+                        else:
+                            self._queue.put_nowait((run_at, i, task, on_shutdown))
+
+                    if stop:
                         return
-                    if run_at <= time.time():
-                        self._scheduled_tasks.discard(task)
-                        fn, args, kwargs = task
-                        kwargs = dict(kwargs)
-                        future = self._executor.submit(fn, *args, **kwargs)
+                    if task_to_submit is not None:
+                        fn, args, kwargs = task_to_submit
+                        future = self._executor.submit(
+                            fn, *args, **dict(kwargs))
                         future.add_done_callback(self._log_if_failed)
                     else:
-                        self._queue.put_nowait((run_at, i, task))
                         break
             except queue.Empty:
                 pass
@@ -4345,13 +5707,17 @@ class ResponseFuture(object):
     _spec_execution_plan = NoSpeculativeExecutionPlan()
     _continuous_paging_session = None
     _host = None
+    _control_connection_query_attempted = False
     _TABLET_ROUTING_CTYPE = None
+    _TABLET_ROUTING_V2_CTYPE = None
+    _bound_result_metadata = None
 
     _warned_timeout = False
 
     def __init__(self, session, message, query, timeout, metrics=None, prepared_statement=None,
                  retry_policy=RetryPolicy(), row_factory=None, load_balancer=None, start_time=None,
-                 speculative_execution_plan=None, continuous_paging_state=None, host=None):
+                 speculative_execution_plan=None, continuous_paging_state=None, host=None,
+                 bound_result_metadata=_NOT_SET, routing_token=None):
         self.session = session
         # TODO: normalize handling of retry policy and row factory
         self.row_factory = row_factory or session.row_factory
@@ -4362,15 +5728,32 @@ class ResponseFuture(object):
         self._retry_policy = retry_policy
         self._metrics = metrics
         self.prepared_statement = prepared_statement
+        # Metadata snapshotted alongside the message's result_metadata_id at construction
+        # time (see Session._create_response_future). Decoding a skip_meta response uses
+        # this so the metadata decoded-with always pairs with the id the message sent,
+        # even if a concurrent METADATA_CHANGED replaces the prepared statement's cache in
+        # between. Defaults to [] for unprepared statements (no cached metadata).
+        self._bound_result_metadata = [] if bound_result_metadata is _NOT_SET else bound_result_metadata
         self._callback_lock = Lock()
         self._start_time = start_time or time.time()
         self._host = host
+        self._routing_token = routing_token
+        self._control_connection_query_attempted = False
+        self._page_generation = 0
+        self._retry_aborted = False
         self._spec_execution_plan = speculative_execution_plan or self._spec_execution_plan
         self._make_query_plan()
         self._event = Event()
         self._errors = {}
         self._callbacks = []
         self._errbacks = []
+        # Maps fallback (connection, request id) pairs to the callback this
+        # future installed. Request ids may be reused as soon as a response
+        # callback returns, while the future can remain pending for a retry,
+        # reprepare, or schema agreement. Keep the callback identity as well as
+        # the id so a later timeout cannot detach an unrelated request that
+        # reused the same stream.
+        self._control_connection_requests = {}
         self.attempted_hosts = []
         self._start_timer()
         self._continuous_paging_state = continuous_paging_state
@@ -4411,9 +5794,21 @@ class ResponseFuture(object):
             )
             return
 
+        conn_in_flight = None
         if self._connection is not None:
+            control_connection_request = \
+                self._connection.is_control_connection and \
+                self._control_connection_query_attempted
+            if control_connection_request:
+                self._orphan_control_connection_request(
+                    self._connection, self._req_id)
             try:
-                self._connection._requests.pop(self._req_id)
+                # A completed fallback stream may already have been reused by
+                # control traffic while this future waits for follow-up work.
+                # _orphan_control_connection_request() verifies ownership; if
+                # it does not own the stream, leave the current request alone.
+                if not control_connection_request:
+                    self._connection._requests.pop(self._req_id)
             # PYTHON-1044
             # This request might have been removed from the connection after the latter was defunct by heartbeat.
             # We should still raise OperationTimedOut to reject the future so that the main event thread will not
@@ -4421,10 +5816,19 @@ class ResponseFuture(object):
             except KeyError:
                 key = "Connection defunct by heartbeat"
                 errors = {key: "Client request timeout. See Session.execute[_async](timeout)"}
-                self._set_final_exception(OperationTimedOut(errors, self._current_host))
+                self._set_final_exception(OperationTimedOut(errors, self._current_host,
+                                                            timeout=self.timeout,
+                                                            in_flight=self._connection.in_flight))
                 return
 
-            pool = self.session._pools.get(self._current_host)
+            # Capture connection stats before pool.return_connection() can alter state
+            conn_in_flight = self._connection.in_flight
+
+            # Fallback requests never belong to a Session pool. A pool may
+            # recover while the future waits for retry/schema work, but the
+            # completed fallback stream must not be returned through that pool.
+            pool = None if control_connection_request else \
+                self.session._pools.get(self._current_host)
             if pool and not pool.is_shutdown:
                 # Do not return the stream ID to the pool yet. We cannot reuse it
                 # because the node might still be processing the query and will
@@ -4437,22 +5841,48 @@ class ResponseFuture(object):
                         self._connection.orphaned_threshold_reached = True
 
                 pool.return_connection(self._connection, stream_was_orphaned=True)
+            elif self._connection.is_control_connection and \
+                    not control_connection_request:
+                with self._connection.lock:
+                    self._connection.orphaned_request_ids.add(self._req_id)
+                    if len(self._connection.orphaned_request_ids) >= self._connection.orphaned_threshold:
+                        self._connection.orphaned_threshold_reached = True
 
         errors = self._errors
         if not errors:
             if self.is_schema_agreed:
-                key = str(self._current_host.endpoint) if self._current_host else 'no host queried before timeout'
+                if self._current_host is None:
+                    key = 'no host queried before timeout'
+                elif self._connection is not None and self._connection.is_control_connection:
+                    control_host = self.session.cluster.get_control_connection_host()
+                    key = str(control_host.endpoint) if control_host is not None else str(self._connection.endpoint)
+                else:
+                    key = str(self._current_host.endpoint)
                 errors = {key: "Client request timeout. See Session.execute[_async](timeout)"}
             else:
                 connection = self.session.cluster.control_connection._connection
                 host = str(connection.endpoint) if connection else 'unknown'
                 errors = {host: "Request timed out while waiting for schema agreement. See Session.execute[_async](timeout) and Cluster.max_schema_agreement_wait."}
 
-        self._set_final_exception(OperationTimedOut(errors, self._current_host))
+        self._set_final_exception(OperationTimedOut(errors, self._current_host,
+                                                    timeout=self.timeout,
+                                                    in_flight=conn_in_flight))
 
     def _on_speculative_execute(self):
         self._timer = None
         if not self._event.is_set():
+
+            # Check the deadline before the PYTHON-836 guard below. That guard
+            # only exists to keep speculative queries from running ahead of the
+            # main thread's first query; it must not swallow an expired client
+            # timeout. The driver's own USE on the control-connection fallback
+            # path is sent with record_attempt=False, so attempted_hosts stays
+            # empty for its whole round trip - and if that USE keeps failing and
+            # retrying, the 0.01s reschedule below would spin forever instead of
+            # ever timing the request out.
+            if self._time_remaining is not None and self._time_remaining <= 0:
+                self._on_timeout()
+                return
 
             # PYTHON-836, the speculative queries must be after
             # the query is sent from the main thread, otherwise the
@@ -4465,10 +5895,6 @@ class ResponseFuture(object):
                 self._timer = self.session.cluster.connection_class.create_timer(0.01, self._on_speculative_execute)
                 return
 
-            if self._time_remaining is not None:
-                if self._time_remaining <= 0:
-                    self._on_timeout()
-                    return
             self.send_request(error_no_hosts=False)
             self._start_timer()
 
@@ -4497,13 +5923,341 @@ class ResponseFuture(object):
                 self._on_timeout()
                 return True
         if error_no_hosts:
+            if self._fallback_to_control_connection():
+                req_id = self._query_control_connection()
+                if req_id is _NOT_SET:
+                    return True
+                if req_id is not None:
+                    # _send_control_connection_message() already recorded the
+                    # id of the message actually in flight. Re-assigning here
+                    # would clobber it with the USE id on the keyspace path.
+                    return True
+
             self._set_final_exception(NoHostAvailable(
                 "Unable to complete the operation against any hosts", self._errors))
         return False
 
+    def _has_usable_node_pool(self):
+        try:
+            pools = tuple(self.session._pools.values())
+        except (AttributeError, TypeError):
+            return False
+
+        return any(pool and not pool.is_shutdown for pool in pools)
+
+    def _fallback_to_control_connection(self):
+        fallback_mode = self.session.cluster.allow_control_connection_query_fallback
+        if fallback_mode is ControlConnectionQueryFallback.Disabled:
+            return False
+        if self._host or self._control_connection_query_attempted:
+            return False
+        if fallback_mode is ControlConnectionQueryFallback.SkipPoolCreation:
+            return True
+        return not self._has_usable_node_pool()
+
+    def _borrow_control_connection(self, connection):
+        control_connection = self.session.cluster.control_connection
+        with control_connection._application_query_lock:
+            with connection.lock:
+                if connection.in_flight >= connection.max_request_id:
+                    raise NoConnectionsAvailable("All request IDs are currently in use")
+                connection.in_flight += 1
+                request_id = connection.get_request_id()
+            control_connection._application_requests_in_flight += 1
+            return request_id
+
+    def _release_control_connection_request(self, connection, request_id,
+                                            provisional_session=None):
+        control_connection = self.session.cluster.control_connection
+        with control_connection._application_query_lock:
+            request_key = (connection, request_id)
+            active_request = self._control_connection_requests.pop(
+                request_key, None)
+            orphaned_request = request_key in \
+                control_connection._application_orphaned_requests
+            if orphaned_request:
+                control_connection._application_orphaned_requests.discard(
+                    request_key)
+
+            # A timeout may have taken ownership while send_msg() was still
+            # encoding and then send_msg() may fail before pushing any bytes.
+            # Retire either form of ownership exactly once in that case.
+            if active_request is not None or orphaned_request:
+                with connection.lock:
+                    connection.in_flight -= 1
+                    connection.request_ids.append(request_id)
+                    connection._requests.pop(request_id, None)
+                    connection.orphaned_request_ids.discard(request_id)
+                if active_request is not None:
+                    control_connection._application_requests_in_flight -= 1
+            control_connection._finish_application_session_claim(
+                provisional_session, False)
+
+    def _handle_control_connection_response(self, connection, request_id, cb,
+                                            response):
+        control_connection = self.session.cluster.control_connection
+        with connection.lock:
+            connection.in_flight -= 1
+        # Keep this request counted while its callback may synchronously hand
+        # off to another physical fallback request. This closes the zero-in-
+        # flight window between the driver's USE response and the application
+        # query it sends next without holding the binding lock during encoding.
+        try:
+            cb(response)
+        finally:
+            with control_connection._application_query_lock:
+                request_key = (connection, request_id)
+                if self._control_connection_requests.pop(
+                        request_key, None) is not None:
+                    control_connection._application_requests_in_flight -= 1
+
+    def _orphan_control_connection_request(self, connection, request_id):
+        """Detach a timed-out fallback request while retaining a safe barrier.
+
+        The normal response callback owns the application in-flight count. A
+        timeout removes that callback, so replace it with a cleanup-only
+        callback and release the count here. The orphan remains a binding
+        barrier until its late response arrives because a timed-out ``USE`` can
+        still change the physical connection keyspace.
+        """
+        control_connection = self.session.cluster.control_connection
+        with control_connection._application_query_lock:
+            with connection.lock:
+                orphan_key = (connection, request_id)
+                expected_callback = self._control_connection_requests.get(
+                    orphan_key)
+                if expected_callback is None:
+                    return False
+                try:
+                    callback, decoder, result_metadata = \
+                        connection._requests[request_id]
+                except KeyError:
+                    return False
+
+                if callback is not expected_callback:
+                    return False
+                callback = partial(
+                    control_connection._handle_orphaned_application_response,
+                    connection, request_id)
+                connection._requests[request_id] = \
+                    (callback, decoder, result_metadata)
+                connection.orphaned_request_ids.add(request_id)
+                if len(connection.orphaned_request_ids) >= connection.orphaned_threshold:
+                    connection.orphaned_threshold_reached = True
+
+            self._control_connection_requests.pop(orphan_key, None)
+            control_connection._application_requests_in_flight -= 1
+            control_connection._application_orphaned_requests.add(orphan_key)
+            return True
+
+    def _is_keyspace_change_query(self, message=None):
+        message = self.message if message is None else message
+        if isinstance(self.query, GraphStatement):
+            return False
+        if not isinstance(message, QueryMessage):
+            return False
+        query = getattr(message.query, 'query_string', message.query)
+        if isinstance(query, (bytes, bytearray)):
+            try:
+                query = query.decode('utf8')
+            except UnicodeDecodeError:
+                return False
+        return isinstance(query, str) and \
+            re.match(r'^(?:\s|(?:--|//)[^\r\n]*(?:\r\n?|\n|$)|/\*(?:[^*]|\*(?!/))*\*/)*USE\b',
+                     query, re.IGNORECASE) is not None
+
+    def _control_connection_failed(self):
+        self._set_final_exception(NoHostAvailable(
+            "Unable to complete the operation against any hosts", self._errors))
+
+    def _set_control_connection_keyspace(self, connection, host, keyspace,
+                                         message=None, cb=None, request_id=_NOT_SET,
+                                         provisional_session=None):
+        use_message = QueryMessage(
+            query='USE %s' % protect_name(keyspace),
+            consistency_level=ConsistencyLevel.ONE)
+
+        def keyspace_set(response):
+            if isinstance(response, ResultMessage) and response.kind == RESULT_KIND_SET_KEYSPACE:
+                connection.keyspace = response.new_keyspace
+                if self._send_control_connection_message(
+                        message=message, cb=cb, connection=connection, host=host) is None:
+                    self._control_connection_failed()
+            elif isinstance(response, ErrorMessage):
+                self._set_final_exception(response.to_exception())
+            elif isinstance(response, ConnectionException):
+                self._errors[host] = response
+                # Known limitation: this retry goes around the RetryPolicy and
+                # _query_retries, because both are keyed to the user's statement
+                # and this is the driver's own USE. It also has no backoff, so a
+                # flapping control connection re-sends USE until the client-side
+                # timeout fires instead of failing fast. Routing it through the
+                # retry machinery shared with the pooled path would be the fix.
+                self.session.submit(self._retry_task, False, host)
+            elif isinstance(response, Exception):
+                self._set_final_exception(response)
+            else:
+                self._set_final_exception(ConnectionException(
+                    "Unexpected response while setting the control-connection keyspace: %r" %
+                    (response,), connection.endpoint))
+
+        # Returns None on failure; send_request() turns that into the final
+        # NoHostAvailable. Setting it here too would fire every errback twice.
+        return self._send_control_connection_message(
+            message=use_message, cb=keyspace_set, connection=connection,
+            host=host, record_attempt=False, record_size=False,
+            request_id=request_id,
+            provisional_session=provisional_session)
+
+    def _send_control_connection_message(self, message=None, cb=None, connection=None,
+                                         host=None, record_attempt=True, record_size=True,
+                                         request_id=_NOT_SET,
+                                         provisional_session=None):
+        if message is None:
+            message = self.message
+
+        if connection is None:
+            control_connection = self.session.cluster.control_connection
+            connection = control_connection._connection if control_connection else None
+        if not connection:
+            self._errors['control connection'] = ConnectionException("Control connection is not connected")
+            return None
+
+        if host is None:
+            host = self.session.cluster.get_control_connection_host() or connection.endpoint
+        self._current_host = host
+
+        if request_id is _NOT_SET:
+            request_id = None
+        request_sent = False
+        previous_req_id = self._req_id
+        try:
+            if request_id is None:
+                request_id = self._borrow_control_connection(connection)
+            result_meta = self._bound_result_metadata
+            if cb is None:
+                cb = partial(self._set_result, host, connection, None)
+            cb = partial(self._handle_control_connection_response, connection,
+                         request_id, cb)
+
+            control_connection = self.session.cluster.control_connection
+            with control_connection._application_query_lock:
+                self._control_connection_requests[(connection, request_id)] = cb
+                self._connection = connection
+                self._req_id = request_id
+
+            log.debug("No usable node pools; falling back to control connection for host %s", host)
+            # Record the stream id before sending, not after. The reply can be
+            # handled re-entrantly - a SET_KEYSPACE reply sends the real message
+            # from inside this very call - and that nested send has to be the one
+            # whose id survives in _req_id. Assigning after send_msg() would put
+            # the already-completed USE id there instead, so a later timeout would
+            # orphan the wrong stream and leave the real request in _requests.
+            encoded_size = connection.send_msg(message, request_id, cb=cb,
+                                               encoder=self._protocol_handler.encode_message,
+                                               decoder=self._protocol_handler.decode_message,
+                                               result_metadata=result_meta)
+            request_sent = True
+            control_connection._finish_application_session_claim(
+                provisional_session, True)
+            if record_size:
+                self.request_encoded_size = encoded_size
+            if record_attempt:
+                self.attempted_hosts.append(host)
+            return request_id
+        except NoConnectionsAvailable as exc:
+            log.debug("Control connection is at capacity")
+            self._errors[host] = exc
+        except ConnectionBusy as exc:
+            log.debug("Control connection is busy")
+            self._errors[host] = exc
+        except Exception as exc:
+            log.debug("Error querying control connection", exc_info=True)
+            self._errors[host] = exc
+            if self._metrics is not None:
+                self._metrics.on_connection_error()
+        finally:
+            if request_id is not None and not request_sent:
+                # Only roll back if nothing else claimed _req_id in the meantime,
+                # so a nested send that did go out keeps its id.
+                if self._req_id == request_id:
+                    self._req_id = previous_req_id
+                self._release_control_connection_request(
+                    connection, request_id, provisional_session)
+
+        return None
+
+    def _query_control_connection(self, message=None, cb=None, connection=None, host=None):
+        self._control_connection_query_attempted = True
+        control_connection = self.session.cluster.control_connection
+        if control_connection is None:
+            self._errors['control connection'] = ConnectionException(
+                "Control connection is not connected")
+            return None
+
+        if self._is_keyspace_change_query(message):
+            self._set_final_exception(InvalidRequest(
+                "Cannot change keyspace while using control-connection fallback; "
+                "create a Session with the attached keyspace instead"))
+            return _NOT_SET
+
+        # Hold this from binding through borrowing a stream. The send itself is
+        # outside the lock so protocol encoding cannot stall response handling.
+        with control_connection._application_query_lock:
+            if connection is None:
+                connection = control_connection._connection
+            if connection is None:
+                self._errors['control connection'] = ConnectionException(
+                    "Control connection is not connected")
+                return None
+
+            keyspace = self.session.keyspace
+            new_application_session = \
+                self.session not in control_connection._application_sessions
+            conflict = control_connection._attach_application_session(keyspace, self.session)
+            if conflict is not None:
+                self._set_final_exception(InvalidRequest(conflict))
+                return _NOT_SET
+            provisional_session = \
+                control_connection._begin_application_session_claim(
+                    self.session, new_application_session)
+
+            if host is None:
+                host = self.session.cluster.get_control_connection_host() or connection.endpoint
+
+            try:
+                request_id = self._borrow_control_connection(connection)
+            except NoConnectionsAvailable as exc:
+                log.debug("Control connection is at capacity")
+                self._errors[host] = exc
+                control_connection._finish_application_session_claim(
+                    provisional_session, False)
+                return None
+            except Exception as exc:
+                log.debug("Error borrowing control connection", exc_info=True)
+                self._errors[host] = exc
+                control_connection._finish_application_session_claim(
+                    provisional_session, False)
+                if self._metrics is not None:
+                    self._metrics.on_connection_error()
+                return None
+
+        if keyspace is not None and connection.keyspace != keyspace:
+            return self._set_control_connection_keyspace(
+                connection, host, keyspace, message=message, cb=cb,
+                request_id=request_id,
+                provisional_session=provisional_session)
+
+        return self._send_control_connection_message(
+            message=message, cb=cb, connection=connection, host=host,
+            request_id=request_id,
+            provisional_session=provisional_session)
+
     def _query(self, host, message=None, cb=None):
         if message is None:
             message = self.message
+
+        self._control_connection_query_attempted = False
 
         pool = self.session._pools.get(host)
         if not pool:
@@ -4516,22 +6270,35 @@ class ResponseFuture(object):
         self._current_host = host
 
         connection = None
+        previous_req_id = self._req_id
+        request_id = None
+        request_sent = False
         try:
             # TODO get connectTimeout from cluster settings
             if self.query:
-                connection, request_id = pool.borrow_connection(timeout=2.0, routing_key=self.query.routing_key, keyspace=self.query.keyspace, table=self.query.table)
+                # Pass the ring token computed once for this request so the pool
+                # can select the shard without re-hashing the routing key.
+                connection, request_id = pool.borrow_connection(
+                    timeout=2.0, routing_key=self.query.routing_key,
+                    keyspace=self.query.keyspace, table=self.query.table,
+                    routing_token=self._routing_token)
             else:
                 connection, request_id = pool.borrow_connection(timeout=2.0)
             self._connection = connection
-            result_meta = self.prepared_statement.result_metadata if self.prepared_statement else []
+            result_meta = self._bound_result_metadata
 
             if cb is None:
                 cb = partial(self._set_result, host, connection, pool)
 
+            # Record the stream before send_msg() starts. Encoding or pushing a
+            # message can overlap the deadline timer; the timeout must be able
+            # to detach the callback send_msg() has installed for this stream.
+            self._req_id = request_id
             self.request_encoded_size = connection.send_msg(message, request_id, cb=cb,
                                                             encoder=self._protocol_handler.encode_message,
                                                             decoder=self._protocol_handler.decode_message,
                                                             result_metadata=result_meta)
+            request_sent = True
             self.attempted_hosts.append(host)
             return request_id
         except NoConnectionsAvailable as exc:
@@ -4547,6 +6314,10 @@ class ResponseFuture(object):
                 self._metrics.on_connection_error()
             if connection:
                 pool.return_connection(connection)
+        finally:
+            if request_id is not None and not request_sent and \
+                    self._req_id == request_id:
+                self._req_id = previous_req_id
 
         return None
 
@@ -4610,20 +6381,55 @@ class ResponseFuture(object):
         if not self._paging_state:
             raise QueryExhausted()
 
+        with self._callback_lock:
+            if self._retry_aborted:
+                raise self._final_exception
+
         self._make_query_plan()
-        self.message.paging_state = self._paging_state
-        self._event.clear()
-        self._final_result = _NOT_SET
-        self._final_exception = None
+
+        with self._callback_lock:
+            if self._retry_aborted:
+                raise self._final_exception
+            self._page_generation += 1
+            self.message.paging_state = self._paging_state
+            self._event.clear()
+            self._final_result = _NOT_SET
+            self._final_exception = None
+            self._control_connection_query_attempted = False
         self._start_timer()
         self.send_request()
 
     def _reprepare(self, prepare_message, host, connection, pool):
         cb = partial(self.session.submit, self._execute_after_prepare, host, connection, pool)
-        request_id = self._query(host, prepare_message, cb=cb)
+        if pool is None and connection is not None and connection.is_control_connection:
+            request_id = self._query_control_connection(prepare_message, cb=cb,
+                                                        connection=connection, host=host)
+        else:
+            request_id = self._query(host, prepare_message, cb=cb)
         if request_id is None:
             # try to submit the original prepared statement on some other host
             self.send_request()
+
+    def _cache_tablet_from_payload(self, payload_key, ctype):
+        """
+        Parse a tablets-routing ``custom_payload`` entry and cache the Tablet.
+
+        ``ctype`` is the tuple type for the negotiated extension. The V1 and V2
+        layouts differ only by a trailing ``tablet_version`` field, and
+        ``Tablet.from_row`` accepts that as an optional final argument, so
+        unpacking the decoded tuple positionally serves both. The tablet is
+        cached under the effective keyspace (the statement's, else the
+        session's) so a prepared statement executed in a session keyspace lands
+        under the same key ``_compute_tablet_version_block`` looks it up by;
+        otherwise that lookup always misses.
+        """
+        info = self._custom_payload.get(payload_key)
+        protocol = self.session.cluster.protocol_version
+        tablet = Tablet.from_row(*ctype.from_binary(info, protocol))
+        keyspace = self.query.keyspace or self.session.keyspace
+        table = self.query.table
+        if tablet and keyspace and table:
+            self.session.cluster.metadata._tablets.add_tablet(keyspace, table, tablet)
 
     def _set_result(self, host, connection, pool, response):
         try:
@@ -4640,25 +6446,29 @@ class ResponseFuture(object):
             self._warnings = getattr(response, 'warnings', None)
             self._custom_payload = getattr(response, 'custom_payload', None)
 
-            if self._custom_payload and self.session.cluster.control_connection._tablets_routing_v1 and 'tablets-routing-v1' in self._custom_payload:
-                protocol = self.session.cluster.protocol_version
-                info = self._custom_payload.get('tablets-routing-v1')
-                ctype = ResponseFuture._TABLET_ROUTING_CTYPE
-                if ctype is None:
-                    ctype = types.lookup_casstype('TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)))')
-                    ResponseFuture._TABLET_ROUTING_CTYPE = ctype
-                tablet_routing_info = ctype.from_binary(info, protocol)
-                first_token = tablet_routing_info[0]
-                last_token = tablet_routing_info[1]
-                tablet_replicas = tablet_routing_info[2]
-                tablet = Tablet.from_row(first_token, last_token, tablet_replicas)
-                keyspace = self.query.keyspace
-                table = self.query.table
-                self.session.cluster.metadata._tablets.add_tablet(keyspace, table, tablet)
+            if self._custom_payload and connection is not None:
+                # Parse the routing payload according to what the connection that
+                # *served this request* negotiated, not the control connection:
+                # different nodes may negotiate different extensions, and each
+                # payload key matches the extension its own connection negotiated.
+                if connection.features.tablets_routing_v2 and 'tablets-routing-v2' in self._custom_payload:
+                    ctype = ResponseFuture._TABLET_ROUTING_V2_CTYPE
+                    if ctype is None:
+                        ctype = types.lookup_casstype('TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)), LongType)')
+                        ResponseFuture._TABLET_ROUTING_V2_CTYPE = ctype
+                    self._cache_tablet_from_payload('tablets-routing-v2', ctype)
+                elif connection.features.tablets_routing_v1 and 'tablets-routing-v1' in self._custom_payload:
+                    ctype = ResponseFuture._TABLET_ROUTING_CTYPE
+                    if ctype is None:
+                        ctype = types.lookup_casstype('TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)))')
+                        ResponseFuture._TABLET_ROUTING_CTYPE = ctype
+                    self._cache_tablet_from_payload('tablets-routing-v1', ctype)
 
             if isinstance(response, ResultMessage):
                 if response.kind == RESULT_KIND_SET_KEYSPACE:
                     session = getattr(self, 'session', None)
+                    if connection is not None:
+                        connection.keyspace = response.new_keyspace
                     # since we're running on the event loop thread, we need to
                     # use a non-blocking method for setting the keyspace on
                     # all connections in this session, otherwise the event
@@ -4681,6 +6491,33 @@ class ResponseFuture(object):
                     self._paging_state = response.paging_state
                     self._col_names = response.column_names
                     self._col_types = response.column_types
+                    new_result_metadata_id = getattr(response, 'result_metadata_id', None)
+                    if self.prepared_statement and new_result_metadata_id is not None:
+                        if response.column_metadata:
+                            # METADATA_CHANGED: replace metadata and its id as one
+                            # atomic pair so a concurrent reader can never pair the
+                            # new id with the old metadata (the server would then
+                            # skip sending metadata and rows would be decoded
+                            # against stale columns, with no recovery).
+                            # (this also re-arms the anomaly warning below)
+                            self.prepared_statement.update_result_metadata(
+                                response.column_metadata, new_result_metadata_id)
+                        elif not self.prepared_statement._warned_missing_column_metadata:
+                            # Anomalous response: a new id without the metadata it
+                            # describes. Cache neither — adopting the id alone would
+                            # create exactly the stale-metadata/fresh-id state
+                            # described above. Keeping the old pair means the next
+                            # EXECUTE sends the old id, the server detects the
+                            # mismatch, and the driver recovers with full metadata.
+                            # Log once per statement (not per execute) while the
+                            # anomaly persists.
+                            self.prepared_statement._warned_missing_column_metadata = True
+                            log.warning(
+                                "Server sent a new result_metadata_id but no column metadata "
+                                "for prepared statement %r. Ignoring both; the cached metadata "
+                                "and id are left unchanged.",
+                                getattr(self.prepared_statement, 'query_id', None)
+                            )
                     if getattr(self.message, 'continuous_paging_options', None):
                         self._handle_continuous_paging_first_response(connection, response)
                     else:
@@ -4831,14 +6668,24 @@ class ResponseFuture(object):
                                 expected=hexlify(self.prepared_statement.query_id), got=hexlify(response.query_id)
                             )
                         ))
-                    self.prepared_statement.result_metadata = response.column_metadata
-                    new_metadata_id = response.result_metadata_id
-                    if new_metadata_id is not None:
-                        self.prepared_statement.result_metadata_id = new_metadata_id
-
+                    # Update the metadata/id pair atomically from exactly what this
+                    # reprepare response carries. Falling back to the previously
+                    # cached id when this response has none would risk pairing it
+                    # with metadata from a different schema version than the one the
+                    # old id was computed for (e.g. schema changed and reverted
+                    # between the two PREPAREs) - a stale-but-plausible id a later
+                    # id-aware execute could send without the server detecting the
+                    # mismatch. Dropping it instead triggers the same self-healing
+                    # b'' sentinel path a never-prepared id would.
+                    self.prepared_statement.update_result_metadata(
+                        response.column_metadata, response.result_metadata_id)
+                
                 # use self._query to re-use the same host and
                 # at the same time properly borrow the connection
-                request_id = self._query(host)
+                if pool is None and connection is not None and connection.is_control_connection:
+                    request_id = self._query_control_connection(connection=connection, host=host)
+                else:
+                    request_id = self._query(host)
                 if request_id is None:
                     # this host errored out, move on to the next
                     self.send_request()
@@ -4864,10 +6711,9 @@ class ResponseFuture(object):
 
     def _set_final_result(self, response):
         self._cancel_timer()
-        if self._metrics is not None:
-            self._metrics.request_timer.addValue(time.time() - self._start_time)
-
         with self._callback_lock:
+            if self._retry_aborted:
+                return
             self._final_result = response
             # save off current callbacks inside lock for execution outside it
             # -- prevents case where _final_result is set, then a callback is
@@ -4878,18 +6724,29 @@ class ResponseFuture(object):
                 for (fn, args, kwargs) in self._callbacks
             )
 
+        if self._metrics is not None:
+            self._metrics.request_timer.addValue(time.time() - self._start_time)
         self._event.set()
 
         # apply each callback
         for callback_partial in to_call:
             callback_partial()
 
-    def _set_final_exception(self, response):
-        self._cancel_timer()
-        if self._metrics is not None:
-            self._metrics.request_timer.addValue(time.time() - self._start_time)
+    def _set_final_exception(self, response,
+                             retry_abort_generation=_NOT_SET):
+        abort_retry = retry_abort_generation is not _NOT_SET
+        if not abort_retry:
+            self._cancel_timer()
 
         with self._callback_lock:
+            if self._retry_aborted:
+                return
+            if abort_retry:
+                if retry_abort_generation != self._page_generation or \
+                        self._final_result is not _NOT_SET or \
+                        self._final_exception is not None:
+                    return
+                self._retry_aborted = True
             self._final_exception = response
             # save off current errbacks inside lock for execution outside it --
             # prevents case where _final_exception is set, then an errback is
@@ -4899,6 +6756,11 @@ class ResponseFuture(object):
                 partial(fn, response, *args, **kwargs)
                 for (fn, args, kwargs) in self._errbacks
             )
+
+        if abort_retry:
+            self._cancel_timer()
+        if self._metrics is not None:
+            self._metrics.request_timer.addValue(time.time() - self._start_time)
         self._event.set()
 
         # apply each callback
@@ -4932,23 +6794,47 @@ class ResponseFuture(object):
         self._errors[host] = exception_from_response(response)
 
     def _retry(self, reuse_connection, consistency_level, host, delay):
-        if self._final_exception:
-            # the connection probably broke while we were waiting
-            # to retry the operation
-            return
+        with self._callback_lock:
+            if self._final_exception:
+                # the connection probably broke while we were waiting
+                # to retry the operation
+                return
+            page_generation = self._page_generation
 
         if self._metrics is not None:
             self._metrics.on_retry()
         if consistency_level is not None:
-            self.message.consistency_level = consistency_level
+            # Never downgrade from serial to non-serial consistency, as that
+            # would break serial read (Paxos) guarantees.
+            original_cl = self.message.consistency_level
+            if ConsistencyLevel.is_serial(original_cl) and not ConsistencyLevel.is_serial(consistency_level):
+                log.debug(
+                    "Retry policy attempted to downgrade serial consistency %s to %s; "
+                    "keeping original consistency level.",
+                    ConsistencyLevel.value_to_name.get(original_cl, original_cl),
+                    ConsistencyLevel.value_to_name.get(consistency_level, consistency_level))
+            else:
+                self.message.consistency_level = consistency_level
 
         # don't retry on the event loop thread
-        self.session.cluster.scheduler.schedule(delay, self._retry_task, reuse_connection, host)
+        self.session.cluster.scheduler.schedule_with_shutdown(
+            delay, partial(self._abort_retry, page_generation),
+            self._retry_task, reuse_connection, host)
+
+    def _abort_retry(self, page_generation):
+        self._set_final_exception(ConnectionShutdown(
+            "Cluster scheduler was shut down before the retry could run"),
+            retry_abort_generation=page_generation)
 
     def _retry_task(self, reuse_connection, host):
         if self._final_exception:
             # the connection probably broke while we were waiting
             # to retry the operation
+            return
+
+        if self._control_connection_query_attempted:
+            self._control_connection_query_attempted = False
+            self.send_request()
             return
 
         if reuse_connection and self._query(host) is not None:

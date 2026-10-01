@@ -12,7 +12,7 @@ from cassandra.cython_deps import HAVE_CYTHON, HAVE_NUMPY
 from cassandra.protocol import ProtocolHandler, LazyProtocolHandler, NumpyProtocolHandler
 from cassandra.query import tuple_factory
 from tests import VERIFY_CYTHON
-from tests.integration import use_singledc, notprotocolv1, \
+from tests.integration import use_single_node, notprotocolv1, \
     drop_keyspace_shutdown_cluster, BasicSharedKeyspaceUnitTestCase, greaterthancass21, TestCluster
 from tests.integration.datatype_utils import update_datatypes
 from tests.integration.standard.utils import (
@@ -21,7 +21,7 @@ from tests.unit.cython.utils import cythontest, numpytest
 
 
 def setup_module():
-    use_singledc()
+    use_single_node()
     update_datatypes()
 
 
@@ -34,7 +34,7 @@ class CythonProtocolHandlerTest(unittest.TestCase):
         cls.cluster = TestCluster()
         cls.session = cls.cluster.connect()
         cls.session.execute("CREATE KEYSPACE testspace WITH replication = "
-                            "{ 'class' : 'SimpleStrategy', 'replication_factor': '1'}")
+                            "{ 'class' : 'NetworkTopologyStrategy', 'replication_factor': '1'}")
         cls.session.set_keyspace("testspace")
         cls.colnames = create_table_with_all_types("test_table", cls.session, cls.N_ITEMS)
 
@@ -225,7 +225,7 @@ class NumpyWideTableTest(unittest.TestCase):
         cls.cluster = TestCluster()
         cls.session = cls.cluster.connect()
         cls.session.execute("CREATE KEYSPACE IF NOT EXISTS test_wide_table WITH replication = "
-                            "{ 'class' : 'SimpleStrategy', 'replication_factor': '1'}")
+                            "{ 'class' : 'NetworkTopologyStrategy', 'replication_factor': '1'}")
         cls.session.set_keyspace("test_wide_table")
 
         # Create a wide table with many int columns

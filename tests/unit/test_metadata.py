@@ -15,27 +15,29 @@ import unittest
 
 from binascii import unhexlify
 import logging
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import os
-import timeit
 import uuid
 
 import cassandra
+from cassandra.connection import DefaultEndPoint, UnixSocketEndPoint
 from cassandra.cqltypes import strip_frozen
 from cassandra.marshal import uint16_unpack, uint16_pack
 from cassandra.metadata import (Murmur3Token, MD5Token,
                                 BytesToken, ReplicationStrategy,
-                                NetworkTopologyStrategy, SimpleStrategy,
+                                NetworkTopologyStrategy,
                                 LocalStrategy, protect_name,
                                 protect_names, protect_value, is_valid_name,
                                 UserType, KeyspaceMetadata, get_schema_parser,
                                 _UnknownStrategy, ColumnMetadata, TableMetadata,
                                 IndexMetadata, Function, Aggregate,
                                 Metadata, TokenMap, ReplicationFactor,
-                                SchemaParserDSE68)
+                                SchemaParserDSE68, SchemaParserV3,
+                                _ConsistencyMode, _consistency_mode_from_string)
 from cassandra.policies import SimpleConvictionPolicy
 from cassandra.pool import Host
 from cassandra.protocol import QueryMessage
+from cassandra.tablets import Tablet
 from tests.util import assertCountEqual
 import pytest
 
@@ -96,14 +98,14 @@ class StrategiesTest(unittest.TestCase):
         assert rs.create('NetworkTopologyStrategy', fake_options_map).dc_replication_factors == NetworkTopologyStrategy(fake_options_map).dc_replication_factors
 
         fake_options_map = {'options': 'map'}
-        assert rs.create('SimpleStrategy', fake_options_map) is None
+        assert rs.create('NetworkTopologyStrategy', fake_options_map) is None
 
         fake_options_map = {'options': 'map'}
         assert isinstance(rs.create('LocalStrategy', fake_options_map), LocalStrategy)
 
-        fake_options_map = {'options': 'map', 'replication_factor': 3}
-        assert isinstance(rs.create('SimpleStrategy', fake_options_map), SimpleStrategy)
-        assert rs.create('SimpleStrategy', fake_options_map).replication_factor == SimpleStrategy(fake_options_map).replication_factor
+        fake_options_map = {'dc1': 3}
+        assert isinstance(rs.create('NetworkTopologyStrategy', fake_options_map), NetworkTopologyStrategy)
+        assert rs.create('NetworkTopologyStrategy', fake_options_map).dc_replication_factors == NetworkTopologyStrategy(fake_options_map).dc_replication_factors
 
         assert rs.create('xxxxxxxx', fake_options_map) == _UnknownStrategy('xxxxxxxx', fake_options_map)
 
@@ -113,38 +115,38 @@ class StrategiesTest(unittest.TestCase):
             rs.export_for_schema()
 
     def test_simple_replication_type_parsing(self):
-        """ Test equality between passing numeric and string replication factor for simple strategy """
+        """ Test equality between passing numeric and string replication factor for NTS """
         rs = ReplicationStrategy()
 
-        simple_int = rs.create('SimpleStrategy', {'replication_factor': 3})
-        simple_str = rs.create('SimpleStrategy', {'replication_factor': '3'})
+        nts_int = rs.create('NetworkTopologyStrategy', {'dc1': 3})
+        nts_str = rs.create('NetworkTopologyStrategy', {'dc1': '3'})
 
-        assert simple_int.export_for_schema() == simple_str.export_for_schema()
-        assert simple_int == simple_str
+        assert nts_int.export_for_schema() == nts_str.export_for_schema()
+        assert nts_int == nts_str
 
         # make token replica map
         ring = [MD5Token(0), MD5Token(1), MD5Token(2)]
-        hosts = [Host('dc1.{}'.format(host), SimpleConvictionPolicy, host_id=uuid.uuid4()) for host in range(3)]
+        hosts = [Host('dc1.{}'.format(host), SimpleConvictionPolicy, datacenter='dc1', rack='rack1', host_id=uuid.uuid4()) for host in range(3)]
         token_to_host = dict(zip(ring, hosts))
-        assert simple_int.make_token_replica_map(token_to_host, ring) == simple_str.make_token_replica_map(token_to_host, ring)
+        assert nts_int.make_token_replica_map(token_to_host, ring) == nts_str.make_token_replica_map(token_to_host, ring)
 
     def test_transient_replication_parsing(self):
-        """ Test that we can PARSE a transient replication factor for SimpleStrategy """
+        """ Test that we can PARSE a transient replication factor for NetworkTopologyStrategy """
         rs = ReplicationStrategy()
 
-        simple_transient = rs.create('SimpleStrategy', {'replication_factor': '3/1'})
-        assert simple_transient.replication_factor_info == ReplicationFactor(3, 1)
-        assert simple_transient.replication_factor == 2
-        assert "'replication_factor': '3/1'" in simple_transient.export_for_schema()
+        nts_transient = rs.create('NetworkTopologyStrategy', {'dc1': '3/1'})
+        assert nts_transient.dc_replication_factors_info['dc1'] == ReplicationFactor(3, 1)
+        assert nts_transient.dc_replication_factors['dc1'] == 2
+        assert "'dc1': '3/1'" in nts_transient.export_for_schema()
 
-        simple_str = rs.create('SimpleStrategy', {'replication_factor': '2'})
-        assert simple_transient != simple_str
+        nts_str = rs.create('NetworkTopologyStrategy', {'dc1': '2'})
+        assert nts_transient != nts_str
 
         # make token replica map
         ring = [MD5Token(0), MD5Token(1), MD5Token(2)]
-        hosts = [Host('dc1.{}'.format(host), SimpleConvictionPolicy, host_id=uuid.uuid4()) for host in range(3)]
+        hosts = [Host('dc1.{}'.format(host), SimpleConvictionPolicy, datacenter='dc1', rack='rack1', host_id=uuid.uuid4()) for host in range(3)]
         token_to_host = dict(zip(ring, hosts))
-        assert simple_transient.make_token_replica_map(token_to_host, ring) == simple_str.make_token_replica_map(token_to_host, ring)
+        assert nts_transient.make_token_replica_map(token_to_host, ring) == nts_str.make_token_replica_map(token_to_host, ring)
 
     def test_nts_replication_parsing(self):
         """ Test equality between passing numeric and string replication factor for NTS """
@@ -224,12 +226,13 @@ class StrategiesTest(unittest.TestCase):
 
     def test_nts_token_performance(self):
         """
-        Tests to ensure that when rf exceeds the number of nodes available, that we dont'
-        needlessly iterate trying to construct tokens for nodes that don't exist.
+        When rf exceeds the number of nodes available, the replica map must
+        only contain the nodes that exist (one replica set per token), not
+        iterate to build replicas for nodes that don't exist.
 
         @since 3.7
         @jira_ticket PYTHON-379
-        @expected_result timing with 1500 rf should be same/similar to 3rf if we have 3 nodes
+        @expected_result 1500 rf with 3 nodes produces the same replica map as 3 rf
 
         @test_category metadata
         """
@@ -249,17 +252,21 @@ class StrategiesTest(unittest.TestCase):
                 ring.append(md5_token)
             current_token += 1000
 
-        nts = NetworkTopologyStrategy({'dc1': 3})
-        start_time = timeit.default_timer()
-        nts.make_token_replica_map(token_to_host_owner, ring)
-        elapsed_base = timeit.default_timer() - start_time
+        expected_replicas = set(token_to_host_owner.values())
 
-        nts = NetworkTopologyStrategy({'dc1': 1500})
-        start_time = timeit.default_timer()
-        nts.make_token_replica_map(token_to_host_owner, ring)
-        elapsed_bad = timeit.default_timer() - start_time
-        difference = elapsed_bad - elapsed_base
-        assert difference < 1 and difference > -1
+        replica_map_rf3 = NetworkTopologyStrategy({'dc1': 3}).make_token_replica_map(
+            token_to_host_owner, ring)
+        replica_map_rf1500 = NetworkTopologyStrategy({'dc1': 1500}).make_token_replica_map(
+            token_to_host_owner, ring)
+
+        for replica_map in (replica_map_rf3, replica_map_rf1500):
+            assert set(replica_map) == set(ring)
+            assert all(
+                len(replicas) == dc1hostnum
+                and set(replicas) == expected_replicas
+                for replicas in replica_map.values()
+            )
+        assert replica_map_rf1500 == replica_map_rf3
 
     def test_nts_make_token_replica_map_multi_rack(self):
         token_to_host_owner = {}
@@ -318,9 +325,9 @@ class StrategiesTest(unittest.TestCase):
         assert "{'class': 'NetworkTopologyStrategy', 'dc1': '1', 'dc2': '2'}" == strategy.export_for_schema()
 
     def test_simple_strategy_make_token_replica_map(self):
-        host1 = Host('1', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        host2 = Host('2', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        host3 = Host('3', SimpleConvictionPolicy, host_id=uuid.uuid4())
+        host1 = Host('1', SimpleConvictionPolicy, datacenter='dc1', rack='rack1', host_id=uuid.uuid4())
+        host2 = Host('2', SimpleConvictionPolicy, datacenter='dc1', rack='rack1', host_id=uuid.uuid4())
+        host3 = Host('3', SimpleConvictionPolicy, datacenter='dc1', rack='rack1', host_id=uuid.uuid4())
         token_to_host_owner = {
             MD5Token(0): host1,
             MD5Token(100): host2,
@@ -328,23 +335,23 @@ class StrategiesTest(unittest.TestCase):
         }
         ring = [MD5Token(0), MD5Token(100), MD5Token(200)]
 
-        rf1_replicas = SimpleStrategy({'replication_factor': '1'}).make_token_replica_map(token_to_host_owner, ring)
+        rf1_replicas = NetworkTopologyStrategy({'dc1': '1'}).make_token_replica_map(token_to_host_owner, ring)
         assertCountEqual(rf1_replicas[MD5Token(0)], [host1])
         assertCountEqual(rf1_replicas[MD5Token(100)], [host2])
         assertCountEqual(rf1_replicas[MD5Token(200)], [host3])
 
-        rf2_replicas = SimpleStrategy({'replication_factor': '2'}).make_token_replica_map(token_to_host_owner, ring)
+        rf2_replicas = NetworkTopologyStrategy({'dc1': '2'}).make_token_replica_map(token_to_host_owner, ring)
         assertCountEqual(rf2_replicas[MD5Token(0)], [host1, host2])
         assertCountEqual(rf2_replicas[MD5Token(100)], [host2, host3])
         assertCountEqual(rf2_replicas[MD5Token(200)], [host3, host1])
 
-        rf3_replicas = SimpleStrategy({'replication_factor': '3'}).make_token_replica_map(token_to_host_owner, ring)
+        rf3_replicas = NetworkTopologyStrategy({'dc1': '3'}).make_token_replica_map(token_to_host_owner, ring)
         assertCountEqual(rf3_replicas[MD5Token(0)], [host1, host2, host3])
         assertCountEqual(rf3_replicas[MD5Token(100)], [host2, host3, host1])
         assertCountEqual(rf3_replicas[MD5Token(200)], [host3, host1, host2])
 
     def test_ss_equals(self):
-        assert SimpleStrategy({'replication_factor': '1'}) != NetworkTopologyStrategy({'dc1': 2})
+        assert NetworkTopologyStrategy({'dc1': '1'}) != NetworkTopologyStrategy({'dc1': 2})
 
 
 class NameEscapingTest(unittest.TestCase):
@@ -409,9 +416,9 @@ class NameEscapingTest(unittest.TestCase):
 class GetReplicasTest(unittest.TestCase):
     def _get_replicas(self, token_klass):
         tokens = [token_klass(i) for i in range(0, (2 ** 127 - 1), 2 ** 125)]
-        hosts = [Host("ip%d" % i, SimpleConvictionPolicy, host_id=uuid.uuid4()) for i in range(len(tokens))]
+        hosts = [Host("ip%d" % i, SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4()) for i in range(len(tokens))]
         token_to_primary_replica = dict(zip(tokens, hosts))
-        keyspace = KeyspaceMetadata("ks", True, "SimpleStrategy", {"replication_factor": "1"})
+        keyspace = KeyspaceMetadata("ks", True, "NetworkTopologyStrategy", {"dc1": "1"})
         metadata = Mock(spec=Metadata, keyspaces={'ks': keyspace})
         token_map = TokenMap(token_klass, token_to_primary_replica, tokens, metadata)
 
@@ -439,6 +446,32 @@ class GetReplicasTest(unittest.TestCase):
 
     def test_bytes_tokens(self):
         self._get_replicas(BytesToken)
+
+
+class DropTableMetadataTest(unittest.TestCase):
+    """Metadata._drop_table should invalidate tablets for the dropped table."""
+
+    def setUp(self):
+        """Set up metadata containing a table with a tablet record."""
+        self.metadata = Metadata()
+        keyspace = KeyspaceMetadata("ks", True, "NetworkTopologyStrategy", {"dc1": "1"})
+        keyspace.tables["tb"] = TableMetadata("ks", "tb")
+        self.metadata.keyspaces["ks"] = keyspace
+        self.metadata._tablets.add_tablet("ks", "tb", Tablet(0, 100, [("host1", 0)]))
+
+    def test_drop_table_invalidates_tablets(self):
+        """Dropping a known table removes its tablet and table metadata."""
+        self.metadata._drop_table("ks", "tb")
+
+        assert self.metadata._tablets.table_has_tablets("ks", "tb") is False
+        assert "tb" not in self.metadata.keyspaces["ks"].tables
+
+    def test_drop_table_invalidates_tablets_for_unknown_keyspace(self):
+        """Dropping a table in an unknown keyspace still removes its tablet metadata."""
+        self.metadata._tablets.add_tablet("unknown", "tb", Tablet(0, 100, [("host1", 0)]))
+        self.metadata._drop_table("unknown", "tb")
+
+        assert self.metadata._tablets.table_has_tablets("unknown", "tb") is False
 
 
 class Murmur3TokensTest(unittest.TestCase):
@@ -522,15 +555,47 @@ class BytesTokensTest(unittest.TestCase):
 
 class KeyspaceMetadataTest(unittest.TestCase):
 
+    @staticmethod
+    def _keyspace(consistency_mode=None):
+        keyspace = KeyspaceMetadata('test', True, 'NetworkTopologyStrategy', dict(dc1=3))
+        if consistency_mode is not None:
+            keyspace._consistency_mode = consistency_mode
+        return keyspace
+
+    def test_as_cql_query_omits_eventual_consistency(self):
+        # Eventual consistency is the server's default, so it must not be
+        # spelled out -- including for a keyspace whose mode was never set,
+        # which is every keyspace on a non-Scylla cluster.
+        assert 'consistency' not in self._keyspace().as_cql_query()
+        assert 'consistency' not in self._keyspace(_ConsistencyMode.EVENTUAL).as_cql_query()
+
+    def test_as_cql_query_includes_consistency_mode(self):
+        # A recreated keyspace has to keep its consistency mode, or the copy
+        # silently loses strong consistency.
+        assert self._keyspace(_ConsistencyMode.GLOBAL).as_cql_query() == (
+            "CREATE KEYSPACE test WITH replication = "
+            "{'class': 'NetworkTopologyStrategy', 'dc1': '3'} "
+            " AND consistency = 'global' AND durable_writes = true")
+        assert self._keyspace(_ConsistencyMode.LOCAL).as_cql_query() == (
+            "CREATE KEYSPACE test WITH replication = "
+            "{'class': 'NetworkTopologyStrategy', 'dc1': '3'} "
+            " AND consistency = 'local' AND durable_writes = true")
+
+    def test_export_as_string_includes_consistency_mode(self):
+        # export_as_string() appends the statement terminator and is what a
+        # schema dump goes through, so the option has to survive that path too.
+        exported = self._keyspace(_ConsistencyMode.GLOBAL).export_as_string()
+        assert "AND consistency = 'global' AND durable_writes = true;" in exported
+
     def test_export_as_string_user_types(self):
         keyspace_name = 'test'
-        keyspace = KeyspaceMetadata(keyspace_name, True, 'SimpleStrategy', dict(replication_factor=3))
+        keyspace = KeyspaceMetadata(keyspace_name, True, 'NetworkTopologyStrategy', dict(dc1=3))
         keyspace.user_types['a'] = UserType(keyspace_name, 'a', ['one', 'two'], ['c', 'int'])
         keyspace.user_types['b'] = UserType(keyspace_name, 'b', ['one', 'two', 'three'], ['d', 'int', 'a'])
         keyspace.user_types['c'] = UserType(keyspace_name, 'c', ['one'], ['int'])
         keyspace.user_types['d'] = UserType(keyspace_name, 'd', ['one'], ['c'])
 
-        assert """CREATE KEYSPACE test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '3'}  AND durable_writes = true;
+        assert """CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': '3'}  AND durable_writes = true;
 
 CREATE TYPE test.c (
     one int
@@ -550,6 +615,150 @@ CREATE TYPE test.b (
     two int,
     three a
 );""" == keyspace.export_as_string()
+
+
+class KeyspaceConsistencyTabletInvalidationTest(unittest.TestCase):
+    """
+    Metadata._update_keyspace must drop cached tablets when a keyspace's
+    strong-consistency mode changes, not only when its replication strategy
+    changes. A tablet cached while the keyspace was eventually consistent has no
+    leader ordering, so it must not survive an eventual->global flip and then be
+    misread as a leader hint by TokenAwarePolicy.make_query_plan.
+    """
+
+    def _ks_meta(self, strongly_consistent):
+        meta = KeyspaceMetadata('ks', True, 'NetworkTopologyStrategy', {'replication_factor': '1'})
+        meta._consistency_mode = _ConsistencyMode.GLOBAL if strongly_consistent else _ConsistencyMode.EVENTUAL
+        return meta
+
+    def _add_cached_tablet(self, metadata):
+        tablet = Tablet(first_token=-100, last_token=100,
+                        replicas=[(uuid.uuid4(), 0)], tablet_version=1)
+        metadata._tablets.add_tablet('ks', 'tbl', tablet)
+
+    def test_consistency_flip_drops_tablets(self):
+        metadata = Metadata()
+        metadata._update_keyspace(self._ks_meta(strongly_consistent=False))
+        self._add_cached_tablet(metadata)
+        assert metadata._tablets.table_has_tablets('ks', 'tbl')
+
+        # Same replication strategy, consistency flips False -> True: the stale
+        # tablet cache must be dropped.
+        metadata._update_keyspace(self._ks_meta(strongly_consistent=True))
+        assert not metadata._tablets.table_has_tablets('ks', 'tbl')
+
+    def test_no_consistency_change_keeps_tablets(self):
+        metadata = Metadata()
+        metadata._update_keyspace(self._ks_meta(strongly_consistent=False))
+        self._add_cached_tablet(metadata)
+        assert metadata._tablets.table_has_tablets('ks', 'tbl')
+
+        # No replication change and no consistency change: cache is preserved.
+        metadata._update_keyspace(self._ks_meta(strongly_consistent=False))
+        assert metadata._tablets.table_has_tablets('ks', 'tbl')
+
+
+class ScyllaKeyspaceConsistencyParsingTest(unittest.TestCase):
+    """
+    SchemaParserV3 maps the server's per-keyspace consistency option to
+    KeyspaceMetadata._consistency_mode, on the bulk path (rows collected by
+    _query_all, folded into a map by _aggregate_results) and on the
+    single-keyspace path (a filtered read). A transient failure reading the
+    consistency table propagates so the schema refresh aborts and the previously
+    known metadata is retried, rather than being reset to eventual.
+
+    Which modes actually get leader-aware routing is TokenAwarePolicy's business
+    and is covered in tests/unit/test_policies.py.
+    """
+
+    def _parser_with_rows(self, rows):
+        # Build the parser without a connection and drive only the aggregation
+        # step; _query_all's batching is exercised by the integration tests.
+        parser = SchemaParserV3.__new__(SchemaParserV3)
+        parser.scylla_keyspaces_result = rows
+        return parser
+
+    def test_consistency_modes_are_mapped_from_rows(self):
+        # The mode the server reported is kept verbatim, so 'local' stays
+        # distinguishable from 'eventual' even though ScyllaDB does not implement
+        # it yet and the driver treats the two alike.
+        parser = self._parser_with_rows([
+            {'keyspace_name': 'g', 'consistency': 'global'},
+            {'keyspace_name': 'l', 'consistency': 'local'},
+            {'keyspace_name': 'e', 'consistency': 'eventual'},
+            {'keyspace_name': 'n', 'consistency': None},
+        ])
+        modes = {row["keyspace_name"]: _consistency_mode_from_string(row.get("consistency"))
+                 for row in parser.scylla_keyspaces_result}
+        assert modes['g'] == _ConsistencyMode.GLOBAL
+        assert modes['l'] == _ConsistencyMode.LOCAL
+        assert modes['e'] == _ConsistencyMode.EVENTUAL
+        assert modes['n'] == _ConsistencyMode.EVENTUAL
+
+    def test_keyspace_absent_from_the_map_is_eventual(self):
+        # Covers the whole-cluster fallbacks too: no rows is what a skipped read
+        # (no TABLETS_ROUTING_V2) and a missing table/column both produce.
+        parser = SchemaParserV3.__new__(SchemaParserV3)
+        parser.keyspace_consistency_modes = {'g': _ConsistencyMode.GLOBAL}
+        assert parser.keyspace_consistency_modes.get(
+            'absent', _ConsistencyMode.EVENTUAL) == _ConsistencyMode.EVENTUAL
+
+    def test_single_keyspace_read_is_filtered_and_mapped(self):
+        # The single-keyspace refresh path must not read the whole table; it
+        # restricts the query to the keyspace being refreshed.
+        parser = SchemaParserV3.__new__(SchemaParserV3)
+        parser.connection = Mock(features=Mock(tablets_routing_v2=True))
+        queries = []
+
+        def _fake_query_build_row(query_string, build_func):
+            queries.append(query_string)
+            return {'keyspace_name': 'g', 'consistency': 'global'}
+        parser._query_build_row = _fake_query_build_row
+
+        assert parser._query_keyspace_consistency_mode('g') == _ConsistencyMode.GLOBAL
+        assert len(queries) == 1
+        assert "WHERE keyspace_name = 'g'" in queries[0]
+
+    def test_single_keyspace_read_is_skipped_without_v2(self):
+        # Without the extension there is nothing to route for, so the query is
+        # not issued at all and the keyspace is eventually consistent.
+        parser = SchemaParserV3.__new__(SchemaParserV3)
+        parser.connection = Mock(features=Mock(tablets_routing_v2=False))
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("scylla_keyspaces must not be queried without V2")
+        parser._query_build_row = _fail
+
+        assert parser._query_keyspace_consistency_mode('g') == _ConsistencyMode.EVENTUAL
+
+    def test_consistency_string_mapping_is_case_insensitive(self):
+        # The option is a free-form string on the wire, so the mapping must not
+        # depend on the case the server happens to use. Anything unrecognized --
+        # including a null, which is how an eventually-consistent keyspace is
+        # reported -- falls back to eventual rather than failing the refresh.
+        assert _consistency_mode_from_string('GLOBAL') == _ConsistencyMode.GLOBAL
+        assert _consistency_mode_from_string('Global') == _ConsistencyMode.GLOBAL
+        assert _consistency_mode_from_string('global') == _ConsistencyMode.GLOBAL
+        assert _consistency_mode_from_string('LOCAL') == _ConsistencyMode.LOCAL
+        assert _consistency_mode_from_string('eventual') == _ConsistencyMode.EVENTUAL
+        assert _consistency_mode_from_string(None) == _ConsistencyMode.EVENTUAL
+        assert _consistency_mode_from_string('something-new') == _ConsistencyMode.EVENTUAL
+
+    def test_read_failure_propagates(self):
+        # A transient failure reading system_schema.scylla_keyspaces must
+        # propagate (not be swallowed into "eventual"), so the schema refresh
+        # aborts and the previously known consistency modes are retried.
+        parser = SchemaParserV3.__new__(SchemaParserV3)
+        # The control connection must have negotiated V2 to reach the read;
+        # otherwise the query is skipped and no failure could propagate.
+        parser.connection = Mock(features=Mock(tablets_routing_v2=True))
+
+        def _raise_timeout(*args, **kwargs):
+            raise cassandra.OperationTimedOut("scylla_keyspaces read timed out")
+        parser._query_build_row = _raise_timeout
+
+        with pytest.raises(cassandra.OperationTimedOut):
+            parser._query_keyspace_consistency_mode('g')
 
 
 class UserTypesTest(unittest.TestCase):
@@ -621,6 +830,30 @@ class IndexTest(unittest.TestCase):
 
 class SchemaParserLookupTests(unittest.TestCase):
 
+    def test_refresh_uses_control_connection_host_id_for_versions(self):
+        metadata = Metadata()
+        host_id = uuid.uuid4()
+        host = Host(
+            UnixSocketEndPoint('/tmp/maintenance.sock'),
+            SimpleConvictionPolicy,
+            host_id=host_id)
+        host.release_version = '3.11.0'
+        metadata.add_or_return_host(host)
+
+        connection = Mock()
+        connection.endpoint = DefaultEndPoint('192.168.1.0')
+        connection.original_endpoint = connection.endpoint
+        connection._control_connection_host_id = host_id
+        parser = Mock()
+        parser.get_all_keyspaces.return_value = ()
+
+        with patch('cassandra.metadata.get_schema_parser',
+                   return_value=parser) as get_parser:
+            metadata.refresh(connection, 0.1)
+
+        get_parser.assert_called_once_with(
+            connection, '3.11.0', None, 0.1, None, None)
+
     def test_reads_versions_from_system_local_when_missing(self):
         connection = Mock()
 
@@ -662,7 +895,7 @@ class UnicodeIdentifiersTests(unittest.TestCase):
     name = b'\'_-()"\xc2\xac'.decode('utf-8')
 
     def test_keyspace_name(self):
-        km = KeyspaceMetadata(self.name, False, 'SimpleStrategy', {'replication_factor': 1})
+        km = KeyspaceMetadata(self.name, False, 'NetworkTopologyStrategy', {'dc1': 1})
         km.export_as_string()
 
     def test_table_name(self):

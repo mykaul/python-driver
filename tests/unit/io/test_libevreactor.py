@@ -24,8 +24,7 @@ try:
 except (ImportError, DependencyException):
     LibevConnection = None  # noqa
 
-from tests import is_monkey_patched
-from tests.unit.io.utils import ReactorTestMixin, TimerTestMixin, noop_if_monkey_patched
+from tests.unit.io.utils import ReactorTestMixin, TimerTestMixin
 
 
 class LibevConnectionTest(ReactorTestMixin, unittest.TestCase):
@@ -35,8 +34,6 @@ class LibevConnectionTest(ReactorTestMixin, unittest.TestCase):
     null_handle_function_args = None, 0
 
     def setUp(self):
-        if is_monkey_patched():
-            raise unittest.SkipTest("Can't test libev with monkey patching")
         if LibevConnection is None:
             raise unittest.SkipTest('libev does not appear to be installed correctly')
         LibevConnection.initialize_reactor()
@@ -69,30 +66,38 @@ class LibevConnectionTest(ReactorTestMixin, unittest.TestCase):
         @test_category connection
         """
         from cassandra.io.libevreactor import _global_loop
-        with patch.object(_global_loop, "_thread"),\
-             patch.object(_global_loop, "notify"):
+        reactor_needs_restore = False
+        try:
+            with patch.object(_global_loop, "_thread"),\
+                 patch.object(_global_loop, "notify"):
 
-            self.make_connection()
+                self.make_connection()
 
-            # We have to make a copy because the connections shouldn't
-            # be alive when we verify them
-            live_connections = set(_global_loop._live_conns)
+                # We have to make a copy because the connections shouldn't
+                # be alive when we verify them
+                live_connections = set(_global_loop._live_conns)
 
-            # This simulates the process ending without cluster.shutdown()
-            # being called, then with atexit _cleanup for libevreactor would
-            # be called
-            libev__cleanup(_global_loop)
-            for conn in live_connections:
-                assert conn._write_watcher.stop.mock_calls
-                assert conn._read_watcher.stop.mock_calls
+                # This simulates the process ending without cluster.shutdown()
+                # being called, then with atexit _cleanup for libevreactor would
+                # be called
+                reactor_needs_restore = True
+                libev__cleanup(_global_loop)
+                for conn in live_connections:
+                    assert conn._write_watcher.stop.mock_calls
+                    assert conn._read_watcher.stop.mock_calls
 
-        _global_loop._shutdown = False
+        finally:
+            if reactor_needs_restore:
+                _global_loop._shutdown = False
+                # _cleanup stopped the prepare watcher; restart it so the shared
+                # singleton loop is left in a working state for subsequent tests
+                # (otherwise timers would never be scheduled and tests would hang).
+                _global_loop._preparer.start()
 
 
 class LibevTimerPatcher(unittest.TestCase):
 
     @classmethod
-    @noop_if_monkey_patched
     def setUpClass(cls):
         if LibevConnection is None:
             raise unittest.SkipTest('libev does not appear to be installed correctly')
@@ -104,7 +109,6 @@ class LibevTimerPatcher(unittest.TestCase):
             p.start()
 
     @classmethod
-    @noop_if_monkey_patched
     def tearDownClass(cls):
         for p in cls.patchers:
             try:
@@ -132,8 +136,6 @@ class LibevTimerTest(TimerTestMixin, LibevTimerPatcher):
         return c
 
     def setUp(self):
-        if is_monkey_patched():
-            raise unittest.SkipTest("Can't test libev with monkey patching.")
         if LibevConnection is None:
             raise unittest.SkipTest('libev does not appear to be installed correctly')
 

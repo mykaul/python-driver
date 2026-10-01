@@ -1,6 +1,39 @@
+from bisect import bisect_left
+from operator import attrgetter
+from random import getrandbits
 from threading import Lock
 from typing import Optional
 from uuid import UUID
+
+# C-accelerated attrgetter avoids per-call lambda allocation overhead
+_get_first_token = attrgetter("first_token")
+_get_last_token = attrgetter("last_token")
+
+
+def choose_tablet_version_block(tablet_version: int) -> int:
+    """
+    Encode a tablet_version_block byte from a cached tablet_version.
+    Picks a block index at random across calls.
+    Returns an int in [0, 255].
+
+    The byte layout: the high nibble is the block index, the low nibble is the value
+    of that block. Blocks are indexed from the least significant bits to the most
+    significant ones, so block `idx` occupies bits [idx*4, idx*4 + 4).
+    """
+    # Pick the block index in [0, 15]; getrandbits(4) is a fast C call with no
+    # application-level shared state.
+    idx = getrandbits(4)
+    # Extract the 4-bit nibble at block index `idx` (0 = least significant).
+    shift = idx * 4
+    nibble = (tablet_version >> shift) & 0xF
+    return (idx << 4) | nibble
+
+
+def random_tablet_version_block() -> int:
+    """
+    Generate a random tablet_version_block byte for cold start.
+    """
+    return getrandbits(8)
 
 
 class Tablet(object):
@@ -12,15 +45,19 @@ class Tablet(object):
     first_token = 0
     last_token = 0
     replicas = None
+    # uint64 hash; None means unknown -- a cold start, or a tablet learned over
+    # TABLETS_ROUTING_V1, which does not report a version.
+    tablet_version = None
 
-    def __init__(self, first_token=0, last_token=0, replicas=None):
+    def __init__(self, first_token=0, last_token=0, replicas=None, tablet_version=None):
         self.first_token = first_token
         self.last_token = last_token
         self.replicas = replicas
+        self.tablet_version = tablet_version
 
     def __str__(self):
-        return "<Tablet: first_token=%s last_token=%s replicas=%s>" \
-               % (self.first_token, self.last_token, self.replicas)
+        return "<Tablet: first_token=%s last_token=%s replicas=%s tablet_version=%s>" \
+               % (self.first_token, self.last_token, self.replicas, self.tablet_version)
     __repr__ = __str__
 
     @staticmethod
@@ -28,11 +65,43 @@ class Tablet(object):
         return replicas is not None and len(replicas) != 0
 
     @staticmethod
-    def from_row(first_token, last_token, replicas):
+    def from_row(first_token, last_token, replicas, tablet_version=None):
         if Tablet._is_valid_tablet(replicas):
-            tablet = Tablet(first_token, last_token, replicas)
+            if tablet_version is not None:
+                # tablet_version is an unsigned 64-bit value, but it is
+                # deserialized from the wire as a signed LongType; normalize it
+                # back to unsigned so it matches the server's representation.
+                tablet_version &= 0xFFFFFFFFFFFFFFFF
+            tablet = Tablet(first_token, last_token, replicas, tablet_version)
             return tablet
         return None
+
+    @property
+    def leader(self) -> Optional[UUID]:
+        """
+        The ``host_id`` of this tablet's Raft leader, or ``None`` if there is
+        none to report.
+
+        A strongly-consistent tablet has one distinguished replica, the leader,
+        that coordinates its writes and its linearizable reads. The server does
+        not name it in a separate field: ``TABLETS_ROUTING_V2`` orders the
+        replica set so that the leader comes first, which is why this is simply
+        ``replicas[0]``.
+
+        That ordering only carries meaning for a tablet of a strongly-consistent
+        keyspace that was learned over V2. An eventually-consistent tablet has no
+        leader at all, and a tablet learned over ``TABLETS_ROUTING_V1`` -- which
+        reports no ``tablet_version``, so ``tablet_version`` is ``None`` -- has no
+        leader ordering either. Callers must establish both of those before
+        treating the result as a leader; this property only answers "which
+        replica is first, if any".
+
+        Returns ``None`` for a tablet with no replicas rather than raising, so
+        callers do not have to guard the lookup themselves.
+        """
+        if not self.replicas:
+            return None
+        return self.replicas[0][0]
 
     def replica_contains_host_id(self, uuid: UUID) -> bool:
         for replica in self.replicas:
@@ -57,7 +126,7 @@ class Tablets(object):
         if not tablet:
             return None
 
-        id = bisect_left(tablet, t.value, key=lambda tablet: tablet.last_token)
+        id = bisect_left(tablet, t.value, key=_get_last_token)
         if id < len(tablet) and t.value > tablet[id].first_token:
             return tablet[id]
         return None
@@ -94,12 +163,12 @@ class Tablets(object):
             tablets_for_table = self._tablets.setdefault((keyspace, table), [])
 
             # find first overlapping range
-            start = bisect_left(tablets_for_table, tablet.first_token, key=lambda t: t.first_token)
+            start = bisect_left(tablets_for_table, tablet.first_token, key=_get_first_token)
             if start > 0 and tablets_for_table[start - 1].last_token > tablet.first_token:
                 start = start - 1
 
             # find last overlapping range
-            end = bisect_left(tablets_for_table, tablet.last_token, key=lambda t: t.last_token)
+            end = bisect_left(tablets_for_table, tablet.last_token, key=_get_last_token)
             if end < len(tablets_for_table) and tablets_for_table[end].first_token >= tablet.last_token:
                 end = end - 1
 
@@ -108,39 +177,3 @@ class Tablets(object):
 
             tablets_for_table.insert(start, tablet)
 
-
-# bisect.bisect_left implementation from Python 3.11, needed untill support for
-# Python < 3.10 is dropped, it is needed to use `key` to extract last_token from
-# Tablet list - better solution performance-wise than materialize list of last_tokens
-def bisect_left(a, x, lo=0, hi=None, *, key=None):
-    """Return the index where to insert item x in list a, assuming a is sorted.
-
-    The return value i is such that all e in a[:i] have e < x, and all e in
-    a[i:] have e >= x.  So if x already appears in the list, a.insert(i, x) will
-    insert just before the leftmost x already there.
-
-    Optional args lo (default 0) and hi (default len(a)) bound the
-    slice of a to be searched.
-    """
-
-    if lo < 0:
-        raise ValueError('lo must be non-negative')
-    if hi is None:
-        hi = len(a)
-    # Note, the comparison uses "<" to match the
-    # __lt__() logic in list.sort() and in heapq.
-    if key is None:
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if a[mid] < x:
-                lo = mid + 1
-            else:
-                hi = mid
-        return
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if key(a[mid]) < x:
-            lo = mid + 1
-        else:
-            hi = mid
-    return lo
