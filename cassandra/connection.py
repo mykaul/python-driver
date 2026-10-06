@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import  # to enable import io from stdlib
 from collections import defaultdict, deque
 import errno
 from functools import wraps, partial, total_ordering
@@ -25,18 +24,19 @@ import sys
 from threading import Thread, Event, RLock, Condition
 import time
 import ssl
+import uuid
 import weakref
 import random
 import itertools
-from typing import Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from cassandra.application_info import ApplicationInfoBase
+from cassandra.driver_config import (DriverConfigReporter, DRIVER_CONFIG_OPTION,
+                                     SESSION_ID_OPTION)
+from cassandra.client_routes import _ClientRoutesHandler
 from cassandra.protocol_features import ProtocolFeatures
 
-if 'gevent.monkey' in sys.modules:
-    from gevent.queue import Queue, Empty
-else:
-    from queue import Queue, Empty  # noqa
+from queue import Queue, Empty  # noqa
 
 from cassandra import ConsistencyLevel, AuthenticationFailed, OperationTimedOut, ProtocolVersion
 from cassandra.marshal import int32_pack
@@ -46,10 +46,11 @@ from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessag
                                 InvalidRequestException, SupportedMessage,
                                 AuthResponseMessage, AuthChallengeMessage,
                                 AuthSuccessMessage, ProtocolException,
-                                RegisterMessage, ReviseRequestMessage)
+                                RegisterMessage, ReviseRequestMessage,
+                                OverloadedErrorMessage)
 from cassandra.segment import SegmentCodec, CrcException
 from cassandra.util import OrderedDict
-from cassandra.shard_info import ShardingInfo
+from cassandra.shard_info import ShardingInfo  # noqa: F401  # re-exported for cassandra.connection.ShardingInfo
 
 log = logging.getLogger(__name__)
 
@@ -64,8 +65,7 @@ locally_supported_compressions = OrderedDict()
 try:
     import lz4
 except ImportError:
-    log.debug("lz4 package could not be imported. LZ4 Compression will not be available")
-    pass
+    lz4 = None
 else:
     # The compress and decompress functions we need were moved from the lz4 to
     # the lz4.block namespace, so we try both here.
@@ -99,6 +99,19 @@ else:
 
     locally_supported_compressions['lz4'] = (lz4_compress, lz4_decompress)
     segment_codec_lz4 = SegmentCodec(lz4_compress, lz4_decompress)
+
+# Prefer the Cython wrappers that call liblz4 directly (no Python object
+# allocation overhead for the byte-order conversion).  This also enables
+# LZ4 support when the Cython extension is available but the Python lz4
+# package is not installed.
+try:
+    from cassandra.cython_lz4 import lz4_compress, lz4_decompress
+    locally_supported_compressions['lz4'] = (lz4_compress, lz4_decompress)
+    segment_codec_lz4 = SegmentCodec(lz4_compress, lz4_decompress)
+except ImportError:
+    if lz4 is None:
+        log.debug("Neither the lz4 package nor the cython_lz4 extension could "
+                  "be imported. LZ4 Compression will not be available")
 
 try:
     import snappy
@@ -160,6 +173,37 @@ class EndPoint(object):
         The socket family of the endpoint.
         """
         return socket.AF_UNSPEC
+
+    _tls_session_cache_key_override = None
+
+    @property
+    def tls_session_cache_key(self):
+        """
+        A hashable value identifying the TLS peer this endpoint connects to,
+        used to look up cached TLS sessions (see
+        :class:`~cassandra.ssl_session_cache.SSLSessionCache`).  Two endpoints
+        may share a key only if a
+        TLS session established with one is valid for the other.
+
+        An endpoint built to reach a node that another one already describes --
+        an alternate listener of the same server -- carries that node's key
+        here, so both share one cached session.  Subclasses give their own
+        identity in :meth:`_default_tls_session_cache_key`.
+        """
+        if self._tls_session_cache_key_override is not None:
+            return self._tls_session_cache_key_override
+        return self._default_tls_session_cache_key()
+
+    @property
+    def _tls_session_cache_key_is_borrowed(self):
+        """
+        Whether :attr:`tls_session_cache_key` names a node this endpoint is an
+        alternate route to, rather than this endpoint's own identity.
+        """
+        return self._tls_session_cache_key_override is not None
+
+    def _default_tls_session_cache_key(self):
+        return (self.address, self.port)
 
     def resolve(self):
         """
@@ -230,7 +274,7 @@ class DefaultEndPointFactory(EndPointFactory):
     port = None
     """
     If no port is discovered in the row, this is the default port
-    used for endpoint creation. 
+    used for endpoint creation.
     """
 
     def __init__(self, port=None):
@@ -255,9 +299,9 @@ class DefaultEndPointFactory(EndPointFactory):
 class SniEndPoint(EndPoint):
     """SNI Proxy EndPoint implementation."""
 
-    def __init__(self, proxy_address, server_name, port=9042):
+    def __init__(self, proxy_address, server_name, port=9042, init_index=0):
         self._proxy_address = proxy_address
-        self._index = 0
+        self._index = init_index
         self._resolved_address = None  # resolved address
         self._port = port
         self._server_name = server_name
@@ -275,10 +319,14 @@ class SniEndPoint(EndPoint):
     def ssl_options(self):
         return self._ssl_options
 
+    def _default_tls_session_cache_key(self):
+        # Several SNI endpoints share a proxy address and port, but each one
+        # presents a different server_name and therefore a different TLS peer.
+        return (self.address, self.port, self._server_name)
+
     def resolve(self):
         try:
-            resolved_addresses = socket.getaddrinfo(self._proxy_address, self._port,
-                                                    socket.AF_UNSPEC, socket.SOCK_STREAM)
+            resolved_addresses = self._resolve_proxy_addresses()
         except socket.gaierror:
             log.debug('Could not resolve sni proxy hostname "%s" '
                       'with port %d' % (self._proxy_address, self._port))
@@ -289,6 +337,10 @@ class SniEndPoint(EndPoint):
         self._index += 1
 
         return self._resolved_address, self._port
+
+    def _resolve_proxy_addresses(self):
+        return socket.getaddrinfo(self._proxy_address, self._port,
+                                  socket.AF_UNSPEC, socket.SOCK_STREAM)
 
     def __eq__(self, other):
         return (isinstance(other, SniEndPoint) and
@@ -316,16 +368,67 @@ class SniEndPointFactory(EndPointFactory):
         self._proxy_address = proxy_address
         self._port = port
         self._node_domain = node_domain
+        # Distribute endpoints across all proxy addresses on their first DNS
+        # resolution instead of making every endpoint try the first address.
+        self._init_index = itertools.count()
+
+    def _create_endpoint(self, server_name):
+        return SniEndPoint(self._proxy_address, server_name, self._port,
+                           next(self._init_index))
 
     def create(self, row):
         host_id = row.get("host_id")
         if host_id is None:
             raise ValueError("No host_id to create the SniEndPoint")
         address = "{}.{}".format(host_id, self._node_domain) if self._node_domain else str(host_id)
-        return SniEndPoint(self._proxy_address, str(address), self._port)
+        return self._create_endpoint(str(address))
 
     def create_from_sni(self, sni):
-        return SniEndPoint(self._proxy_address, sni, self._port)
+        return self._create_endpoint(sni)
+
+
+class ClientRoutesEndPointFactory(EndPointFactory):
+    """
+    EndPointFactory for Client Routes (Private Link) support.
+
+    Creates ClientRoutesEndPoint instances that defer both address translation
+    (host_id -> hostname lookup) and DNS resolution until connection time.
+    This ensures immediate reaction to infrastructure changes.
+    """
+
+    client_routes_handler: _ClientRoutesHandler
+    default_port: int
+
+    def __init__(self, client_routes_handler: _ClientRoutesHandler, default_port: int = None) -> None:
+        """
+        :param client_routes_handler: _ClientRoutesHandler instance to lookup routes
+        :param default_port: Default port if none found in row
+        """
+        self.client_routes_handler = client_routes_handler
+        self.default_port = default_port
+
+    def create(self, row: Dict[str, Any]) -> 'ClientRoutesEndPoint':
+        """
+        Create a ClientRoutesEndPoint from a system.peers row.
+
+        Stores only the host_id and handler reference. Both translation
+        (route lookup) and DNS resolution happen later in resolve().
+        """
+        from cassandra.metadata import _NodeInfo
+        host_id = row.get("host_id")
+
+        if host_id is None:
+            raise ValueError("No host_id to create ClientRoutesEndPoint")
+
+        addr = _NodeInfo.get_broadcast_rpc_address(row)
+        port = _NodeInfo.get_broadcast_rpc_port(row) or _NodeInfo.get_broadcast_port(row) or self.default_port
+
+        return ClientRoutesEndPoint(
+            host_id=host_id,
+            handler=self.client_routes_handler,
+            original_address=addr,
+            original_port=port,
+        )
 
 
 @total_ordering
@@ -369,7 +472,91 @@ class UnixSocketEndPoint(EndPoint):
         return "<%s: %s>" % (self.__class__.__name__, self._unix_socket_path)
 
 
+@total_ordering
+class ClientRoutesEndPoint(EndPoint):
+    """
+    Client Routes (Private Link) EndPoint implementation.
+
+    Defers both address translation (route lookup) and DNS resolution
+    until resolve() is called at connection time. This ensures immediate
+    reaction to infrastructure changes and CLIENT_ROUTES_CHANGE events.
+    """
+
+    _host_id: uuid.UUID
+    _handler: _ClientRoutesHandler
+    _original_address: str
+    _original_port: int
+
+    def __init__(self, host_id: uuid.UUID, handler: _ClientRoutesHandler, original_address: str, original_port: int = None) -> None:
+        """
+        :param host_id: Host UUID for route lookup
+        :param handler: _ClientRoutesHandler instance
+        :param original_address: Original address from system.peers (for identification)
+        :param original_port: Original port if route doesn't specify one
+        """
+        self._host_id = host_id
+        self._handler = handler
+        self._original_address = original_address
+        self._original_port = original_port
+
+    @property
+    def address(self) -> str:
+        """Returns the original address (updated by resolve())."""
+        return self._original_address
+
+    @property
+    def port(self) -> Optional[int]:
+        return self._original_port
+
+    @property
+    def host_id(self) -> uuid.UUID:
+        return self._host_id
+
+    def _default_tls_session_cache_key(self):
+        # The proxy address this endpoint resolves to may change between
+        # connections; the TLS peer is identified by the node behind it.
+        return (self._host_id, self._original_address, self._original_port)
+
+    def resolve(self) -> Tuple[str, int]:
+        """
+        Resolve endpoint by delegating to the handler.
+        Falls back to original address/port if no route mapping is available.
+        """
+        result = self._handler.resolve_host(self._host_id)
+        if result is None:
+            return self._original_address, self._original_port
+        return result
+
+    def __eq__(self, other):
+        return (isinstance(other, ClientRoutesEndPoint) and
+                self._host_id == other._host_id and
+                self._original_address == other._original_address)
+
+    def __hash__(self):
+        return hash((self._host_id, self._original_address))
+
+    def __lt__(self, other):
+        return ((self._host_id, self._original_address) <
+                (other._host_id, other._original_address))
+
+    def __str__(self):
+        return str("%s (host_id=%s)" % (self._original_address, self._host_id))
+
+    def __repr__(self):
+        return "<%s: host_id=%s, original_addr=%s>" % (
+            self.__class__.__name__, self._host_id, self._original_address)
+
+
 class _Frame(object):
+    __slots__ = (
+        'version',
+        'flags',
+        'stream',
+        'opcode',
+        'body_offset',
+        'end_pos',
+    )
+
     def __init__(self, version, flags, stream, opcode, body_offset, end_pos):
         self.version = version
         self.flags = flags
@@ -689,6 +876,23 @@ class Connection(object):
     ssl_context = None
     last_error = None
 
+    # Whether this connection implementation can restore a cached TLS session
+    # before the handshake.  True here because the accessors below speak the
+    # stdlib ssl API, which is what the asyncore and libev reactors use.  A
+    # reactor that establishes TLS some other way sets this to False until it
+    # overrides those accessors -- asyncio hands the handshake to
+    # loop.create_connection(), which offers no point to restore a session at
+    # all.
+    supports_tls_session_resumption = True
+
+    _ssl_session_cache = None
+    _tls_session_offered = None
+    _tls_handshake_began_at = None
+
+    # RFC 8446 section 4.6.1: "Clients MUST NOT cache tickets for longer than
+    # 7 days, regardless of the ticket_lifetime".
+    _MAX_TLS_SESSION_LIFETIME = 7 * 24 * 60 * 60
+
     # The current number of operations that are in flight. More precisely,
     # the number of request IDs that are currently in use.
     # This includes orphaned requests.
@@ -718,10 +922,50 @@ class Connection(object):
     # and the connection will be replaced
     orphaned_threshold_reached = False
 
+    # The CQL stream id space, which is all the protocol can address however high
+    # max_in_flight is set. Both limits below are capped to it.
+    _MAX_STREAM_IDS = 2 ** 15
+
     # If the number of orphaned streams reaches this threshold, this connection
     # will become marked and will be replaced with a new connection by the
-    # owning pool (currently, only HostConnection supports this)
-    orphaned_threshold = 3  * max_in_flight // 4
+    # owning pool (currently, only HostConnection supports this). The default
+    # for this class's max_in_flight; a connection derives its own in __init__.
+    orphaned_threshold = 3 * min(max_in_flight, _MAX_STREAM_IDS) // 4
+
+    @staticmethod
+    def max_request_id_for(max_in_flight):
+        """
+        The highest request id a connection with this limit will hand out.
+
+        Request ids run from zero to this inclusive, and borrow_connection
+        admits a request only while in_flight is below it. Capped at the CQL
+        stream id range, which is all the protocol can address however high
+        max_in_flight is set.
+        """
+        return min(max_in_flight, Connection._MAX_STREAM_IDS) - 1
+
+    @staticmethod
+    def orphaned_threshold_for(max_in_flight):
+        """
+        The orphaned stream count at which a connection with this limit is
+        marked for replacement.
+
+        Three quarters of the stream ids a connection can actually hold, which
+        is max_in_flight capped the way :meth:`max_request_id_for` caps it.
+        Taken off that capped pool rather than off max_in_flight itself: a
+        connection holds at most max_request_id + 1 ids, so a threshold above
+        that is one `len(orphaned_request_ids) >= orphaned_threshold` never
+        reaches, leaving orphan-based replacement dead for a max_in_flight
+        raised past the stream id range.
+        """
+        return 3 * min(max_in_flight, Connection._MAX_STREAM_IDS) // 4
+
+    # Both limits are derived, and both are asked for rather than stored on the
+    # class, because max_in_flight is tuned at runtime -- assigned on the class,
+    # or patched in a test -- and a value derived once does not follow it. A
+    # connection derives both in __init__ from the limit in force when it is
+    # built, and the configuration report, which has to describe them before any
+    # connection exists, asks with the class's current limit.
 
     is_defunct = False
     is_closed = False
@@ -733,6 +977,8 @@ class Connection(object):
     is_unsupported_proto_version = False
 
     is_control_connection = False
+    # Stable identity learned from system.local for control connections.
+    _control_connection_host_id = None
     signaled_error = False  # used for flagging at the pool level
 
     allow_beta_protocol_version = False
@@ -754,6 +1000,16 @@ class Connection(object):
     features = None
     _application_info: Optional[ApplicationInfoBase] = None
 
+    # Identifier of the cluster this connection belongs to, reported in the
+    # SESSION_ID startup option so that all of a cluster's connections can be
+    # correlated with each other in the clients table.
+    _session_id = None
+
+    # Set on every connection, but only used by the control connection, which is
+    # the only one reporting the driver configuration. Left as None when the
+    # cluster has configuration reporting disabled.
+    _driver_config_reporter: Optional[DriverConfigReporter] = None
+
     @property
     def _iobuf(self):
         # backward compatibility, to avoid any change in the reactors
@@ -764,13 +1020,23 @@ class Connection(object):
                  cql_version=None, protocol_version=ProtocolVersion.MAX_SUPPORTED, is_control_connection=False,
                  user_type_map=None, connect_timeout=None, allow_beta_protocol_version=False, no_compact=False,
                  ssl_context=None, owning_pool=None, shard_id=None, total_shards=None,
-                 on_orphaned_stream_released=None, application_info: Optional[ApplicationInfoBase] = None):
+                 on_orphaned_stream_released=None, application_info: Optional[ApplicationInfoBase] = None,
+                 session_id=None, driver_config_reporter: Optional[DriverConfigReporter] = None,
+                 ssl_session_cache=None):
         # TODO next major rename host to endpoint and remove port kwarg.
         self.endpoint = host if isinstance(host, EndPoint) else DefaultEndPoint(host, port)
 
         self.authenticator = authenticator
         self.ssl_options = ssl_options.copy() if ssl_options else {}
         self.ssl_context = ssl_context
+        # A TLS session can only be replayed onto the SSLContext it was
+        # established with -- the stdlib ssl module rejects anything else with
+        # "Session refers to a different SSLContext".  Connections that derive
+        # their own context from ssl_options below therefore have nothing to
+        # gain from the cache, and would only fill it with sessions no one can
+        # use, so resumption is limited to a caller-supplied context.
+        if ssl_context is not None and self.supports_tls_session_resumption:
+            self._ssl_session_cache = ssl_session_cache
         self.sockopts = sockopts
         self.compression = compression
         self.cql_version = cql_version
@@ -788,6 +1054,8 @@ class Connection(object):
         self.orphaned_request_ids = set()
         self._on_orphaned_stream_released = on_orphaned_stream_released
         self._application_info = application_info
+        self._session_id = session_id
+        self._driver_config_reporter = driver_config_reporter
 
         if ssl_options:
             self.ssl_options.update(self.endpoint.ssl_options or {})
@@ -805,7 +1073,9 @@ class Connection(object):
         if not self.ssl_context and self.ssl_options:
             self.ssl_context = self._build_ssl_context_from_options()
 
-        self.max_request_id = min(self.max_in_flight - 1, (2 ** 15) - 1)
+        self.max_request_id = self.max_request_id_for(self.max_in_flight)
+        self.orphaned_threshold = self.orphaned_threshold_for(self.max_in_flight)
+
         # Don't fill the deque with 2**15 items right away. Start with some and add
         # more if needed.
         initial_size = min(300, self.max_in_flight)
@@ -837,7 +1107,7 @@ class Connection(object):
     @classmethod
     def handle_fork(cls):
         """
-        Called after a forking.  This should cleanup any remaining reactor state
+        Called after a fork.  This should clean up any remaining reactor state
         from the parent process.
         """
         pass
@@ -868,7 +1138,10 @@ class Connection(object):
             raise conn.last_error
         elif not conn.connected_event.is_set():
             conn.close()
-            raise OperationTimedOut("Timed out creating connection (%s seconds)" % timeout)
+            raise OperationTimedOut("Timed out creating connection (%s seconds)" % timeout,
+                                    timeout=timeout)
+        elif conn.is_closed:
+            raise ConnectionShutdown("Connection to %s was closed by server" % conn.endpoint)
         else:
             return conn
 
@@ -878,7 +1151,7 @@ class Connection(object):
         ssl_context_opt_names = ['ssl_version', 'cert_reqs', 'check_hostname', 'keyfile', 'certfile', 'ca_certs', 'ciphers']
         opts = {k:self.ssl_options.get(k, None) for k in ssl_context_opt_names if k in self.ssl_options}
 
-        # Python >= 3.10 requires either PROTOCOL_TLS_CLIENT or PROTOCOL_TLS_SERVER so we'll get ahead of things by always
+        # Python >= 3.10 requires either PROTOCOL_TLS_CLIENT or PROTOCOL_TLS_SERVER, so we'll get ahead of things by always
         # being explicit
         ssl_version = opts.get('ssl_version', None) or ssl.PROTOCOL_TLS_CLIENT
         cert_reqs = opts.get('cert_reqs', None) or ssl.CERT_REQUIRED
@@ -903,17 +1176,16 @@ class Connection(object):
 
         # Extract a subset of names from self.ssl_options which apply to SSLContext.wrap_socket (or at least the parts
         # of it that don't involve building an SSLContext under the covers)
-        wrap_socket_opt_names = ['server_side', 'do_handshake_on_connect', 'suppress_ragged_eofs', 'server_hostname']
+        wrap_socket_opt_names = ['server_side', 'do_handshake_on_connect', 'suppress_ragged_eofs']
         opts = {k:self.ssl_options.get(k, None) for k in wrap_socket_opt_names if k in self.ssl_options}
 
-        # PYTHON-1186: set the server_hostname only if the SSLContext has
-        # check_hostname enabled and it is not already provided by the EndPoint ssl options
-        #opts['server_hostname'] = self.endpoint.address
-        if (self.ssl_context.check_hostname and 'server_hostname' not in opts):
-            server_hostname = self.endpoint.address
+        server_hostname = self._tls_server_hostname()
+        if server_hostname is not None:
             opts['server_hostname'] = server_hostname
 
-        return self.ssl_context.wrap_socket(self._socket, **opts)
+        ssl_sock = self.ssl_context.wrap_socket(self._socket, **opts)
+        self._restore_tls_session(ssl_sock)
+        return ssl_sock
 
     def _initiate_connection(self, sockaddr):
         if self.features.shard_id is not None:
@@ -926,6 +1198,238 @@ class Connection(object):
             log.debug('connection (%r) port=%d should be shard_id=%d', id(self), port, port % self.total_shards)
 
         self._socket.connect(sockaddr)
+
+    # TLS session resumption.  Everything a reactor establishing TLS by other
+    # means than the stdlib ssl module has to reimplement is in the three
+    # accessors below -- _set_tls_session, _get_resumable_tls_session and
+    # _tls_negotiated_version -- and nothing else here touches the socket, so
+    # the policy around them is shared by every reactor that has them.
+
+    def _tls_server_hostname(self):
+        """
+        The name ``wrap_socket`` is given, which is the name the peer
+        certificate is verified against when the context checks hostnames.
+
+        PYTHON-1186: the endpoint's ssl_options may provide it (an SNI proxy
+        needs it for routing); otherwise it is the endpoint address, and only
+        when the context actually checks hostnames.
+        """
+        if 'server_hostname' in self.ssl_options:
+            return self.ssl_options['server_hostname']
+        if getattr(self.ssl_context, 'check_hostname', False):
+            return self.endpoint.address
+        return None
+
+    def _tls_session_cache_key(self):
+        # The SSLContext is part of the key because a session cannot be
+        # replayed onto a different one, and a cache may be shared by several
+        # clusters.  It is held strongly: a cached session already keeps its
+        # context alive on its own -- CPython's SSLSession holds a reference to
+        # the context it was established with -- so holding it weakly here
+        # would buy nothing.
+        # The verified name is part of it because a resumed handshake carries no
+        # Certificate, so that name is never checked again: offering a session
+        # to a connection expecting a different name would silently skip
+        # hostname verification for it.  Deriving the name from the same place
+        # _wrap_socket_from_context does is what keeps the two from drifting.
+        return (self.ssl_context, self.endpoint.tls_session_cache_key,
+                self._tls_server_hostname())
+
+    def _restore_tls_session(self, sock):
+        """
+        Offer the session cached for this endpoint, if any, on *sock*, which
+        must not have begun its handshake yet.  Not offering one only costs a
+        full handshake, so failures here are logged and ignored.
+        """
+        # Set below only if a session is actually offered, so that this always
+        # describes the attempt in flight: _connect_socket may come back here
+        # for another address, and an earlier attempt's session is not this
+        # one's to retract.
+        self._tls_session_offered = None
+        # Taken for every attempt, offered or not: what is stored afterwards
+        # was issued during the handshake this is about to begin, and its
+        # lifetime runs from then rather than from when the CQL handshake
+        # finishes reading it.
+        self._tls_handshake_began_at = time.monotonic()
+        if self._ssl_session_cache is None:
+            return
+
+        try:
+            session = self._ssl_session_cache.get(self._tls_session_cache_key())
+            if session is not None:
+                self._set_tls_session(sock, session)
+                self._tls_session_offered = session
+                log.debug("Offering a cached TLS session to %s", self.endpoint)
+        except Exception as exc:
+            log.debug("Could not offer a cached TLS session to %s: %s", self.endpoint, exc)
+
+    def _discard_tls_session(self):
+        """
+        Drop the session offered on this connection, after a handshake it took
+        part in failed -- during _connect_socket, or, where ssl_options defer
+        the handshake past it, wherever the reactor meets the failure.
+
+        A cached session should never be able to fail a handshake -- RFC 5077
+        section 3.2 and RFC 8446 section 4.6.1 both have the server fall back to
+        a full one when it will not resume -- but nothing stores a fresh session
+        for a connection that never came up, so an entry that does provoke a
+        failure would otherwise be offered again by every later connection until
+        its lifetime ran out.
+
+        Only the session this connection offered is dropped: another connection
+        may have stored a session the peer issued in its place, and removing
+        that would cost every later connection a full handshake for a session
+        that never failed anything.  A store of the same session is not that,
+        and leaves the entry retractable.
+
+        Nothing is dropped for an endpoint that borrowed its key from another.
+        An alternate listener resumes the node's session and stores back to it,
+        which is the point of sharing the key, but the entry is not its to
+        remove: it would cost the node's other pools and its control connection
+        a full handshake apiece, and a pool filling against that listener would
+        do it again on every retry.  A session that genuinely cannot resume
+        fails on the endpoint that owns the key as well, and goes from there.
+        """
+        offered, self._tls_session_offered = self._tls_session_offered, None
+        if offered is None or self._ssl_session_cache is None:
+            # Nothing was offered on this connection -- there was nothing
+            # cached, or setting it on the socket was refused -- so there is
+            # nothing of ours to retract.  Going on would hand discard() no
+            # session to compare against, which tells it to drop whatever is
+            # there, including one a sibling connection stored in the meantime.
+            return
+
+        if self.endpoint._tls_session_cache_key_is_borrowed:
+            log.debug("Leaving the TLS session %s offered where it is: the key "
+                      "is another endpoint's", self.endpoint)
+            return
+
+        try:
+            self._ssl_session_cache.discard(self._tls_session_cache_key(), offered)
+            log.debug("Dropped the cached TLS session offered to %s", self.endpoint)
+        except Exception as exc:
+            log.debug("Could not drop the cached TLS session of %s: %s", self.endpoint, exc)
+
+    def _store_tls_session(self):
+        """
+        Cache this connection's TLS session so that later connections to the
+        same peer can resume it.  Called once the CQL handshake has completed,
+        which is late enough to have read a TLS 1.3 session ticket from a
+        server that sends one with the handshake, Scylla among them.
+        """
+        # Reaching here is the TLS handshake having stood: the CQL one is
+        # complete, so there is nothing left to retract and the attribute goes
+        # back to meaning "offered, and not yet known to be good".
+        offered, self._tls_session_offered = self._tls_session_offered, None
+        if self._ssl_session_cache is None:
+            return
+
+        try:
+            session = self._get_resumable_tls_session()
+            if session is None:
+                # Every connection samples at this same point in the CQL
+                # handshake, so reaching here is not something the next one
+                # retries: a peer that has not produced a ticket by now will
+                # not have for the next connection either, and nothing is ever
+                # cached for it.  Scylla produces one well before this -- the
+                # TLS handshake plus the OPTIONS exchange -- so a peer that
+                # deferred its ticket past this point is what would call for a
+                # later hook than this one.
+                return
+            lifetime = self._tls_session_lifetime(session)
+            if lifetime is None:
+                return
+            self._ssl_session_cache.set(self._tls_session_cache_key(),
+                                        session, lifetime, offered=offered)
+            log.debug("Cached the TLS session of %s for resumption, for %ss",
+                      self.endpoint, int(lifetime))
+        except Exception as exc:
+            log.debug("Could not cache the TLS session of %s: %s", self.endpoint, exc)
+
+    def _tls_session_lifetime(self, session):
+        """
+        How much longer, in seconds, *session* may be offered, or ``None`` if
+        it must not be cached at all.
+
+        A ticket's lifetime is the one the server announced;
+        ``SSLSession.timeout`` is the local context's default and says nothing
+        about what the peer will still accept, so it is only used where the
+        server announced nothing.  RFC 8446 section 4.6.1 also caps a client at
+        seven days however long a lifetime the server asked for.
+
+        A zero lifetime means opposite things in the two RFCs that define
+        tickets, so the negotiated version has to decide: RFC 8446 section 4.6.1
+        (TLS 1.3) says discard the ticket immediately, while RFC 5077 section 3.3
+        (TLS 1.2) reserves zero for "lifetime unspecified" and leaves retention
+        to local policy -- for which the local timeout is the only figure
+        available.
+
+        What is left of that lifetime is what the entry gets.  The peer issued
+        the ticket during the handshake, while this runs once the CQL handshake
+        has completed -- a startup exchange later, and an authentication one
+        after that -- so stamping the announced lifetime here would hand the
+        entry every second of that on top of what the peer allowed.  The age is
+        measured from a monotonic mark taken as the TLS handshake began, not
+        from ``SSLSession.time``: that is a wall-clock stamp, and subtracting it
+        from ``time.time()`` would let a clock step landing in between decide
+        the answer -- far enough forward and nothing is cached at all, backward
+        and the age disappears.  The deadline the cache keeps is monotonic too,
+        so nothing after this point can skew it either.
+        """
+        if session.has_ticket:
+            lifetime = session.ticket_lifetime_hint
+            if not lifetime:
+                if self._tls_negotiated_version() == 'TLSv1.3':
+                    return None
+                lifetime = session.timeout
+        elif self._tls_negotiated_version() == 'TLSv1.3':
+            # TLS 1.3 resumes only from a ticket, whose pre-shared key is the
+            # whole mechanism; the session id a TLS 1.3 handshake carries is
+            # legacy_session_id_echo (RFC 8446 section 4.1.3), which a server
+            # echoes for the middlebox compatibility mode of appendix D.4 and
+            # which resumes nothing.  OpenSSL does not report such an id as the
+            # session's -- one appears only once a NewSessionTicket has been
+            # read, which is what defers the store until then -- so this is
+            # unreachable there; it is here so the rule follows from the
+            # protocol rather than from what one library chooses to expose.
+            return None
+        else:
+            lifetime = session.timeout
+
+        lifetime = min(lifetime, self._MAX_TLS_SESSION_LIFETIME)
+        if self._tls_handshake_began_at is not None:
+            lifetime -= time.monotonic() - self._tls_handshake_began_at
+        return lifetime if lifetime > 0 else None
+
+    def _set_tls_session(self, sock, session):
+        sock.session = session
+
+    def _tls_negotiated_version(self):
+        """
+        The name of the TLS version in force on this connection, as
+        ``SSLSocket.version`` reports it -- ``'TLSv1.3'`` and so on -- or
+        :const:`None` if there is no handshake to ask about.
+
+        Only the retention rules need this: which RFC defines the tickets the
+        peer issues, and so what a lifetime of zero in one means, is decided by
+        the version, and no property of the session itself distinguishes them.
+        """
+        return self._socket.version()
+
+    def _get_resumable_tls_session(self):
+        session = getattr(self._socket, 'session', None)
+        if session is None:
+            return None
+        # There has to be something to offer on the next connection: a ticket
+        # (RFC 5077 for TLS 1.2, RFC 8446 for TLS 1.3) or a session id.  A TLS
+        # 1.3 server sends its NewSessionTicket after the handshake as a
+        # separate message, and until that has been read the session carries
+        # neither, which is what keeps an empty one from being stored.  Whether
+        # an id alone is worth anything is not decided here: that depends on
+        # the negotiated version, which _tls_session_lifetime reads.
+        if not (session.has_ticket or session.id):
+            return None
+        return session
 
     # PYTHON-1331
     #
@@ -968,12 +1472,22 @@ class Connection(object):
                 # run that here.
                 if self._check_hostname:
                     self._validate_hostname()
+                # The handshake stood, so there is nothing left to retract --
+                # but what was offered is kept, because the store still reads
+                # it to tell a session the peer reissued from the one this
+                # connection offered and got back unchanged.
                 sockerr = None
                 break
             except socket.error as err:
                 if self._socket:
                     self._socket.close()
                     self._socket = None
+                # Only for a TLS failure: a connection refused or reset says
+                # nothing about the session, and dropping it would cost a later
+                # connection a full handshake for no reason.  Whether anything
+                # was offered to retract is _discard_tls_session's own business.
+                if isinstance(err, ssl.SSLError):
+                    self._discard_tls_session()
                 sockerr = err
 
         if sockerr:
@@ -1011,6 +1525,15 @@ class Connection(object):
         else:
             log.debug("Defuncting connection (%s) to %s: %s",
                       id(self), self.endpoint, exc)
+
+        if isinstance(exc, ssl.SSLError):
+            # ssl_options may carry do_handshake_on_connect=False, which leaves
+            # the handshake to the first read or write and so to the reactor,
+            # where a failure arrives here rather than at _connect_socket.
+            # Nothing is retracted for a connection that got as far as the CQL
+            # handshake, which cleared what it had offered; only a TLS error
+            # counts, for the same reason it does there.
+            self._discard_tls_session()
 
         self.last_error = exc
         self.close()
@@ -1103,7 +1626,8 @@ class Connection(object):
         # this allows us to inject custom functions per request to encode, decode messages
         self._requests[request_id] = (cb, decoder, result_metadata)
         msg = encoder(msg, request_id, self.protocol_version, compressor=self.compressor,
-                      allow_beta_protocol_version=self.allow_beta_protocol_version)
+                      allow_beta_protocol_version=self.allow_beta_protocol_version,
+                      protocol_features=self.features)
 
         if self._is_checksumming_enabled:
             buffer = io.BytesIO()
@@ -1131,6 +1655,7 @@ class Connection(object):
                 msg += ": %s" % (self.last_error,)
             raise ConnectionShutdown(msg)
         timeout = kwargs.get('timeout')
+        original_timeout = timeout  # preserve for exception reporting
         fail_on_error = kwargs.get('fail_on_error', True)
         waiter = ResponseWaiter(self, len(msgs), fail_on_error)
 
@@ -1155,7 +1680,8 @@ class Connection(object):
                 if timeout is not None:
                     timeout -= 0.01
                     if timeout <= 0.0:
-                        raise OperationTimedOut()
+                        raise OperationTimedOut(timeout=original_timeout,
+                                                in_flight=self.in_flight)
                 time.sleep(0.01)
 
         try:
@@ -1247,11 +1773,11 @@ class Connection(object):
 
             if not self._current_frame or pos < self._current_frame.end_pos:
                 if self._is_checksumming_enabled and self._io_buffer.readable_io_bytes():
-                    # We have a multi-segments message and we need to read more
+                    # We have a multi-segment message and we need to read more
                     # data to complete the current cql frame
                     continue
 
-                # we don't have a complete header yet or we
+                # we don't have a complete header yet, or we
                 # already saw a header, but we don't have a
                 # complete message yet
                 return
@@ -1377,6 +1903,55 @@ class Connection(object):
             self._application_info.add_startup_options(options)
         self.features.add_startup_options(options)
 
+        # Driver-owned options go in after the application's, so that they can
+        # overwrite them and never the other way round. An application that set
+        # SESSION_ID would break correlating a cluster's connections in the
+        # clients table, which is the only reason the option exists; one that set
+        # DRIVER_CONFIG would have an operator read its value as the driver's
+        # description of itself; and one that set DRIVER_NAME or DRIVER_VERSION
+        # would misreport the driver for the life of the connection, to the same
+        # operator and in the same row.
+        #
+        # They are cleared rather than merely overwritten, so that ownership does
+        # not depend on this connection having something to say: a pool
+        # connection reports no configuration at all, and neither does a control
+        # connection whose report was dropped or turned off. DRIVER_NAME and
+        # DRIVER_VERSION are then put back by _send_startup_message, the only
+        # place that knows them. CQL_VERSION needs no entry here: StartupMessage
+        # writes it after the options map, so it cannot be overridden either.
+        for owned_key in (SESSION_ID_OPTION, DRIVER_CONFIG_OPTION,
+                          'DRIVER_NAME', 'DRIVER_VERSION'):
+            if options.pop(owned_key, None) is not None:
+                # The application info is one object shared by every connection of
+                # a cluster, so an offending key is seen on all of them: warning
+                # on each would mean hosts x shards + 1 lines per connect(), and
+                # as many again on every pool replacement or control connection
+                # reconnect, for a misconfiguration that is in the application's
+                # code and identical on all of them.
+                #
+                # Warn on the control connection, which is established once per
+                # cluster and before the pools, and keep the rest at debug for
+                # whoever is looking at a specific connection.
+                level = logging.WARNING if self.is_control_connection else logging.DEBUG
+                log.log(level,
+                        "Ignoring the application-supplied %s startup option on %s: "
+                        "the option is reserved for the driver", owned_key, self.endpoint)
+
+        if self._session_id is not None:
+            options[SESSION_ID_OPTION] = str(self._session_id)
+
+        # The configuration is the same for every connection of a cluster, so
+        # only the control connection reports it. A reporter left as None means
+        # the cluster has configuration reporting disabled.
+        if self.is_control_connection and self._driver_config_reporter is not None:
+            # Whether this is a ScyllaDB node is already known: the features
+            # above were parsed from the SUPPORTED response, and sharding info
+            # is what the driver itself keys ScyllaDB-only behaviour off (see
+            # ControlConnection._try_connect), so the report describes what the
+            # driver will actually do rather than only what it was configured to.
+            self._driver_config_reporter.add_startup_options(
+                options, is_scylla=self.features.sharding_info is not None)
+
         if self.cql_version:
             if self.cql_version not in supported_cql_versions:
                 raise ProtocolError(
@@ -1435,7 +2010,7 @@ class Connection(object):
         log.debug("Sending StartupMessage on %s", self)
         opts = {'DRIVER_NAME': DRIVER_NAME,
                 'DRIVER_VERSION': DRIVER_VERSION,
-                **extra_options}
+                **(extra_options or {})}
         if compression:
             opts['COMPRESSION'] = compression
         if no_compact:
@@ -1462,6 +2037,7 @@ class Connection(object):
             if ProtocolVersion.has_checksumming_support(self.protocol_version):
                 self._enable_checksumming()
 
+            self._store_tls_session()
             self.connected_event.set()
         elif isinstance(startup_response, AuthenticateMessage):
             log.debug("Got AuthenticateMessage on new connection (%s) from %s: %s",
@@ -1493,6 +2069,8 @@ class Connection(object):
             log.debug("Received ErrorMessage on new connection (%s) from %s: %s",
                       id(self), self.endpoint, startup_response.summary_msg())
             if did_authenticate:
+                if isinstance(startup_response, OverloadedErrorMessage):
+                    raise startup_response
                 raise AuthenticationFailed(
                     "Failed to authenticate to %s: %s" %
                     (self.endpoint, startup_response.summary_msg()))
@@ -1518,6 +2096,7 @@ class Connection(object):
             self.authenticator.on_authentication_success(auth_response.token)
             if self._compressor:
                 self.compressor = self._compressor
+            self._store_tls_session()
             self.connected_event.set()
         elif isinstance(auth_response, AuthChallengeMessage):
             response = self.authenticator.evaluate_challenge(auth_response.challenge)
@@ -1527,6 +2106,8 @@ class Connection(object):
         elif isinstance(auth_response, ErrorMessage):
             log.debug("Received ErrorMessage on new connection (%s) from %s: %s",
                       id(self), self.endpoint, auth_response.summary_msg())
+            if isinstance(auth_response, OverloadedErrorMessage):
+                raise auth_response
             raise AuthenticationFailed(
                 "Failed to authenticate to %s: %s" %
                 (self.endpoint, auth_response.summary_msg()))
@@ -1542,7 +2123,8 @@ class Connection(object):
         if not keyspace or keyspace == self.keyspace:
             return
 
-        query = QueryMessage(query='USE "%s"' % (keyspace,),
+        from cassandra.metadata import escape_name
+        query = QueryMessage(query='USE %s' % (escape_name(keyspace),),
                              consistency_level=ConsistencyLevel.ONE)
         try:
             result = self.wait_for_response(query)
@@ -1596,7 +2178,8 @@ class Connection(object):
             callback(self, None)
             return
 
-        query = QueryMessage(query='USE "%s"' % (keyspace,),
+        from cassandra.metadata import escape_name
+        query = QueryMessage(query='USE %s' % (escape_name(keyspace),),
                              consistency_level=ConsistencyLevel.ONE)
 
         def process_result(result):
@@ -1678,7 +2261,8 @@ class ResponseWaiter(object):
         if self.error:
             raise self.error
         elif not self.event.is_set():
-            raise OperationTimedOut()
+            raise OperationTimedOut(timeout=timeout,
+                                    in_flight=self.connection.in_flight)
         else:
             return self.responses
 
@@ -1694,18 +2278,33 @@ class HeartbeatFuture(object):
         with connection.lock:
             if connection.in_flight < connection.max_request_id:
                 connection.in_flight += 1
-                connection.send_msg(OptionsMessage(), connection.get_request_id(), self._options_callback)
+                request_id = connection.get_request_id()
+                try:
+                    connection.send_msg(OptionsMessage(), request_id, self._options_callback)
+                except Exception as exc:
+                    if connection.is_control_connection:
+                        connection.in_flight -= 1
+                    # send_msg() registers the callback before writing to the socket,
+                    # so a write failure must unwind that registration here.
+                    connection._requests.pop(request_id, None)
+                    if request_id not in connection.request_ids:
+                        connection.request_ids.append(request_id)
+                    self._exception = exc
+                    self._event.set()
             else:
                 self._exception = Exception("Failed to send heartbeat because connection 'in_flight' exceeds threshold")
                 self._event.set()
 
-    def wait(self, timeout):
+    def wait(self, timeout, original_timeout):
         self._event.wait(timeout)
         if self._event.is_set():
             if self._exception:
                 raise self._exception
         else:
-            raise OperationTimedOut("Connection heartbeat timeout after %s seconds" % (timeout,), self.connection.endpoint)
+            raise OperationTimedOut("Connection heartbeat timeout (total wait=%s seconds, this wait call=%s seconds)" % (original_timeout, timeout),
+                                    self.connection.endpoint,
+                                    timeout=original_timeout,
+                                    in_flight=self.connection.in_flight)
 
     def _options_callback(self, response):
         if isinstance(response, SupportedMessage):
@@ -1758,18 +2357,18 @@ class ConnectionHeartbeat(Thread):
                         else:
                             log.debug("Cannot send heartbeat message on connection (%s) to %s",
                                       id(connection), connection.endpoint)
-                            # make sure the owner sees this defunt/closed connection
+                            # make sure the owner sees this defunct/closed connection
                             owner.return_connection(connection)
                     self._raise_if_stopped()
 
                 # Wait max `self._timeout` seconds for all HeartbeatFutures to complete
-                timeout = self._timeout
+                timeout_left = self._timeout
                 start_time = time.time()
                 for f in futures:
                     self._raise_if_stopped()
                     connection = f.connection
                     try:
-                        f.wait(timeout)
+                        f.wait(timeout_left, self._timeout)
                         # TODO: move this, along with connection locks in pool, down into Connection
                         with connection.lock:
                             connection.in_flight -= 1
@@ -1779,7 +2378,7 @@ class ConnectionHeartbeat(Thread):
                                     id(connection), connection.endpoint)
                         failed_connections.append((f.connection, f.owner, e))
 
-                    timeout = self._timeout - (time.time() - start_time)
+                    timeout_left = self._timeout - (time.time() - start_time)
 
                 for connection, owner, exc in failed_connections:
                     self._raise_if_stopped()

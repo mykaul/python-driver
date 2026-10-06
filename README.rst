@@ -2,8 +2,9 @@
     :target: https://opensource.org/licenses/Apache-2.0
 .. |version| image:: https://badge.fury.io/py/scylla-driver.svg
     :target: https://badge.fury.io/py/scylla-driver
+.. |pyversion| image:: https://img.shields.io/pypi/pyversions/scylla-driver.svg
 
-|license| |version|
+|license| |version| |pyversion|
 
 Scylla Python Driver
 ====================
@@ -14,13 +15,13 @@ Scylla Enterprise (2018.1.x+) using exclusively Cassandra's binary protocol and 
 .. image:: https://github.com/scylladb/python-driver/actions/workflows/build-push.yml/badge.svg?branch=master
    :target: https://github.com/scylladb/python-driver/actions/workflows/build-push.yml?query=event%3Apush+branch%3Amaster
 
-.. image:: https://github.com/scylladb/python-driver/actions/workflows/docs-pages.yaml/badge.svg?branch=master
-   :target: https://github.com/scylladb/python-driver/actions/workflows/docs-pages.yaml?query=event%3Apush+branch%3Amaster
+.. image:: https://github.com/scylladb/python-driver/actions/workflows/docs-pages.yml/badge.svg?branch=master
+   :target: https://github.com/scylladb/python-driver/actions/workflows/docs-pages.yml?query=event%3Apush+branch%3Amaster
 
 .. image:: https://github.com/scylladb/python-driver/actions/workflows/integration-tests.yml/badge.svg?branch=master
    :target: https://github.com/scylladb/python-driver/actions/workflows/integration-tests.yml?query=event%3Apush+branch%3Amaster
 
-The driver supports Python versions 3.10-3.14.
+The driver supports Python versions 3.10-3.15.
 
 .. **Note:** This driver does not support big-endian systems.
 

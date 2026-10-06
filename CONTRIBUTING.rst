@@ -40,6 +40,19 @@ When modifying driver files, rebuilding Cython modules is often necessary.
 Without caching, each such rebuild may take over a minute. Caching usually brings it
 down to about 2-3 seconds.
 
+**Important:** After modifying any ``.py`` file under ``cassandra/`` that is
+Cython-compiled (such as ``query.py``, ``protocol.py``, ``cluster.py``, etc.),
+extensions must be rebuilt before running tests. If you always use ``uv run``
+(e.g. ``uv run pytest``), this is handled automatically via the ``cache-keys``
+configuration in ``pyproject.toml``. If you invoke ``pytest`` directly, you can
+rebuild with::
+
+    uv sync --reinstall-package scylla-driver
+
+Without rebuilding, Python will load the stale compiled extension (``.so`` / ``.pyd``)
+instead of your modified ``.py`` source, and your changes will not actually be tested.
+The test suite will emit a warning if it detects this situation.
+
 Building the Docs
 =================
 
@@ -60,8 +73,7 @@ Running Unit Tests
 Unit tests can be run like so::
 
     uv run pytest tests/unit
-    EVENT_LOOP_MANAGER=gevent uv run pytest tests/unit/io/test_geventreactor.py
-    EVENT_LOOP_MANAGER=eventlet uv run pytest tests/unit/io/test_eventletreactor.py
+    EVENT_LOOP_MANAGER=asyncio CASS_DRIVER_NO_SKIP=1 uv run pytest tests/unit/io/test_asyncioreactor.py
 
 You can run a specific test method like so::
 
@@ -70,21 +82,15 @@ You can run a specific test method like so::
 Running Integration Tests
 -------------------------
 In order to run integration tests, you must specify a version to run using either of:
-* ``SCYLLA_VERSION`` e.g. ``release:2025.2``
+* ``SCYLLA_VERSION`` e.g. ``release:2025.2.5``
 * ``CASSANDRA_VERSION``
 environment variable::
 
-    SCYLLA_VERSION="release:2025.2" uv run pytest tests/integration/standard tests/integration/cqlengine/
+    SCYLLA_VERSION="release:2025.2.5" uv run pytest tests/integration/standard tests/integration/cqlengine/
 
 Or you can specify a scylla/cassandra directory (to test unreleased versions)::
 
     SCYLLA_VERSION=/path/to/scylla uv run pytest tests/integration/standard/
-
-Specifying the usage of an already running Scylla cluster
-------------------------------------------------------------
-The test will start the appropriate Scylla clusters when necessary  but if you don't want this to happen because a Scylla cluster is already running the flag ``USE_CASS_EXTERNAL`` can be used, for example::
-
-    USE_CASS_EXTERNAL=1 SCYLLA_VERSION='release:5.1' uv run pytest tests/integration/standard
 
 Specify a Protocol Version for Tests
 ------------------------------------
@@ -94,7 +100,7 @@ The protocol version defaults to:
 - 5 for Cassandra >= 4.0, 4 for Cassandra >= 2.2, 3 for Cassandra >= 2.1, 2 for Cassandra >= 2.0
 You can overwrite it with the ``PROTOCOL_VERSION`` environment variable::
 
-    PROTOCOL_VERSION=3 SCYLLA_VERSION="release:5.1" uv run pytest tests/integration/standard tests/integration/cqlengine/
+    PROTOCOL_VERSION=3 SCYLLA_VERSION="release:5.1.19" uv run pytest tests/integration/standard tests/integration/cqlengine/
 
 Seeing Test Logs in Real Time
 -----------------------------
@@ -106,12 +112,34 @@ Use tee to capture logs and see them on your terminal::
 
     uv run pytest -s tests/unit/ 2>&1 | tee test.log
 
+Measuring Code Coverage
+------------------------
+``scripts/coverage.sh`` runs the unit suite (all event-loop reactors) and,
+if a Scylla/Cassandra version is available, the integration suite, under
+``coverage.py``, then combines and reports the result::
+
+    bash scripts/coverage.sh
+
+    # include the integration suite too
+    SCYLLA_VERSION="release:2026.1.13" bash scripts/coverage.sh
+
+Open ``htmlcov/index.html`` afterwards for a line-by-line, browsable report.
+``coverage.xml`` is also produced for tooling that consumes Cobertura-style
+XML.
+
+Note that ``cluster.py``, ``connection.py``, ``protocol.py`` and the other
+modules that are optionally Cython-compiled (see ``Dev setup`` above) are
+measured as plain Python here, since ``coverage.py`` cannot trace
+into compiled extensions -- the script sets ``CASS_DRIVER_NO_CYTHON=1`` for
+this reason. Modules that are Cython-only with no pure-Python fallback
+(``obj_parser``, ``numpy_parser``, ``row_parser``, and similar) are not built
+at all in that mode, so they are not measured by this script.
 
 Running the Benchmarks
 ======================
 There needs to be a version of Scyll running locally so before running the benchmarks, if ccm is installed:
 
-	uv run ccm create benchmark_cluster --scylla -v release:2025.2 -n 1 -s
+	uv run ccm create benchmark_cluster --scylla -v release:2025.2.5 -n 1 -s
 
 To run the benchmarks, pick one of the files under the ``benchmarks/`` dir and run it::
 

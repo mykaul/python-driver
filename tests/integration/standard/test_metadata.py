@@ -14,38 +14,30 @@
 
 import unittest
 
-from collections import defaultdict
-import difflib
 import logging
 import sys
-import time
 import os
-from typing import Optional
 
 from packaging.version import Version
 from unittest.mock import Mock, patch
 import pytest
 
 from cassandra import AlreadyExists, SignatureDescriptor, UserFunctionDescriptor, UserAggregateDescriptor
-from cassandra.connection import Connection
 
 from cassandra.encoder import Encoder
 from cassandra.metadata import (IndexMetadata, Token, murmur3, Function, Aggregate, protect_name, protect_names,
                                 RegisteredTableExtension, _RegisteredExtensionType, get_schema_parser,
                                 group_keys_by_replica, NO_VALID_REPLICA)
 from cassandra.protocol import QueryMessage, ProtocolHandler
-from cassandra.util import SortedSet
 
 from tests.integration import (get_cluster, use_singledc, PROTOCOL_VERSION, execute_until_pass,
                                BasicSegregatedKeyspaceUnitTestCase, BasicSharedKeyspaceUnitTestCase,
                                BasicExistingKeyspaceUnitTestCase, drop_keyspace_shutdown_cluster, CASSANDRA_VERSION,
                                greaterthanorequalcass30, lessthancass30, local,
                                get_supported_protocol_versions, greaterthancass20,
-                               greaterthancass21, greaterthanorequalcass40,
-                               lessthancass40,
+                               greaterthancass21, lessthancass40,
                                TestCluster, requires_java_udf, requires_composite_type,
-                               requires_collection_indexes, SCYLLA_VERSION, xfail_scylla, xfail_scylla_version_lt,
-                               requirescompactstorage)
+                               requires_collection_indexes, SCYLLA_VERSION, xfail_scylla, requirescompactstorage, get_tablets_disabled_ddl_suffix, execute_with_long_wait_retry)
 
 from tests.util import wait_until, assertRegex, assertDictEqual, assertListEqual, assert_startswith_diff
 
@@ -80,17 +72,15 @@ class HostMetaDataTests(BasicExistingKeyspaceUnitTestCase):
                 assert host.broadcast_rpc_port is not None
 
         con = self.cluster.control_connection.get_connections()[0]
-        local_host = con.host
+        local_host = self.cluster.control_connection._get_host_for_connection(con)
 
         # The control connection node should have the listen address set.
-        # Note: Scylla does not populate listen_address in system.local
-        if SCYLLA_VERSION is None:
-            listen_addrs = [host.listen_address for host in self.cluster.metadata.all_hosts()]
-            assert local_host in listen_addrs
+        assert local_host is not None
+        assert local_host.listen_address is not None
 
         # The control connection node should have the broadcast_rpc_address set.
         rpc_addrs = [host.broadcast_rpc_address for host in self.cluster.metadata.all_hosts()]
-        assert local_host in rpc_addrs
+        assert con.host in rpc_addrs
 
     @unittest.skipUnless(
         os.getenv('MAPPED_CASSANDRA_VERSION', None) is not None,
@@ -141,6 +131,12 @@ class MetaDataRemovalTest(unittest.TestCase):
 
 class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
 
+    @classmethod
+    def create_keyspace(cls, rf):
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}{2}".format(
+            cls.ks_name, rf, get_tablets_disabled_ddl_suffix())
+        execute_with_long_wait_retry(cls.session, ddl)
+
     def test_schema_metadata_disable(self):
         """
         Checks to ensure that schema metadata_enabled, and token_metadata_enabled
@@ -161,6 +157,11 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         no_token = TestCluster(token_metadata_enabled=False)
         no_token_session = no_token.connect()
         assert len(no_token.metadata.token_map.token_to_host_owner) == 0
+        no_token_connection = no_token.control_connection.get_connections()[0]
+        no_token_local_host = no_token.control_connection._get_host_for_connection(no_token_connection)
+        assert no_token_local_host is not None
+        assert no_token_local_host.listen_address is not None
+        assert no_token_local_host.broadcast_address is not None
 
         # Do a simple query to ensure queries are working
         query = "SELECT * FROM system.local WHERE key='local'"
@@ -230,8 +231,8 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
 
         assert ksmeta.name == self.keyspace_name
         assert ksmeta.durable_writes
-        assert ksmeta.replication_strategy.name == 'SimpleStrategy'
-        assert ksmeta.replication_strategy.replication_factor == 1
+        assert ksmeta.replication_strategy.name == 'NetworkTopologyStrategy'
+        assert ksmeta.replication_strategy.dc_replication_factors["dc1"] == 1
 
         assert self.function_table_name in ksmeta.tables
         tablemeta = ksmeta.tables[self.function_table_name]
@@ -601,7 +602,7 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         assert "new_keyspace" not in cluster2.metadata.keyspaces
 
         # Cluster metadata modification
-        self.session.execute("CREATE KEYSPACE new_keyspace WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}")
+        self.session.execute("CREATE KEYSPACE new_keyspace WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}")
         assert "new_keyspace" not in cluster2.metadata.keyspaces
 
         cluster2.refresh_schema_metadata()
@@ -693,11 +694,11 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         """
         test for synchronously refreshing table metadata
 
-        test_refresh_table_metatadata tests that table metadata is refreshed when calling test_refresh_table_metatadata().
+        test_refresh_table_metadata tests that table metadata is refreshed when calling test_refresh_table_metadata().
         It creates a second cluster object with schema_event_refresh_window=-1 such that schema refreshes are disabled
         for schema change push events. It then alters the table, adding a new column, using the first cluster
         object, and verifies that the table metadata has not changed in the second cluster object. Finally, it calls
-        test_refresh_table_metatadata() and verifies that the table metadata is updated in the second cluster object.
+        test_refresh_table_metadata() and verifies that the table metadata is updated in the second cluster object.
 
         @since 2.6.0
         @jira_ticket PYTHON-291
@@ -727,10 +728,10 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         test for synchronously refreshing materialized view metadata
 
         test_refresh_table_metadata_for_materialized_views tests that materialized view metadata is refreshed when calling
-        test_refresh_table_metatadata() with the materialized view name as the table. It creates a second cluster object
+        test_refresh_table_metadata() with the materialized view name as the table. It creates a second cluster object
         with schema_event_refresh_window=-1 such that schema refreshes are disabled for schema change push events.
         It then creates a new materialized view , using the first cluster object, and verifies that the materialized view
-        metadata has not changed in the second cluster object. Finally, it calls test_refresh_table_metatadata() with the
+        metadata has not changed in the second cluster object. Finally, it calls test_refresh_table_metadata() with the
         materialized view name as the table name, and verifies that the materialized view metadata is updated in the
         second cluster object.
 
@@ -1077,7 +1078,7 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
 
         for ks in keyspaces:
             self.session.execute(
-                f"CREATE KEYSPACE IF NOT EXISTS {ks} WITH REPLICATION = {{ 'class' : 'SimpleStrategy', 'replication_factor' : 3 }}"
+                f"CREATE KEYSPACE IF NOT EXISTS {ks} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3 }}"
             )
 
         self.cluster.schema_metadata_page_size = 2000
@@ -1138,7 +1139,7 @@ class TestCodeCoverage(unittest.TestCase):
 
         session.execute("""
             CREATE KEYSPACE export_udts
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}
             AND durable_writes = true;
         """)
         session.execute("""
@@ -1162,7 +1163,7 @@ class TestCodeCoverage(unittest.TestCase):
             addresses map<text, frozen<address>>)
         """)
 
-        expected_prefix = """CREATE KEYSPACE export_udts WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}  AND durable_writes = true;
+        expected_prefix = """CREATE KEYSPACE export_udts WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}  AND durable_writes = true;
 
 CREATE TYPE export_udts.street (
     street_number int,
@@ -1196,8 +1197,6 @@ CREATE TABLE export_udts.users (
         cluster.shutdown()
 
     @greaterthancass21
-    @xfail_scylla_version_lt(reason='scylladb/scylladb#10707 - Column name in CREATE INDEX is not quoted',
-                             oss_scylla_version="5.2", ent_scylla_version="2023.1.1")
     def test_case_sensitivity(self):
         """
         Test that names that need to be escaped in CREATE statements are
@@ -1210,10 +1209,9 @@ CREATE TABLE export_udts.users (
         cfname = 'AnInterestingTable'
 
         session.execute("DROP KEYSPACE IF EXISTS {0}".format(ksname))
-        session.execute("""
-            CREATE KEYSPACE "%s"
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}
-            """ % (ksname,))
+        session.execute(
+            ("CREATE KEYSPACE \"%s\" WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}" +
+             get_tablets_disabled_ddl_suffix()) % (ksname,))
         session.execute("""
             CREATE TABLE "%s"."%s" (
                 k int,
@@ -1256,7 +1254,7 @@ CREATE TABLE export_udts.users (
 
         ddl = '''
             CREATE KEYSPACE %s
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '3'}'''
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '3'}'''
         with pytest.raises(AlreadyExists):
             session.execute(ddl % ksname)
 
@@ -1387,7 +1385,7 @@ class KeyspaceAlterMetadata(unittest.TestCase):
         self.session = self.cluster.connect()
         name = self._testMethodName.lower()
         crt_ks = '''
-                CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1} AND durable_writes = true''' % name
+                CREATE KEYSPACE %s WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND durable_writes = true''' % name
         self.session.execute(crt_ks)
 
     def tearDown(self):
@@ -1434,11 +1432,9 @@ class IndexMapTests(unittest.TestCase):
             if cls.keyspace_name in cls.cluster.metadata.keyspaces:
                 cls.session.execute("DROP KEYSPACE %s" % cls.keyspace_name)
 
-            cls.session.execute(
-                """
-                CREATE KEYSPACE %s
-                WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'};
-                """ % cls.keyspace_name)
+            ddl = ("CREATE KEYSPACE %s WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}" +
+                   get_tablets_disabled_ddl_suffix())
+            cls.session.execute(ddl % cls.keyspace_name)
             cls.session.set_keyspace(cls.keyspace_name)
         except Exception:
             cls.cluster.shutdown()
@@ -1540,7 +1536,7 @@ class FunctionTest(unittest.TestCase):
             cls.cluster = TestCluster()
             cls.keyspace_name = cls.__name__.lower()
             cls.session = cls.cluster.connect()
-            cls.session.execute("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}" % cls.keyspace_name)
+            cls.session.execute("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}" % cls.keyspace_name)
             cls.session.set_keyspace(cls.keyspace_name)
             cls.keyspace_function_meta = cls.cluster.metadata.keyspaces[cls.keyspace_name].functions
             cls.keyspace_aggregate_meta = cls.cluster.metadata.keyspaces[cls.keyspace_name].aggregates
@@ -2007,7 +2003,8 @@ class BadMetaTest(unittest.TestCase):
         cls.cluster = TestCluster()
         cls.keyspace_name = cls.__name__.lower()
         cls.session = cls.cluster.connect()
-        cls.session.execute("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}" % cls.keyspace_name)
+        ddl = "CREATE KEYSPACE %s WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}" + get_tablets_disabled_ddl_suffix()
+        cls.session.execute(ddl % cls.keyspace_name)
         cls.session.set_keyspace(cls.keyspace_name)
         connection = cls.cluster.control_connection._connection
 
@@ -2132,6 +2129,13 @@ class DynamicCompositeTypeTest(BasicSharedKeyspaceUnitTestCase):
 @greaterthanorequalcass30
 class MaterializedViewMetadataTestSimple(BasicSharedKeyspaceUnitTestCase):
 
+    @classmethod
+    def create_keyspace(cls, rf):
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}{2}".format(
+            cls.ks_name, rf, get_tablets_disabled_ddl_suffix())
+        execute_with_long_wait_retry(cls.session, ddl)
+
+
     def setUp(self):
         self.session.execute("CREATE TABLE {0}.{1} (pk int PRIMARY KEY, c int)".format(self.keyspace_name, self.function_table_name))
         self.session.execute(
@@ -2219,6 +2223,13 @@ class MaterializedViewMetadataTestSimple(BasicSharedKeyspaceUnitTestCase):
 
 @greaterthanorequalcass30
 class MaterializedViewMetadataTestComplex(BasicSegregatedKeyspaceUnitTestCase):
+
+    @classmethod
+    def create_keyspace(cls, rf):
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}{2}".format(
+            cls.ks_name, rf, get_tablets_disabled_ddl_suffix())
+        execute_with_long_wait_retry(cls.session, ddl)
+
     def test_create_view_metadata(self):
         """
         test to ensure that materialized view metadata is properly constructed
@@ -2378,13 +2389,11 @@ class MaterializedViewMetadataTestComplex(BasicSegregatedKeyspaceUnitTestCase):
         assert "fouls" in score_table.columns
 
         # This is a workaround for mv notifications being separate from base table schema responses.
-        # This maybe fixed with future protocol changes
-        for i in range(10):
-            mv_alltime = self.cluster.metadata.keyspaces[self.keyspace_name].views["alltimehigh"]
-            if("fouls" in mv_alltime.columns):
-                break
-            time.sleep(.2)
-
+        # This maybe fixed with future protocol changes. CI load can push the lag well past a couple
+        # seconds, so poll for up to 30s (see https://github.com/scylladb/python-driver/issues/1020).
+        wait_until(lambda: "fouls" in self.cluster.metadata.keyspaces[self.keyspace_name].views["alltimehigh"].columns,
+                   delay=.5, max_attempts=60)
+        mv_alltime = self.cluster.metadata.keyspaces[self.keyspace_name].views["alltimehigh"]
         assert "fouls" in mv_alltime.columns
 
         mv_alltime_fouls_comumn = self.cluster.metadata.keyspaces[self.keyspace_name].views["alltimehigh"].columns['fouls']
@@ -2434,13 +2443,12 @@ class MaterializedViewMetadataTestComplex(BasicSegregatedKeyspaceUnitTestCase):
         score_column = self.cluster.metadata.keyspaces[self.keyspace_name].tables['scores'].columns['score']
         assert score_column.cql_type == 'blob'
 
-        # until CASSANDRA-9920+CASSANDRA-10500 MV updates are only available later with an async event
-        for i in range(10):
-            score_mv_column = self.cluster.metadata.keyspaces[self.keyspace_name].views["monthlyhigh"].columns['score']
-            if "blob" == score_mv_column.cql_type:
-                break
-            time.sleep(.2)
-
+        # until CASSANDRA-9920+CASSANDRA-10500 MV updates are only available later with an async event.
+        # CI load can push the lag well past a couple seconds, so poll for up to 30s
+        # (see https://github.com/scylladb/python-driver/issues/1020).
+        wait_until(lambda: self.cluster.metadata.keyspaces[self.keyspace_name].views["monthlyhigh"].columns['score'].cql_type == 'blob',
+                   delay=.5, max_attempts=60)
+        score_mv_column = self.cluster.metadata.keyspaces[self.keyspace_name].views["monthlyhigh"].columns['score']
         assert score_mv_column.cql_type == 'blob'
 
     def test_metadata_with_quoted_identifiers(self):

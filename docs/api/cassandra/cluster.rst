@@ -30,6 +30,11 @@ Clusters and Sessions
 
    .. autoattribute:: address_translator
 
+   .. autoattribute:: session_id
+
+   .. autoattribute:: driver_config_reporting_enabled
+      :annotation: = True
+
    .. autoattribute:: metrics_enabled
 
    .. autoattribute:: metrics
@@ -37,6 +42,8 @@ Clusters and Sessions
    .. autoattribute:: ssl_context
 
    .. autoattribute:: ssl_options
+
+   .. autoattribute:: ssl_session_cache
 
    .. autoattribute:: sockopts
 
@@ -47,6 +54,8 @@ Clusters and Sessions
    .. autoattribute:: connection_class
 
    .. autoattribute:: control_connection_timeout
+
+   .. autoattribute:: allow_control_connection_query_fallback
 
    .. autoattribute:: idle_heartbeat_interval
 
@@ -106,6 +115,9 @@ Clusters and Sessions
 
    .. automethod:: set_meta_refresh_enabled
 
+.. autoclass:: ControlConnectionQueryFallback
+   :members:
+
 .. autoclass:: ExecutionProfile (load_balancing_policy=<object object>, retry_policy=None, consistency_level=ConsistencyLevel.LOCAL_ONE, serial_consistency_level=None, request_timeout=10.0, row_factory=<function named_tuple_factory>, speculative_execution_policy=None)
    :members:
    :exclude-members: consistency_level
@@ -159,6 +171,12 @@ Clusters and Sessions
 
    .. automethod:: execute_async(statement[, parameters][, trace][, custom_payload][, paging_state][, host][, execute_as])
 
+   .. automethod:: execute_concurrent(statements_and_parameters[, concurrency][, raise_on_first_error][, results_generator][, execution_profile])
+
+   .. automethod:: execute_concurrent_with_args(statement, parameters, *args, **kwargs)
+
+   .. automethod:: execute_concurrent_async(statements_and_parameters[, concurrency][, raise_on_first_error][, execution_profile])
+
    .. automethod:: execute_graph(statement[, parameters][, trace][, execution_profile=EXEC_PROFILE_GRAPH_DEFAULT][, execute_as])
 
    .. automethod:: execute_graph_async(statement[, parameters][, trace][, execution_profile=EXEC_PROFILE_GRAPH_DEFAULT][, execute_as])
@@ -168,6 +186,8 @@ Clusters and Sessions
    .. automethod:: shutdown()
 
    .. automethod:: set_keyspace(keyspace)
+
+   .. automethod:: wait_for_schema_agreement
 
    .. automethod:: get_execution_profile
 

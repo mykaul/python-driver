@@ -1,14 +1,8 @@
-name: Build and upload to PyPi
+name: Build wheels
 
 on:
   workflow_call:
     inputs:
-      upload:
-        description: 'Upload to PyPI'
-        type: boolean
-        required: false
-        default: false
-
       python-version:
         description: 'Python version to run on'
         type: string
@@ -33,10 +27,17 @@ on:
         required: false
         default: false
 
+      smoke_tests:
+        description: "Minimal import check per wheel instead of the full test suite"
+        type: boolean
+        required: false
+        default: false
+
 jobs:
   prepare-matrix:
     name: "Prepare matrix to run for ${{ inputs.python-version }} on `${{ inputs.target }}`"
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.prepare.outputs.matrix }}
     steps:
@@ -76,6 +77,7 @@ jobs:
   build-wheels:
     name: Build wheels for ${{ matrix.target }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     needs: prepare-matrix
     strategy:
       fail-fast: false
@@ -83,13 +85,17 @@ jobs:
         include: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Checkout tag ${{ inputs.target_tag }}
-        if: inputs.target_tag != ''
-        uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.target_tag }}
+          ref: ${{ inputs.target_tag || github.sha }}
+
+      - name: Set build concurrency to the runner's CPU count
+        shell: bash
+        run: |
+          cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo "${NUMBER_OF_PROCESSORS:-2}")
+          cpus="${cpus:-2}"
+          echo "CASS_DRIVER_BUILD_CONCURRENCY=$cpus" >> "$GITHUB_ENV"
+          echo "Building extensions with concurrency: $cpus"
 
       - name: Disable tests
         if: inputs.ignore_tests
@@ -101,34 +107,62 @@ jobs:
           echo "CIBW_BEFORE_TEST=true" >> $GITHUB_ENV;
           echo "CIBW_BEFORE_TEST_WINDOWS=(exit 0)" >> $GITHUB_ENV;
 
+      - name: Import smoke test only
+        if: inputs.smoke_tests
+        shell: bash
+        env:
+          SMOKE_IMPORT: >-
+            import cassandra, cassandra.cluster, cassandra.protocol,
+            cassandra.connection, cassandra.cqltypes, cassandra.metadata,
+            cassandra.pool, cassandra.query, cassandra.util
+        run: |
+          echo "CIBW_TEST_COMMAND=python -c \"$SMOKE_IMPORT\"" >> $GITHUB_ENV
+          echo "CIBW_TEST_COMMAND_WINDOWS=python -c \"$SMOKE_IMPORT\"" >> $GITHUB_ENV
+          echo "CIBW_TEST_GROUPS=" >> $GITHUB_ENV
+          echo "CIBW_TEST_EXTRAS=" >> $GITHUB_ENV
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: ${{ inputs.python-version }}
+          enable-cache: true
 
       - name: Install cibuildwheel
+        if: runner.os != 'Windows'
         run: |
-          uv tool install 'cibuildwheel==3.2.1'
+          uv tool install 'cibuildwheel==4.2.1'
 
-      - name: Install OpenSSL for Windows
+      - name: Install cibuildwheel with PyPy 8 support
         if: runner.os == 'Windows'
         run: |
-          choco install openssl.light --no-progress -y
+          # Pin pypa/cibuildwheel#2998 until it reaches a release after 4.2.1.
+          uv tool install 'cibuildwheel @ git+https://github.com/pypa/cibuildwheel.git@088b48b1989e2aa802b5ca7889f85892f2280428'
+          # The upstream pin also adds PyPy 3.12, whose dependencies do not
+          # publish compatible Windows wheels yet. Preserve the current set.
+          echo "CIBW_BUILD=cp3* pp311*" >> "$env:GITHUB_ENV"
+
+      - name: Cache Conan
+        if: runner.os == 'Windows'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.conan2
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.py') }}
+          restore-keys: conan-${{ runner.os }}-
 
       - name: Install Conan
         if: runner.os == 'Windows'
-        uses: turtlebrowser/get-conan@main
+        uses: turtlebrowser/get-conan@c171f295f3f507360ee018736a6608731aa2109d # v1.2
 
       - name: Configure libev for Windows
         if: runner.os == 'Windows'
         run: |
-          conan profile detect
+          conan profile detect --force
           conan install conanfile.py
 
-      - name: Install libev for MacOS
+      - name: Install libev and lz4 for MacOS
         if: runner.os == 'MacOs'
         run: |
-          brew install libev
+          brew install libev lz4
 
       - name: Overwrite for MacOS
         if: runner.os == 'MacOS'
@@ -146,14 +180,14 @@ jobs:
         if: matrix.target != 'linux-aarch64'
         shell: bash
         run: |
-          GITHUB_WORKFLOW_REF="scylladb/python-driver/.github/workflows/lib-build-and-push.yml@refs/heads/master" cibuildwheel --output-dir wheelhouse
+          cibuildwheel --output-dir wheelhouse
 
       - name: Build wheels for linux aarch64
         if: matrix.target == 'linux-aarch64'
         run: |
-          GITHUB_WORKFLOW_REF="scylladb/python-driver/.github/workflows/lib-build-and-push.yml@refs/heads/master" CIBW_BUILD="cp3*" cibuildwheel --archs aarch64 --output-dir wheelhouse
+          CIBW_BUILD="cp3*" cibuildwheel --archs aarch64 --output-dir wheelhouse
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-${{ matrix.target }}-${{ matrix.os }}
           path: ./wheelhouse/*.whl
@@ -161,35 +195,22 @@ jobs:
   build-sdist:
     name: Build source distribution
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.target_tag || github.sha }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: ${{ inputs.python-version }}
+          enable-cache: true
 
       - name: Build sdist
         run: uv build --sdist
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: source-dist
           path: dist/*.tar.gz
-
-  upload_pypi:
-    if: inputs.upload
-    needs: [build-wheels, build-sdist]
-    runs-on: ubuntu-24.04
-    permissions:
-      id-token: write
-
-    steps:
-      - uses: actions/download-artifact@v7
-        with:
-          path: dist
-          merge-multiple: true
-
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true

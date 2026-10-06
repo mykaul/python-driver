@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest
 
 from cassandra import ConsistencyLevel
 from cassandra.cqlengine import operators
@@ -22,12 +21,12 @@ from cassandra.cqlengine.query import ResultObject
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.cqlengine import models
 
-from tests.integration.cqlengine import setup_connection, execute_count
+from tests.integration.cqlengine import execute_count
 from tests.integration.cqlengine.base import BaseCassEngTestCase
 from tests.integration.cqlengine.query.test_queryset import BaseQuerySetUsage
 
 
-from tests.integration import BasicSharedKeyspaceUnitTestCase, greaterthanorequalcass30, requires_collection_indexes
+from tests.integration import BasicSharedKeyspaceUnitTestCase, greaterthanorequalcass30, requires_collection_indexes, get_tablets_disabled_ddl_suffix, execute_with_long_wait_retry
 import pytest
 
 
@@ -279,6 +278,12 @@ class TestQuerySetCountSelectionAndIteration(BaseQuerySetUsage):
 
 
 class TestNamedWithMV(BasicSharedKeyspaceUnitTestCase):
+
+    @classmethod
+    def create_keyspace(cls, rf):
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}{2}".format(
+            cls.ks_name, rf, get_tablets_disabled_ddl_suffix())
+        execute_with_long_wait_retry(cls.session, ddl)
 
     @classmethod
     def setUpClass(cls):

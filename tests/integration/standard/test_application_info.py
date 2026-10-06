@@ -15,7 +15,8 @@
 import unittest
 
 from cassandra.application_info import ApplicationInfo
-from tests.integration import TestCluster, use_single_node, remove_cluster, xfail_scylla_version_lt
+from tests.integration import (TestCluster, get_client_options, use_single_node, remove_cluster,
+                               xfail_scylla_version_lt)
 
 
 def setup_module():
@@ -27,7 +28,7 @@ def teardown_module():
 
 
 @xfail_scylla_version_lt(reason='scylladb/scylla-enterprise#5467 - system.client_options is not yet supported',
-                             oss_scylla_version="7.0", ent_scylla_version="2026.1.0")
+                         scylla_version="2026.1.0")
 class ApplicationInfoTest(unittest.TestCase):
     attribute_to_startup_key = {
         'application_name': 'APPLICATION_NAME',
@@ -77,22 +78,15 @@ class ApplicationInfoTest(unittest.TestCase):
                     found = False
                     session = cluster.connect()
 
-                    try:
-                        rows = list(session.execute("SELECT client_options FROM system.clients"))
-                    except Exception:
-                        rows = list(session.execute("SELECT client_options FROM system_views.clients"))
-
-                    for row in rows:
-                        if not row[0]:
-                            continue
+                    for client_options in get_client_options(session):
                         for attribute_key, startup_key in self.attribute_to_startup_key.items():
                             expected_value = application_info_args.get(attribute_key)
                             if expected_value:
-                                if row[0].get(startup_key) != expected_value:
+                                if client_options.get(startup_key) != expected_value:
                                     break
                             else:
                                 # Check that it is absent
-                                if row[0].get(startup_key, None) is not None:
+                                if client_options.get(startup_key, None) is not None:
                                     break
                         else:
                             found = True

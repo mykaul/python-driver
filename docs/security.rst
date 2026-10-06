@@ -65,14 +65,70 @@ keystore files with these instructions:
 
 * `Scylla TLS/SSL Guide <https://opensource.docs.scylladb.com/stable/operating-scylla/security/client-node-encryption.html>`_
 
-SSL with Twisted or Eventlet
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Twisted and Eventlet both use an alternative SSL implementation called pyOpenSSL, so if your `Cluster`'s connection class is
-:class:`~cassandra.io.twistedreactor.TwistedConnection` or :class:`~cassandra.io.eventletreactor.EventletConnection`, you must pass a
-`pyOpenSSL context <https://www.pyopenssl.org/en/stable/api/ssl.html#context-objects>`_ instead.
-An example is provided in these docs, and more details can be found in the
-`documentation <https://www.pyopenssl.org/en/stable/api/ssl.html#context-objects>`_.
-pyOpenSSL is not installed by the driver and must be installed separately.
+TLS Session Resumption
+^^^^^^^^^^^^^^^^^^^^^^
+A shard-aware driver opens one connection per shard to every node, and a full
+TLS handshake on each is the expensive part of that. Whenever
+:attr:`.Cluster.ssl_context` is set, the driver caches the TLS session each
+connection establishes and offers it on the next one, so the connections that
+follow resume instead of handshaking in full. This is on by default and needs no
+configuration.
+
+There is one thing to weigh before leaving it on. A resumed handshake carries
+no Certificate message, so nothing about the server's certificate is checked
+again while a cached session is being offered -- not its expiry, and not a
+revocation list the ``SSLContext`` carries. A certificate that expires or is
+revoked goes on being accepted by connections that resume, until the cached
+entry goes: that is the lifetime the server announced with the ticket, which
+the driver caps at seven days. Connections that handshake in full verify as
+they always have. The hostname is not re-checked either, which is why the
+driver keys each cached session by the name verified when it was established,
+so a session is never offered to a connection expecting a different one. Where
+that window is not acceptable, turn resumption off with
+``ssl_session_cache=None``.
+
+It does need the server to issue something to resume from. Scylla sends session
+tickets only when ``enable_session_tickets`` is set in its
+``client_encryption_options``, which defaults to true from Scylla 2026.3 and to
+false in the releases before it:
+
+.. code-block:: yaml
+
+    client_encryption_options:
+        enabled: true
+        certificate: /path/to/scylla.crt
+        keyfile: /path/to/scylla.key
+        enable_session_tickets: true
+
+Without that, nothing resumes and every connection performs a full handshake, as
+it did before.
+
+Resumption also needs a reactor that can offer a session before the handshake
+begins: the ``libev`` reactor, and ``asyncore`` on the Python versions that still
+ship it, which is up to 3.11. The ``asyncio`` reactor performs its handshake
+inside ``loop.create_connection()``, leaving no point at which to restore a
+session, so resumption is unavailable there -- worth knowing, because that is the
+default reactor on Python 3.12 and newer when the libev extension is not
+installed. It is unavailable too with the deprecated
+:attr:`.Cluster.ssl_options`-only configuration below, since each of those
+connections builds its own ``SSLContext`` and a session cannot be replayed onto a
+different one.
+
+Where resumption is unavailable, no cache is created and
+:attr:`.Cluster.ssl_session_cache` reads as ``None``; asking for one anyway is
+reported when :meth:`.Cluster.connect` is called. To turn resumption off, or to
+size the cache or share it between clusters, see
+:attr:`.Cluster.ssl_session_cache`:
+
+.. code-block:: python
+
+    from cassandra.cluster import Cluster
+    from cassandra.ssl_session_cache import SSLSessionCache
+
+    cluster = Cluster(ssl_context=ssl_context, ssl_session_cache=None)
+
+    cluster = Cluster(ssl_context=ssl_context,
+                      ssl_session_cache=SSLSessionCache(max_size=64))
 
 SSL Configuration Examples
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -246,32 +302,6 @@ The following driver code specifies that the connection should use two-way verif
 The driver uses ``SSLContext`` directly to give you many other options in configuring SSL. Consider reading the `Python SSL documentation <https://docs.python.org/library/ssl.html#ssl.SSLContext>`__
 for more details about ``SSLContext`` configuration.
 
-**Server verifies client and client verifies server using Twisted and pyOpenSSL**
-
-.. code-block:: python
-
-    from OpenSSL import SSL, crypto
-    from cassandra.cluster import Cluster
-    from cassandra.io.twistedreactor import TwistedConnection
-
-    ssl_context = SSL.Context(SSL.TLSv1_2_METHOD)
-    ssl_context.set_verify(SSL.VERIFY_PEER, callback=lambda _1, _2, _3, _4, ok: ok)
-    ssl_context.use_certificate_file('/path/to/client.crt_signed')
-    ssl_context.use_privatekey_file('/path/to/client.key')
-    ssl_context.load_verify_locations('/path/to/rootca.crt')
-
-    cluster = Cluster(
-        contact_points=['127.0.0.1'],
-        connection_class=TwistedConnection,
-        ssl_context=ssl_context,
-        ssl_options={'check_hostname': True}
-    )
-    session = cluster.connect()
-
-
-Connecting using Eventlet would look similar except instead of importing and using ``TwistedConnection``, you would
-import and use ``EventletConnection``, including the appropriate monkey-patching.
-
 Versions 3.16.0 and lower
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -303,8 +333,3 @@ This is only an example to show how to pass the ssl parameters. Consider reading
 the `python ssl documentation <https://docs.python.org/3/library/ssl.html#ssl.wrap_socket>`__ for
 your configuration.
 
-SSL with Twisted
-++++++++++++++++
-
-In case the twisted event loop is used pyOpenSSL must be installed or an exception will be risen. Also
-to set the ``ssl_version`` and ``cert_reqs`` in ``ssl_opts`` the appropriate constants from pyOpenSSL are expected.

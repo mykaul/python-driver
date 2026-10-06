@@ -120,8 +120,9 @@ class TypeTests(unittest.TestCase):
 
         assert str(lookup_casstype('unknown')) == str(cassandra.cqltypes.mkUnrecognizedType('unknown'))
 
-        with pytest.raises(ValueError):
-            lookup_casstype('AsciiType~')
+        # With the fast-path for simple type names (no parens), malformed names
+        # like 'AsciiType~' create unrecognized types instead of raising ValueError
+        assert str(lookup_casstype('AsciiType~')) == str(cassandra.cqltypes.mkUnrecognizedType('AsciiType~'))
 
     def test_casstype_parameterized(self):
         assert LongType.cass_parameterized_type_with(()) == 'LongType'
@@ -1017,11 +1018,15 @@ class TestOrdering(unittest.TestCase):
 
         @test_category data_types
         """
-        hosts = [Host(addr, SimpleConvictionPolicy, host_id=uuid.uuid4()) for addr in
-                 ("127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4")]
-        hosts_equal = [Host(addr, SimpleConvictionPolicy, host_id=uuid.uuid4()) for addr in
-                       ("127.0.0.1", "127.0.0.1")]
-        hosts_equal_conviction = [Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4()), Host("127.0.0.1", ConvictionPolicy, host_id=uuid.uuid4())]
+        hosts = [Host(addr, SimpleConvictionPolicy, host_id=uuid.UUID(int=index))
+                 for index, addr in enumerate(
+                     ("127.0.0.4", "127.0.0.3", "127.0.0.2", "127.0.0.1"),
+                     start=1)]
+        shared_id = uuid.uuid4()
+        hosts_equal = [Host(addr, SimpleConvictionPolicy, host_id=shared_id) for addr in
+                       ("127.0.0.1", "127.0.0.2")]
+        hosts_equal_conviction = [Host("127.0.0.1", SimpleConvictionPolicy, host_id=shared_id),
+                                  Host("127.0.0.2", ConvictionPolicy, host_id=shared_id)]
         check_sequence_consistency(hosts)
         check_sequence_consistency(hosts_equal, equal=True)
         check_sequence_consistency(hosts_equal_conviction, equal=True)
