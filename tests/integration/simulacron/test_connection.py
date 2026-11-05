@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import unittest
 
 import logging
 import time
@@ -23,19 +22,20 @@ from cassandra.cluster import (EXEC_PROFILE_DEFAULT, Cluster, ExecutionProfile,
 from cassandra.policies import HostStateListener, RoundRobinPolicy, WhiteListRoundRobinPolicy
 
 from tests import connection_class, thread_pool_executor_class
-from tests.util import late
+from tests.util import late, wait_until_not_raised
 from tests.integration import requiressimulacron, libevtest
 from tests.integration.util import assert_quiescent_pool_state
 # important to import the patch PROTOCOL_VERSION from the simulacron module
 from tests.integration.simulacron import SimulacronBase, PROTOCOL_VERSION
-from cassandra.connection import DEFAULT_CQL_VERSION, Connection
+from cassandra.connection import Connection
 from tests.unit.cython.utils import cythontest
 from tests.integration.simulacron.utils import (NO_THEN, PrimeOptions,
                                                 prime_query, prime_request,
                                                 start_and_prime_cluster_defaults,
                                                 start_and_prime_singledc,
                                                 clear_queries, RejectConnections,
-                                                RejectType, AcceptConnections, PauseReads, ResumeReads)
+                                                RejectType, AcceptConnections, PauseReads, ResumeReads,
+                                                CQL_VERSION)
 import pytest
 
 
@@ -81,7 +81,7 @@ def _send_options_message(self):
     test to avoid a condition where the CC tries to reconnect in the executor but can't
     since we prime that message."""
     self._compressor = None
-    self.cql_version = DEFAULT_CQL_VERSION
+    self.cql_version = CQL_VERSION
     self._send_startup_message(no_compact=self.no_compact)
 
 
@@ -225,7 +225,7 @@ class ConnectionTests(SimulacronBase):
             # Send always to same host
             def make_query_plan(self, working_keyspace=None, query=None):
                 if query and query.query_string == query_to_prime:
-                    return filter(lambda h: h == query_host, self._live_hosts)
+                    return filter(lambda h: h.address == query_host, self._live_hosts)
                 else:
                     return super(PatchedRoundRobinPolicy, self).make_query_plan()
 
@@ -356,13 +356,15 @@ class ConnectionTests(SimulacronBase):
         for _ in range(10):
             session.execute(query_to_prime)
 
-        # Might take some time to close the previous connections and reconnect
-        time.sleep(10)
-        assert_quiescent_pool_state(cluster)
+        # Wait for previous connections to close and pool to stabilize
+        wait_until_not_raised(
+            lambda: assert_quiescent_pool_state(cluster),
+            delay=1, max_attempts=30)
         clear_queries()
 
-        time.sleep(10)
-        assert_quiescent_pool_state(cluster)
+        wait_until_not_raised(
+            lambda: assert_quiescent_pool_state(cluster),
+            delay=1, max_attempts=30)
 
     def test_idle_connection_is_not_closed(self):
         """

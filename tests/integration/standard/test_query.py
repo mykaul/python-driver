@@ -19,21 +19,24 @@ import unittest
 import logging
 import pytest
 from cassandra import ProtocolVersion
-from cassandra import ConsistencyLevel, Unavailable, InvalidRequest, cluster
+from cassandra import ConsistencyLevel, Unavailable, InvalidRequest, WriteTimeout, WriteFailure, cluster
+from cassandra.protocol import SyntaxException
 from cassandra.query import (PreparedStatement, BoundStatement, SimpleStatement,
                              BatchStatement, BatchType, dict_factory, TraceUnavailable)
 from cassandra.cluster import NoHostAvailable, ExecutionProfile, EXEC_PROFILE_DEFAULT, Cluster
-from cassandra.policies import HostDistance, RoundRobinPolicy, WhiteListRoundRobinPolicy
+from cassandra.policies import RoundRobinPolicy, WhiteListRoundRobinPolicy
 from tests.integration import use_singledc, PROTOCOL_VERSION, BasicSharedKeyspaceUnitTestCase, \
     greaterthanprotocolv3, MockLoggingHandler, get_supported_protocol_versions, local, get_cluster, setup_keyspace, \
-    USE_CASS_EXTERNAL, greaterthanorequalcass40, TestCluster, xfail_scylla
+    greaterthanorequalcass40, TestCluster, xfail_scylla, xfail_scylla_version_lt, \
+    get_tablets_disabled_ddl_suffix, execute_with_long_wait_retry
 from tests import notwindows
 from tests.integration import greaterthanorequalcass30, get_node
-from tests.util import assertListEqual
+from tests.util import assertListEqual, wait_until
 
 import time
 import random
 import re
+import uuid
 
 from unittest import mock
 
@@ -42,17 +45,57 @@ log = logging.getLogger(__name__)
 
 
 def setup_module():
-    if not USE_CASS_EXTERNAL:
-        use_singledc(start=False)
-        ccm_cluster = get_cluster()
-        ccm_cluster.stop()
-        # This is necessary because test_too_many_statements may
-        # timeout otherwise
-        config_options = {'write_request_timeout_in_ms': '20000'}
-        ccm_cluster.set_configuration_options(config_options)
-        ccm_cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
+    use_singledc(start=False)
+    ccm_cluster = get_cluster()
+    ccm_cluster.stop()
+    # This is necessary because test_too_many_statements may
+    # timeout otherwise
+    config_options = {'write_request_timeout_in_ms': '20000'}
+    ccm_cluster.set_configuration_options(config_options)
+    ccm_cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
 
     setup_keyspace()
+
+
+class SelectWithoutFromTests(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cluster = TestCluster()
+        cls.addClassCleanup(cls.cluster.shutdown)
+        cls.session = cls.cluster.connect()
+        try:
+            cls.session.execute("SELECT 1")
+        except SyntaxException:
+            raise unittest.SkipTest("Server does not support SELECT without FROM")
+
+    def check_result(self, result, selector):
+        assert self.session.keyspace is None
+        assert result.column_names == (["1"] if selector == "1" else ["system.now()"])
+        rows = list(result)
+        assert len(rows) == 1
+        assert len(rows[0]) == 1
+        if selector == "1":
+            assert result.column_types[0].typename == 'int'
+            assert type(rows[0][0]) is int
+            assert rows[0][0] == 1
+        else:
+            assert result.column_types[0].typename == 'timeuuid'
+            assert isinstance(rows[0][0], uuid.UUID)
+            assert rows[0][0].version == 1
+
+    def test_simple(self):
+        for selector in ("1", "now()"):
+            with self.subTest(selector=selector):
+                result = self.session.execute(SimpleStatement("SELECT " + selector))
+                self.check_result(result, selector)
+
+    def test_prepared(self):
+        for selector in ("1", "now()"):
+            with self.subTest(selector=selector):
+                prepared = self.session.prepare("SELECT " + selector)
+                result = self.session.execute(prepared.bind(()))
+                self.check_result(result, selector)
 
 
 class QueryTests(BasicSharedKeyspaceUnitTestCase):
@@ -804,6 +847,9 @@ class SerialConsistencyTests(unittest.TestCase):
     def tearDown(self):
         self.cluster.shutdown()
 
+    @xfail_scylla_version_lt(reason='scylladb/scylladb#18068 - LWT is not yet supported with tablets',
+                             scylla_version='2025.4',
+                             raises=InvalidRequest)
     def test_conditional_update(self):
         self.session.execute("INSERT INTO test3rf.test (k, v) VALUES (0, 0)")
         statement = SimpleStatement(
@@ -828,6 +874,9 @@ class SerialConsistencyTests(unittest.TestCase):
         assert result
         assert result.one().applied
 
+    @xfail_scylla_version_lt(reason='scylladb/scylladb#18068 - LWT is not yet supported with tablets',
+                             scylla_version='2025.4',
+                             raises=InvalidRequest)
     def test_conditional_update_with_prepared_statements(self):
         self.session.execute("INSERT INTO test3rf.test (k, v) VALUES (0, 0)")
         statement = self.session.prepare(
@@ -850,6 +899,9 @@ class SerialConsistencyTests(unittest.TestCase):
         assert result
         assert result.one().applied
 
+    @xfail_scylla_version_lt(reason='scylladb/scylladb#18068 - LWT is not yet supported with tablets',
+                             scylla_version='2025.4',
+                             raises=InvalidRequest)
     def test_conditional_update_with_batch_statements(self):
         self.session.execute("INSERT INTO test3rf.test (k, v) VALUES (0, 0)")
         statement = BatchStatement(serial_consistency_level=ConsistencyLevel.SERIAL)
@@ -911,14 +963,29 @@ class LightweightTransactionTests(unittest.TestCase):
         """
         Shutdown cluster
         """
-        self.session.execute("DROP TABLE test3rf.lwt")
-        self.session.execute("DROP TABLE test3rf.lwt_clustering")
+        self.session.execute("DROP TABLE IF EXISTS test3rf.lwt")
+        self.session.execute("DROP TABLE IF EXISTS test3rf.lwt_clustering")
         self.cluster.shutdown()
 
+    @xfail_scylla_version_lt(reason='scylladb/scylladb#18068 - LWT is not yet supported with tablets',
+                             scylla_version='2025.4',
+                             raises=pytest.fail.Exception)
     def test_no_connection_refused_on_timeout(self):
         """
         Test for PYTHON-91 "Connection closed after LWT timeout"
         Verifies that connection to the cluster is not shut down when timeout occurs.
+
+        Fires a large batch of concurrent, conflicting LWT statements at the
+        server -- the same genuine contention used to reproduce PYTHON-91 --
+        so that a real WriteTimeout/WriteFailure response (including its CAS
+        write_type) is parsed by the driver whenever the cluster is slow
+        enough to produce one. Whether that actually happens is inherently
+        non-deterministic (it depends on cluster load/scheduling), so unlike
+        the original version of this test we do not hard-assert on it -- that
+        assertion was the source of the flakiness. Instead, a single LWT sent
+        while two of the three replicas are paused deterministically produces
+        a WriteTimeout, and the session must still be usable afterwards.
+
         Number of iterations can be specified with LWT_ITERATIONS environment variable.
         Default value is 1000
         """
@@ -934,6 +1001,7 @@ class LightweightTransactionTests(unittest.TestCase):
             statements_and_params.append((delete_statement, ()))
 
         received_timeout = False
+        received_client_timeout = False
         results = execute_concurrent(self.session, statements_and_params, raise_on_first_error=False)
         for (success, result) in results:
             if success:
@@ -942,16 +1010,48 @@ class LightweightTransactionTests(unittest.TestCase):
                 # In this case result is an exception
                 exception_type = type(result).__name__
                 if exception_type == "NoHostAvailable":
-                    pytest.fail("PYTHON-91: Disconnected from Cassandra: %s" % result.message)
-                if exception_type in ["WriteTimeout", "WriteFailure", "ReadTimeout", "ReadFailure", "ErrorMessageSub"]:
-                    if type(result).__name__ in ["WriteTimeout", "WriteFailure"]:
+                    pytest.fail("PYTHON-91: Disconnected from Cassandra: %s" % result)
+                if exception_type in ["WriteTimeout", "WriteFailure", "ReadTimeout", "ReadFailure",
+                                       "ErrorMessageSub", "OperationTimedOut"]:
+                    if exception_type in ["WriteTimeout", "WriteFailure"]:
                         received_timeout = True
+                    elif exception_type == "OperationTimedOut":
+                        # Client-side timeout only -- doesn't imply the server
+                        # actually returned a WriteTimeout/WriteFailure.
+                        received_client_timeout = True
                     continue
 
-                pytest.fail("Unexpected exception %s: %s" % (exception_type, result.message))
+                pytest.fail("Unexpected exception %s: %s" % (exception_type, result))
 
-        # Make sure test passed
-        assert received_timeout
+        if not received_timeout:
+            # The cluster handled every op without a server-side timeout this
+            # run -- that's fine (this is what actually caused the original
+            # flakiness when it was a hard assertion), just note it so the
+            # timeout path not being exercised is visible without failing the test.
+            log.warning("LWT stress of %d iterations completed without inducing a "
+                        "WriteTimeout/WriteFailure (client-side OperationTimedOut: %s) "
+                        "-- server timeout path not exercised this run.",
+                        iterations, received_client_timeout)
+
+        # Deterministic server-side timeout: with 2 of 3 replicas frozen, Paxos can't reach quorum.
+        coordinator = next(h for h in self.cluster.metadata.all_hosts() if h.address == '127.0.0.1')
+        frozen = []
+        try:
+            for node in (get_node(2), get_node(3)):
+                node.pause()
+                frozen.append(node)
+            with pytest.raises((WriteTimeout, WriteFailure)):
+                self.session.execute("INSERT INTO test3rf.lwt (k, v) VALUES (1, 1) IF NOT EXISTS",
+                                     host=coordinator, timeout=30)
+        finally:
+            for node in frozen:
+                node.resume()
+
+        # The actual PYTHON-91 regression check: can we still talk to the cluster?
+        try:
+            self.session.execute("SELECT key FROM system.local", host=coordinator)
+        except NoHostAvailable:
+            pytest.fail("PYTHON-91: Connection to cluster was lost after LWT timeout stress")
 
     @xfail_scylla('Fails on Scylla with error `SERIAL/LOCAL_SERIAL consistency may only be requested for one partition at a time`')
     def test_was_applied_batch_stmt(self):
@@ -1156,6 +1256,12 @@ class BatchStatementDefaultRoutingKeyTests(unittest.TestCase):
 @greaterthanorequalcass30
 class MaterializedViewQueryTest(BasicSharedKeyspaceUnitTestCase):
 
+    @classmethod
+    def create_keyspace(cls, rf):
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}{2}".format(
+            cls.ks_name, rf, get_tablets_disabled_ddl_suffix())
+        execute_with_long_wait_retry(cls.session, ddl)
+
     def test_mv_filtering(self):
         """
         Test to ensure that cql filtering where clauses are properly supported in the python driver.
@@ -1359,12 +1465,12 @@ class BaseKeyspaceTests():
         cls.table_name = "table_query_keyspace_tests"
 
         ddl = """CREATE KEYSPACE {0} WITH replication =
-                        {{'class': 'SimpleStrategy',
+                        {{'class': 'NetworkTopologyStrategy',
                         'replication_factor': '{1}'}}""".format(cls.ks_name, 1)
         cls.session.execute(ddl)
 
         ddl = """CREATE KEYSPACE {0} WITH replication =
-                                {{'class': 'SimpleStrategy',
+                                {{'class': 'NetworkTopologyStrategy',
                                 'replication_factor': '{1}'}}""".format(cls.alternative_ks, 1)
         cls.session.execute(ddl)
 
@@ -1571,9 +1677,10 @@ class PreparedWithKeyspaceTests(BaseKeyspaceTests, unittest.TestCase):
 
             get_node(1).start(wait_for_binary_proto=True, wait_other_notice=True)
 
-            # We wait for cluster._prepare_all_queries to be called
-            time.sleep(5)
-            assert 1 == mock_handler.get_message_count('debug', 'Preparing all known prepared statements')
+            # Wait for cluster._prepare_all_queries to be called
+            wait_until(
+                lambda: mock_handler.get_message_count('debug', 'Preparing all known prepared statements') >= 1,
+                delay=0.5, max_attempts=20)
 
             results = self.session.execute(prepared_statement, (1,), execution_profile="only_first")
             assert results.one() == (1, )

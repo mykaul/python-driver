@@ -1,0 +1,221 @@
+name: Build wheels
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to run on'
+        type: string
+        required: false
+        default: "3.13"
+
+      target:
+        description: "Target os to build for: linux,macos,windows"
+        type: string
+        required: false
+        default: "linux,macos-x86,macos-arm,windows,linux-aarch64"
+
+      target_tag:
+        description: "Publish particular tag"
+        type: string
+        required: false
+        default: ""
+
+      ignore_tests:
+        description: "Don't run tests"
+        type: boolean
+        required: false
+        default: false
+
+      smoke_tests:
+        description: "Minimal import check per wheel instead of the full test suite"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  prepare-matrix:
+    name: "Prepare matrix to run for ${{ inputs.python-version }} on `${{ inputs.target }}`"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+    steps:
+      - name: Prepare matrix json from input matrix list
+        id: prepare
+        run: |
+          echo -n "[" > /tmp/matrix.json
+          was_added=""
+          for target in $(echo "${{ inputs.target }}" | tr -d " " | tr "," "\n")
+          do
+           if [[ "${target}" == "linux" ]]; then
+             [ -n "$was_added" ] && echo -n ","  >> /tmp/matrix.json
+             echo -n '{"os":"ubuntu-24.04", "target": "linux"}' >> /tmp/matrix.json
+             was_added=1
+           elif [[ "${target}" == "linux-aarch64" ]]; then
+             [ -n "$was_added" ] && echo -n ","  >> /tmp/matrix.json
+             echo -n  '{"os":"ubuntu-24.04-arm", "target": "linux-aarch64"}' >> /tmp/matrix.json
+             was_added=1
+           elif [[ "${target}" == "windows" ]]; then
+             [ -n "$was_added" ] && echo -n ","  >> /tmp/matrix.json
+             echo -n  '{"os":"windows-2022", "target": "windows"}' >> /tmp/matrix.json
+             was_added=1
+           elif [[ "${target}" == "macos-x86" ]]; then
+             [ -n "$was_added" ] && echo -n ","  >> /tmp/matrix.json
+             echo -n  '{"os":"macos-15-intel", "target": "macos-x86"}' >> /tmp/matrix.json
+             was_added=1
+           elif [[ "${target}" == "macos-arm" ]]; then
+             [ -n "$was_added" ] && echo -n ","  >> /tmp/matrix.json
+             echo -n  '{"os":"macos-15", "target": "macos-arm"}' >> /tmp/matrix.json
+             was_added=1
+           fi
+          done
+          echo -n "]" >> /tmp/matrix.json
+          echo -e "Resulted matrix json:\n$(cat /tmp/matrix.json)"
+          echo "matrix=$(cat /tmp/matrix.json)" >> $GITHUB_OUTPUT
+
+  build-wheels:
+    name: Build wheels for ${{ matrix.target }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.target_tag || github.sha }}
+
+      - name: Set build concurrency to the runner's CPU count
+        shell: bash
+        run: |
+          cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo "${NUMBER_OF_PROCESSORS:-2}")
+          cpus="${cpus:-2}"
+          echo "CASS_DRIVER_BUILD_CONCURRENCY=$cpus" >> "$GITHUB_ENV"
+          echo "Building extensions with concurrency: $cpus"
+
+      - name: Disable tests
+        if: inputs.ignore_tests
+        shell: bash
+        run: |
+          echo "CIBW_TEST_COMMAND=true" >> $GITHUB_ENV;
+          echo "CIBW_TEST_COMMAND_WINDOWS=(exit 0)" >> $GITHUB_ENV;
+          echo "CIBW_TEST_SKIP=*" >> $GITHUB_ENV;
+          echo "CIBW_BEFORE_TEST=true" >> $GITHUB_ENV;
+          echo "CIBW_BEFORE_TEST_WINDOWS=(exit 0)" >> $GITHUB_ENV;
+
+      - name: Import smoke test only
+        if: inputs.smoke_tests
+        shell: bash
+        env:
+          SMOKE_IMPORT: >-
+            import importlib.util;
+            assert importlib.util.find_spec('numpy') is not None;
+            import cassandra, cassandra.cluster, cassandra.protocol,
+            cassandra.connection, cassandra.cqltypes, cassandra.metadata,
+            cassandra.pool, cassandra.query, cassandra.util;
+            import sys;
+            assert 'numpy' not in sys.modules;
+            assert 'cassandra.numpy_parser' not in sys.modules
+          # On CPython the libev extension must be present, so the real-socket
+          # regression for #501 below cannot pass by skipping.
+          LIBEV_IMPORT: >-
+            import sys;
+            sys.implementation.name != 'cpython' or __import__('cassandra.io.libevwrapper')
+        run: |
+          echo "CIBW_TEST_COMMAND=python -c \"$SMOKE_IMPORT\"" >> $GITHUB_ENV
+          echo "CIBW_TEST_COMMAND_WINDOWS=python -c \"$SMOKE_IMPORT\" && python -c \"$LIBEV_IMPORT\" && pytest --import-mode=append {project}/tests/unit/io/test_libevreactor.py -v -k LibevRealSocketTest" >> $GITHUB_ENV
+          echo "CIBW_TEST_GROUPS=" >> $GITHUB_ENV
+          echo "CIBW_TEST_EXTRAS=" >> $GITHUB_ENV
+          echo "CIBW_TEST_REQUIRES=numpy" >> $GITHUB_ENV
+          echo "CIBW_TEST_REQUIRES_WINDOWS=numpy pytest" >> $GITHUB_ENV
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          enable-cache: true
+
+      - name: Install cibuildwheel
+        if: runner.os != 'Windows'
+        run: |
+          uv tool install 'cibuildwheel==4.2.1'
+
+      - name: Install cibuildwheel with PyPy 8 support
+        if: runner.os == 'Windows'
+        run: |
+          # Pin pypa/cibuildwheel#2998 until it reaches a release after 4.2.1.
+          uv tool install 'cibuildwheel @ git+https://github.com/pypa/cibuildwheel.git@088b48b1989e2aa802b5ca7889f85892f2280428'
+          # The upstream pin also adds PyPy 3.12, whose dependencies do not
+          # publish compatible Windows wheels yet. Preserve the current set.
+          echo "CIBW_BUILD=cp3* pp311*" >> "$env:GITHUB_ENV"
+
+      - name: Cache Conan
+        if: runner.os == 'Windows'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.conan2
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.py') }}
+          restore-keys: conan-${{ runner.os }}-
+
+      - name: Install Conan
+        if: runner.os == 'Windows'
+        uses: turtlebrowser/get-conan@c171f295f3f507360ee018736a6608731aa2109d # v1.2
+
+      - name: Configure libev for Windows
+        if: runner.os == 'Windows'
+        run: |
+          conan profile detect --force
+          conan install conanfile.py
+
+      - name: Install libev and lz4 for MacOS
+        if: runner.os == 'MacOs'
+        run: |
+          brew install libev lz4
+
+      - name: Overwrite for MacOS
+        if: runner.os == 'MacOS'
+        run: |
+          echo "MACOSX_DEPLOYMENT_TARGET=15.0" >> "$GITHUB_ENV"
+
+      - name: Build wheels
+        if: matrix.target != 'linux-aarch64'
+        shell: bash
+        run: |
+          cibuildwheel --output-dir wheelhouse
+
+      - name: Build wheels for linux aarch64
+        if: matrix.target == 'linux-aarch64'
+        run: |
+          CIBW_BUILD="cp3*" cibuildwheel --archs aarch64 --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-${{ matrix.target }}-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.target_tag || github.sha }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          enable-cache: true
+
+      - name: Build sdist
+        run: uv build --sdist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: source-dist
+          path: dist/*.tar.gz

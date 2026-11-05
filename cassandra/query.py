@@ -29,6 +29,7 @@ from cassandra import ConsistencyLevel, OperationTimedOut
 from cassandra.util import unix_time_from_uuid1, maybe_add_timeout_to_query
 from cassandra.encoder import Encoder
 import cassandra.encoder
+from cassandra.marshal import uint16_pack
 from cassandra.policies import ColDesc
 from cassandra.protocol import _UNSET_VALUE
 from cassandra.util import OrderedDict, _sanitize_identifiers
@@ -299,9 +300,17 @@ class Statement(object):
         self.is_idempotent = is_idempotent
 
     def _key_parts_packed(self, parts):
+        _pack = uint16_pack
         for p in parts:
-            l = len(p)
-            yield struct.pack(">H%dsB" % l, l, p, 0)
+            # Normalize to bytes so any buffer-protocol object (bytearray,
+            # memoryview, including non-contiguous slices, etc.) is accepted,
+            # matching (and slightly broadening) what struct.pack used to
+            # tolerate here. This is a cheap no-op when p is already bytes.
+            if not isinstance(p, bytes):
+                p = bytes(p)
+            # Single allocation via join(), instead of chained `+` which
+            # would create an extra intermediate bytes object.
+            yield b''.join((_pack(len(p)), p, b'\x00'))
 
     def _get_routing_key(self):
         return self._routing_key
@@ -451,13 +460,16 @@ class PreparedStatement(object):
     protocol_version = None
     query_id = None
     query_string = None
-    result_metadata = None
-    result_metadata_id = None
+    _result_metadata_and_id = (None, None)
     column_encryption_policy = None
     routing_key_indexes = None
     _routing_key_index_set = None
     serial_consistency_level = None  # TODO never used?
     _is_lwt = False
+    # Set once we've logged the "new metadata id without column metadata" anomaly
+    # for this statement, to avoid logging it on every execute while a misbehaving
+    # server keeps returning it. Re-armed whenever the metadata is updated.
+    _warned_missing_column_metadata = False
 
     def __init__(self, column_metadata, query_id, routing_key_indexes, query,
                  keyspace, protocol_version, result_metadata, result_metadata_id,
@@ -468,11 +480,56 @@ class PreparedStatement(object):
         self.query_string = query
         self.keyspace = keyspace
         self.protocol_version = protocol_version
-        self.result_metadata = result_metadata
-        self.result_metadata_id = result_metadata_id
+        self._result_metadata_and_id = (result_metadata, result_metadata_id)
         self.column_encryption_policy = column_encryption_policy
         self.is_idempotent = False
         self._is_lwt = is_lwt
+
+    @property
+    def result_metadata_and_id(self):
+        """
+        The cached result metadata and its metadata id as one immutable
+        ``(result_metadata, result_metadata_id)`` pair.
+
+        Read this property when both values are needed together: the tuple is
+        replaced atomically by :meth:`update_result_metadata`, so a single read
+        can never observe the metadata of one schema version paired with the
+        metadata id of another.
+        """
+        return self._result_metadata_and_id
+
+    @property
+    def result_metadata(self):
+        """
+        Cached result metadata (column definitions) from PREPARE. Read-only:
+        :meth:`update_result_metadata` is the only way to replace it, so it can
+        never be assigned separately from the id it belongs to.
+        """
+        return self._result_metadata_and_id[0]
+
+    @property
+    def result_metadata_id(self):
+        """
+        Cached result metadata id (hash) from PREPARE. Read-only:
+        :meth:`update_result_metadata` is the only way to replace it, so it can
+        never be assigned separately from the metadata it describes.
+        """
+        return self._result_metadata_and_id[1]
+
+    def update_result_metadata(self, result_metadata, result_metadata_id):
+        """
+        Replace the cached result metadata and metadata id together, in a single
+        atomic attribute store. Response callbacks may update a statement while
+        request threads read it; updating the pair in one step (rather than the
+        two fields separately) prevents a reader from pairing a fresh metadata id
+        with stale metadata — a state in which the server would skip sending
+        metadata and rows would be decoded against the wrong columns.
+
+        Also re-arms :attr:`_warned_missing_column_metadata`, so an anomaly that
+        recurs after the metadata was recovered is logged again.
+        """
+        self._result_metadata_and_id = (result_metadata, result_metadata_id)
+        self._warned_missing_column_metadata = False
 
     @classmethod
     def from_message(cls, query_id, column_metadata, pk_indexes, cluster_metadata,
@@ -1021,7 +1078,7 @@ class QueryTrace(object):
         This can be used to query events from partial sessions.
 
         `query_cl` specifies a consistency level to use for polling the trace tables,
-        if it should be different than the session default.
+        if different from the session default.
         """
         attempt = 0
         start = time.time()
@@ -1046,7 +1103,7 @@ class QueryTrace(object):
             if is_complete:
                 log.debug("Fetched trace info for trace ID: %s", self.trace_id)
             else:
-                log.debug("Fetching parital trace info for trace ID: %s", self.trace_id)
+                log.debug("Fetching partial trace info for trace ID: %s", self.trace_id)
 
             self.request_type = session_row.request
             self.duration = timedelta(microseconds=session_row.duration) if is_complete else None

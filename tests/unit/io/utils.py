@@ -20,7 +20,6 @@ from cassandra.protocol import (
     write_stringmultimap, write_int, write_string, SupportedMessage, ReadyMessage, ServerError
 )
 from cassandra.connection import DefaultEndPoint
-from tests import is_monkey_patched
 
 import io
 import random
@@ -120,7 +119,7 @@ def submit_and_wait_for_completion(unit_test, create_timer, start, end, incremen
         pending_callbacks.append(callback)
 
     # wait for all the callbacks associated with the timers to be invoked
-    while len(pending_callbacks) is not 0:
+    while len(pending_callbacks) != 0:
         for callback in pending_callbacks:
             if callback.was_invoked():
                 pending_callbacks.remove(callback)
@@ -132,17 +131,6 @@ def submit_and_wait_for_completion(unit_test, create_timer, start, end, incremen
     # especially Windows during wheel building where timing can be significantly less precise
     for callback in completed_callbacks:
         assert callback.expected_wait == pytest.approx(callback.get_wait_time(), abs=.5)
-
-
-def noop_if_monkey_patched(f):
-    if is_monkey_patched():
-        @wraps(f)
-        def noop(*args, **kwargs):
-            return
-        return noop
-
-    return f
-
 
 class TimerTestMixin(object):
 

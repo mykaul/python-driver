@@ -14,7 +14,6 @@
 
 import json
 import subprocess
-import time
 from urllib.request import build_opener, Request, HTTPHandler
 
 from cassandra.metadata import SchemaParserV4, SchemaParserDSE68
@@ -23,6 +22,8 @@ from tests.util import wait_until_not_raised
 from tests.integration import CASSANDRA_VERSION, SIMULACRON_JAR
 
 DEFAULT_CLUSTER = "python_simulacron_cluster"
+
+CQL_VERSION = "3.4.5"
 
 
 class SimulacronCluster(object):
@@ -89,8 +90,13 @@ def start_simulacron():
 
     SERVER_SIMULACRON.start()
 
-    # TODO improve this sleep, maybe check the logs like ccm
-    time.sleep(5)
+    # Poll the admin endpoint until simulacron is ready
+    def _check_simulacron_ready():
+        opener = build_opener(HTTPHandler)
+        request = Request("http://127.0.0.1:8187/cluster")
+        opener.open(request, timeout=2)
+
+    wait_until_not_raised(_check_simulacron_ready, delay=0.5, max_attempts=30)
 
 
 def stop_simulacron():
@@ -115,13 +121,19 @@ class SimulacronClient(object):
         connection = wait_until_not_raised(lambda: opener.open(request), 1, 10)
         return connection.read().decode('utf-8')
 
-    def prime_server_versions(self):
+    def prime_server_versions(self, version=CASSANDRA_VERSION):
         """
         This information has to be primed for the test harness to run
+
+        :param version: C* release version used to prime ``release_version``.
+            ``cql_version`` is the CQL language version, which is not derived
+            from the release version (the two are independent).
         """
-        system_local_row = {}
-        system_local_row["cql_version"] = CASSANDRA_VERSION.base_version
-        system_local_row["release_version"] = CASSANDRA_VERSION.base_version + "-SNAPSHOT"
+        system_local_row = {"cql_version": CQL_VERSION,
+                            "release_version": version.base_version + "-SNAPSHOT"}
+        system_local = PrimeQuery("SELECT cql_version, release_version FROM system.local WHERE key='local'",
+                                  rows=[system_local_row],
+                                  column_types={"cql_version": "ascii", "release_version": "ascii"})
 
         self.submit_request(system_local)
 
@@ -359,12 +371,12 @@ class ResumeReads(_PauseOrResumeReads):
         return "DELETE"
 
 
-def prime_driver_defaults():
+def prime_driver_defaults(version=CASSANDRA_VERSION):
     """
     Function to prime the necessary queries so the test harness can run
     """
     client_simulacron = SimulacronClient()
-    client_simulacron.prime_server_versions()
+    client_simulacron.prime_server_versions(version)
 
     # prepare InvalidResponses for virtual tables
     for query in [SchemaParserV4._SELECT_VIRTUAL_KEYSPACES,
@@ -418,10 +430,11 @@ def start_and_prime_cluster_defaults(number_of_dc=1, nodes_per_dc=3, version=CAS
     :param version: C* version
     """
     start_simulacron()
+    version = version or CASSANDRA_VERSION
     data_centers = ",".join([str(nodes_per_dc)] * number_of_dc)
     simulacron_cluster = prime_cluster(data_centers=data_centers, version=version,
                                        cluster_name=cluster_name, dse_version=dse_version)
-    prime_driver_defaults()
+    prime_driver_defaults(version)
 
     return simulacron_cluster
 
