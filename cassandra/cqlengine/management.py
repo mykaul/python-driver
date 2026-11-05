@@ -56,7 +56,7 @@ def _get_context(keyspaces, connections):
 
 def create_keyspace_simple(name, replication_factor, durable_writes=True, connections=None):
     """
-    Creates a keyspace with SimpleStrategy for replica placement
+    Creates a keyspace with NetworkTopologyStrategy for replica placement
 
     If the keyspace already exists, it will not be modified.
 
@@ -66,11 +66,11 @@ def create_keyspace_simple(name, replication_factor, durable_writes=True, connec
     *There are plans to guard schema-modifying functions with an environment-driven conditional.*
 
     :param str name: name of keyspace to create
-    :param int replication_factor: keyspace replication factor, used with :attr:`~.SimpleStrategy`
+    :param int replication_factor: keyspace replication factor, used with :attr:`~.NetworkTopologyStrategy`
     :param bool durable_writes: Write log is bypassed if set to False
     :param list connections: List of connection names
     """
-    _create_keyspace(name, durable_writes, 'SimpleStrategy',
+    _create_keyspace(name, durable_writes, 'NetworkTopologyStrategy',
                      {'replication_factor': replication_factor}, connections=connections)
 
 
@@ -537,7 +537,7 @@ def _drop_table(model, connection=None):
 
     connection = connection or model._get_connection()
 
-    # don't try to delete non existant tables
+    # don't try to delete nonexistent tables
     meta = get_cluster(connection).metadata
 
     ks_name = model._get_keyspace()

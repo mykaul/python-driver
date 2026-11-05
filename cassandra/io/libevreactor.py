@@ -13,12 +13,11 @@
 # limitations under the License.
 import atexit
 from collections import deque
-from functools import partial
 import logging
 import os
 import socket
 import ssl
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread
 import time
 
 from cassandra import DependencyException
@@ -29,7 +28,7 @@ except ImportError:
         "The C extension needed to use libev was not found.  This "
         "probably means that you didn't have the required build dependencies "
         "when installing the driver.  See "
-        "http://datastax.github.io/python-driver/installation.html#c-extensions "
+        "https://python-driver.docs.scylladb.com/stable/installation.html#libev-support "
         "for instructions on installing build dependencies and building "
         "the C extension.")
 
@@ -58,19 +57,32 @@ class LibevLoop(object):
 
         self._started = False
         self._shutdown = False
-        self._lock = Lock()
+        # Single lock for _started/_shutdown *and* _live_conns/_new_conns/
+        # _closed_conns. The exit check in _run_loop() must see the started/
+        # shutdown flags and the live connection set as one atomic snapshot,
+        # otherwise connection_created() can register a connection in the
+        # instant after the exit check reads an empty _live_conns but before
+        # _started is flipped to False -- a lost wakeup that hangs the
+        # connection forever (see issue #980). Two separate locks can't give
+        # that atomicity no matter which one each side takes, so there is
+        # only one lock here, not a hold-both-locks protocol.
+        # It is an RLock only so connection_destroyed() can detect being
+        # re-entered by a thread that already holds it, via _is_owned():
+        # private, but threading.Condition relies on it too.
+        self._lock = RLock()
         self._lock_thread = Lock()
 
         self._thread = None
 
         # set of all connections; only replaced with a new copy
-        # while holding _conn_set_lock, never modified in place
+        # while holding _lock, never modified in place
         self._live_conns = set()
         # newly created connections that need their write/read watcher started
         self._new_conns = set()
         # recently closed connections that need their write/read watcher stopped
         self._closed_conns = set()
-        self._conn_set_lock = Lock()
+        # connections closed while their thread held _lock; drained by the loop
+        self._deferred_destroyed = []
 
         self._preparer = libev.Prepare(self._loop, self._loop_will_run)
         # prevent _preparer from keeping the loop from returning
@@ -102,6 +114,16 @@ class LibevLoop(object):
             self._loop.start()
             # there are still active watchers, no deadlock
             with self._lock:
+                # Reading _live_conns and deciding/committing the exit here
+                # happen atomically under the same lock that guards
+                # connection_created()/connection_destroyed(). So any
+                # concurrent connection_created() either finishes-before this
+                # read (its connection is seen in _live_conns, loop
+                # restarts) or finishes-after this block sets _started =
+                # False (maybe_start(), called right after
+                # connection_created(), then observes _started == False and
+                # starts a fresh thread). There is no interleaving in which
+                # the new connection is invisible to both.
                 if not self._shutdown and self._live_conns:
                     log.debug("Restarting event loop")
                     continue
@@ -109,22 +131,45 @@ class LibevLoop(object):
                     # all Connections have been closed, no active watchers
                     log.debug("All Connections currently closed, event loop ended")
                     self._started = False
+                    # A connection may have been closed after the last
+                    # _loop_will_run() pass, which is where closed
+                    # connections' sockets are closed. No reactor thread
+                    # will run it again for them, so close them here.
+                    # This happens under the lock, so a new reactor thread
+                    # can't be touching the watchers concurrently. On
+                    # shutdown, _cleanup() closes all connections itself.
+                    if not self._shutdown:
+                        to_stop = self._closed_conns
+                        self._closed_conns = set()
+                        self._close_conns(to_stop)
                     break
+        self._drain_deferred()
 
     def _cleanup(self):
+        # TODO: unguarded write; self._notify() below wakes _run_loop to re-check.
         self._shutdown = True
         if not self._thread:
             return
 
-        # Stop the prepare watcher first to prevent race conditions
+        # Stop the prepare watcher first to prevent race conditions.
+        # It was unref'd when started, so ref the loop back first: stopping it
+        # unbalanced leaves libev's active count at -1, and a loop thread still
+        # in ev_run then never returns, so the join below waits its full timeout.
+        # The timer is stopped by _update_timer() once _shutdown is set, but that
+        # runs from the prepare watcher, so stop it here too
         if self._preparer:
+            self._loop.ref()
             self._preparer.stop()
+        self._loop_timer.stop()
 
+        # TODO: unguarded read; sets are copy-on-write, so at most a stale
+        # snapshot (redundant idempotent close), never a torn read.
         for conn in self._live_conns | self._new_conns | self._closed_conns:
             conn.close()
             for watcher in (conn._write_watcher, conn._read_watcher):
                 if watcher:
                     watcher.stop()
+            conn._socket.close()
 
         self.notify()  # wake the timer watcher
 
@@ -149,7 +194,10 @@ class LibevLoop(object):
             next_end = self._timers.service_timeouts()
             if next_end:
                 self._loop_timer.start(next_end - time.time())  # timer handles negative values
-        else:
+        # _cleanup() may have run meanwhile (service_timeouts() runs callbacks)
+        # and stopped the timer before it was armed above. Check again, or the
+        # armed timer keeps ev_run going and the join in _cleanup() times out
+        if self._shutdown:
             self._loop_timer.stop()
 
     def _on_loop_timer(self):
@@ -159,7 +207,7 @@ class LibevLoop(object):
         self._notifier.send()
 
     def connection_created(self, conn):
-        with self._conn_set_lock:
+        with self._lock:
             new_live_conns = self._live_conns.copy()
             new_live_conns.add(conn)
             self._live_conns = new_live_conns
@@ -169,7 +217,22 @@ class LibevLoop(object):
             self._new_conns = new_new_conns
 
     def connection_destroyed(self, conn):
-        with self._conn_set_lock:
+        self._connection_destroyed(conn)
+        self._drain_deferred()
+
+    def _connection_destroyed(self, conn):
+        if self._lock._is_owned():
+            # Re-entered on a thread that already holds _lock: any allocation
+            # inside a locked block can run a GC finalizer (Session.__del__ ->
+            # shutdown() -> conn.close()). Updating the sets here would be
+            # overwritten by the enclosing copy-on-write update, and with a
+            # plain Lock it deadlocked (GH-1133). Finish it once the lock
+            # is released, see _drain_deferred().
+            self._deferred_destroyed.append(conn)
+            self._notifier.send()
+            return
+
+        with self._lock:
             new_conns = self._new_conns.copy()
             new_conns.discard(conn)
             self._new_conns = new_conns
@@ -178,14 +241,55 @@ class LibevLoop(object):
             new_live_conns.discard(conn)
             self._live_conns = new_live_conns
 
-            new_closed_conns = self._closed_conns.copy()
-            new_closed_conns.add(conn)
-            self._closed_conns = new_closed_conns
+            if not self._started and not self._shutdown:
+                # No reactor thread is running to close the socket in
+                # _loop_will_run(), and none is going to start for an
+                # already-closed connection, so close it here. Holding
+                # the lock ensures no reactor thread starts meanwhile.
+                # On shutdown, _cleanup() closes all connections itself.
+                self._close_conns((conn,))
+            else:
+                new_closed_conns = self._closed_conns.copy()
+                new_closed_conns.add(conn)
+                self._closed_conns = new_closed_conns
 
         self._notifier.send()
 
+    def _drain_deferred(self):
+        # Called after every release of _lock that may have deferred a
+        # connection_destroyed(): end of connection_destroyed(), each loop
+        # pass, and reactor exit, which nothing else would run after.
+        # Can run on several threads at once, so pop() can lose the race.
+        # Calls the non-draining variant: closes deferred meanwhile are
+        # picked up by this loop, so the stack doesn't grow per connection.
+        if self._lock._is_owned():
+            return  # still inside the locked block that deferred them
+        while True:
+            try:
+                conn = self._deferred_destroyed.pop()
+            except IndexError:
+                return
+            self._connection_destroyed(conn)
+
+    @staticmethod
+    def _close_conns(conns):
+        for conn in conns:
+            if conn._write_watcher:
+                conn._write_watcher.stop()
+                # clear reference cycles from IO callback
+                del conn._write_watcher
+            if conn._read_watcher:
+                conn._read_watcher.stop()
+                # clear reference cycles from IO callback
+                del conn._read_watcher
+            conn._socket.close()
+            log.debug("Closed socket to %s", conn.endpoint)
+
     def _loop_will_run(self, prepare):
         changed = False
+        self._drain_deferred()
+
+        # TODO: unguarded read; copy-on-write set, self-heals next tick.
         for conn in self._live_conns:
             if not conn.deque and conn._write_watcher_is_active:
                 if conn._write_watcher:
@@ -198,7 +302,7 @@ class LibevLoop(object):
                 changed = True
 
         if self._new_conns:
-            with self._conn_set_lock:
+            with self._lock:
                 to_start = self._new_conns
                 self._new_conns = set()
 
@@ -209,19 +313,11 @@ class LibevLoop(object):
             changed = True
 
         if self._closed_conns:
-            with self._conn_set_lock:
+            with self._lock:
                 to_stop = self._closed_conns
                 self._closed_conns = set()
 
-            for conn in to_stop:
-                if conn._write_watcher:
-                    conn._write_watcher.stop()
-                    # clear reference cycles from IO callback
-                    del conn._write_watcher
-                if conn._read_watcher:
-                    conn._read_watcher.stop()
-                    # clear reference cycles from IO callback
-                    del conn._read_watcher
+            self._close_conns(to_stop)
 
             changed = True
 
@@ -232,8 +328,20 @@ class LibevLoop(object):
             self._notifier.send()
 
 
+def _atexit_cleanup():
+    """Cleanup function called by atexit that uses the current _global_loop value.
+
+    This wrapper ensures that cleanup receives the actual LibevLoop instance
+    instead of None, which was the value of _global_loop when the module was
+    imported.
+    """
+    global _global_loop
+    if _global_loop is not None:
+        _cleanup(_global_loop)
+
+
 _global_loop = None
-atexit.register(partial(_cleanup, _global_loop))
+atexit.register(_atexit_cleanup)
 
 
 class LibevConnection(Connection):
@@ -277,9 +385,17 @@ class LibevConnection(Connection):
         self._connect_socket()
         self._socket.setblocking(0)
 
-        with _global_loop._lock:
-            self._read_watcher = libev.IO(self._socket.fileno(), libev.EV_READ, _global_loop._loop, self.handle_read)
-            self._write_watcher = libev.IO(self._socket.fileno(), libev.EV_WRITE, _global_loop._loop, self.handle_write)
+        try:
+            with _global_loop._lock:
+                self._read_watcher = libev.IO(self._socket.fileno(), libev.EV_READ, _global_loop._loop, self.handle_read)
+                self._write_watcher = libev.IO(self._socket.fileno(), libev.EV_WRITE, _global_loop._loop, self.handle_write)
+        except Exception:
+            # Not registered with the loop yet, so nothing else will clean up.
+            # Dropping the watcher breaks its cycle with this connection
+            # through the bound callback, which IO cannot collect.
+            self._read_watcher = self._write_watcher = None
+            self._socket.close()
+            raise
 
         self._send_options_message()
 
@@ -297,8 +413,6 @@ class LibevConnection(Connection):
         log.debug("Closing connection (%s) to %s", id(self), self.endpoint)
 
         _global_loop.connection_destroyed(self)
-        self._socket.close()
-        log.debug("Closed socket to %s", self.endpoint)
 
         # don't leave in-progress operations hanging
         if not self.is_defunct:
@@ -309,6 +423,8 @@ class LibevConnection(Connection):
             self.connected_event.set()
 
     def handle_write(self, watcher, revents, errno=None):
+        if self.is_closed:
+            return
         if revents & libev.EV_ERROR:
             if errno:
                 exc = IOError(errno, os.strerror(errno))
@@ -350,6 +466,8 @@ class LibevConnection(Connection):
                         return
 
     def handle_read(self, watcher, revents, errno=None):
+        if self.is_closed:
+            return
         if revents & libev.EV_ERROR:
             if errno:
                 exc = IOError(errno, os.strerror(errno))

@@ -1,0 +1,109 @@
+name: Code coverage
+
+on:
+  push:
+    branches:
+      - master
+      - 'branch-**'
+    paths-ignore:
+      - docs/**
+      - examples/**
+      - .gitignore
+      - '**/*.rst'
+      - '**/*.md'
+      - '*.ini'
+      - LICENSE
+      - .github/dependabot.yml
+      - .github/pull_request_template.md
+      - .github/workflows/docs-*
+  pull_request:
+    paths-ignore:
+      - docs/**
+      - examples/**
+      - .gitignore
+      - '**/*.rst'
+      - '**/*.md'
+      - '*.ini'
+      - LICENSE
+      - .github/dependabot.yml
+      - .github/pull_request_template.md
+      - .github/workflows/docs-*
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  coverage:
+    name: Measure code coverage
+    if: "!contains(github.event.pull_request.labels.*.name, 'disable-coverage-tests')"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SCYLLA_VERSION: release:2026.1.13
+      PROTOCOL_VERSION: 4
+      # Set once at job level so every step (including "Build driver" and the
+      # summary step, both of which invoke `uv run`) sees the same value.
+      # uv's cache-keys include this var, so a value that flips between steps
+      # makes each `uv run` re-detect a "changed" build config and rebuild the
+      # Cython extensions from scratch -- about two minutes wasted per flip.
+      CASS_DRIVER_NO_CYTHON: "1"
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install libev
+      run: sudo apt-get install libev4 libev-dev
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        python-version: "3.13"
+        enable-cache: true
+
+    - name: Build driver
+      run: uv sync
+
+    - name: Cache Scylla download
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.ccm/scylla-repository
+        key: scylla-${{ env.SCYLLA_VERSION }}-${{ runner.os }}
+        restore-keys: scylla-${{ env.SCYLLA_VERSION }}-
+
+    - name: Run tests with coverage
+      run: bash scripts/coverage.sh
+
+    - name: Publish coverage summary
+      if: always()
+      run: |
+        {
+          echo '## Coverage report'
+          echo '```'
+          uv run coverage report -m
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload coverage report
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: coverage-report
+        path: |
+          htmlcov/
+          coverage.xml
+
+    # No `if: always()` here: only a run in which every step above passed
+    # uploads. scripts/coverage.sh writes its reports even when a test fails,
+    # and on master such a partial report would become the baseline later pull
+    # requests are compared against. Pull requests from forks get no secrets
+    # and upload without a token; neither that nor a Dependabot run, which gets
+    # no CODECOV_TOKEN, fails the job if Codecov refuses the upload.
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: coverage.xml
+        disable_search: true
+        fail_ci_if_error: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}

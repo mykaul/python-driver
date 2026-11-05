@@ -45,7 +45,6 @@ log = logging.getLogger(__name__)
 class LoadBalancingPolicyTests(unittest.TestCase):
 
     def setUp(self):
-        remove_cluster()  # clear ahead of test so it doesn't use one left in unknown state
         self.coordinator_stats = CoordinatorStats()
         self.prepared = None
         self.probe_cluster = None
@@ -191,6 +190,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
             assert isinstance(cluster.profile_manager.default.load_balancing_policy, DCAwareRoundRobinPolicy)
 
     def test_roundrobin(self):
+        remove_cluster()
         use_singledc()
         keyspace = 'test_roundrobin'
         cluster, session = self._cluster_session_with_lbp(RoundRobinPolicy())
@@ -215,10 +215,10 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(2, 6)
         self.coordinator_stats.assert_query_count_equals(3, 0)
 
-        decommission(1)
-        start(3)
-        self._wait_for_nodes_down([1], cluster)
+        start(3)  # Restart before decommission (Raft rejects ops with dead nodes)
         self._wait_for_nodes_up([3], cluster)
+        decommission(1)
+        self._wait_for_nodes_down([1], cluster)
 
         self.coordinator_stats.reset_counts()
         self._query(session, keyspace)
@@ -228,6 +228,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(3, 6)
 
     def test_roundrobin_two_dcs(self):
+        remove_cluster()
         use_multidc([2, 2])
         keyspace = 'test_roundrobin_two_dcs'
         cluster, session = self._cluster_session_with_lbp(RoundRobinPolicy())
@@ -243,13 +244,12 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(3, 3)
         self.coordinator_stats.assert_query_count_equals(4, 3)
 
+        bootstrap(5, 'dc3')  # Bootstrap before force_stop (Raft rejects ops with dead nodes)
+        self._wait_for_nodes_up([5], cluster)
         force_stop(1)
-        bootstrap(5, 'dc3')
 
         # reset control connection
         self._insert(session, keyspace, count=1000)
-
-        self._wait_for_nodes_up([5], cluster)
 
         self.coordinator_stats.reset_counts()
         self._query(session, keyspace)
@@ -261,6 +261,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(5, 3)
 
     def test_roundrobin_two_dcs_2(self):
+        remove_cluster()
         use_multidc([2, 2])
         keyspace = 'test_roundrobin_two_dcs_2'
         cluster, session = self._cluster_session_with_lbp(RoundRobinPolicy())
@@ -276,13 +277,12 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(3, 3)
         self.coordinator_stats.assert_query_count_equals(4, 3)
 
+        bootstrap(5, 'dc1')  # Bootstrap before force_stop (Raft rejects ops with dead nodes)
+        self._wait_for_nodes_up([5], cluster)
         force_stop(1)
-        bootstrap(5, 'dc1')
 
         # reset control connection
         self._insert(session, keyspace, count=1000)
-
-        self._wait_for_nodes_up([5], cluster)
 
         self.coordinator_stats.reset_counts()
         self._query(session, keyspace)
@@ -294,6 +294,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(5, 3)
 
     def test_dc_aware_roundrobin_two_dcs(self):
+        remove_cluster()
         use_multidc([3, 2])
         keyspace = 'test_dc_aware_roundrobin_two_dcs'
         cluster, session = self._cluster_session_with_lbp(DCAwareRoundRobinPolicy('dc1'))
@@ -311,6 +312,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(5, 0)
 
     def test_dc_aware_roundrobin_two_dcs_2(self):
+        remove_cluster()
         use_multidc([3, 2])
         keyspace = 'test_dc_aware_roundrobin_two_dcs_2'
         cluster, session = self._cluster_session_with_lbp(DCAwareRoundRobinPolicy('dc2'))
@@ -328,6 +330,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(5, 6)
 
     def test_dc_aware_roundrobin_one_remote_host(self):
+        remove_cluster()
         use_multidc([2, 2])
         keyspace = 'test_dc_aware_roundrobin_one_remote_host'
         cluster, session = self._cluster_session_with_lbp(DCAwareRoundRobinPolicy('dc2', used_hosts_per_remote_dc=1))
@@ -369,23 +372,25 @@ class LoadBalancingPolicyTests(unittest.TestCase):
             responses.add(self.coordinator_stats.get_query_count(node))
         assert set([0, 0, 12]) == responses
 
+        # Decommission node 1 while 3 Raft voters remain (nodes 1, 2, 5).
+        # Doing this later (with only 2 voters) can cause Raft issues.
         self.coordinator_stats.reset_counts()
-        decommission(5)
-        self._wait_for_nodes_down([5])
+        decommission(1)
+        self._wait_for_nodes_down([1])
 
         self._query(session, keyspace)
 
+        self.coordinator_stats.assert_query_count_equals(1, 0)
         self.coordinator_stats.assert_query_count_equals(3, 0)
         self.coordinator_stats.assert_query_count_equals(4, 0)
-        self.coordinator_stats.assert_query_count_equals(5, 0)
         responses = set()
-        for node in [1, 2]:
+        for node in [2, 5]:
             responses.add(self.coordinator_stats.get_query_count(node))
         assert set([0, 12]) == responses
 
         self.coordinator_stats.reset_counts()
-        decommission(1)
-        self._wait_for_nodes_down([1])
+        decommission(5)
+        self._wait_for_nodes_down([5])
 
         self._query(session, keyspace)
 
@@ -410,6 +415,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.token_aware(keyspace, True)
 
     def token_aware(self, keyspace, use_prepared=False):
+        remove_cluster()
         use_singledc()
         cluster, session = self._cluster_session_with_lbp(TokenAwarePolicy(RoundRobinPolicy()))
         self.addCleanup(cluster.shutdown)
@@ -473,6 +479,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(2, 0)
 
     def test_token_aware_composite_key(self):
+        remove_cluster()
         use_singledc()
         keyspace = 'test_token_aware_composite_key'
         table = 'composite'
@@ -505,6 +512,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         assert results[0].i
 
     def test_token_aware_with_rf_2(self, use_prepared=False):
+        remove_cluster()
         use_singledc()
         keyspace = 'test_token_aware_with_rf_2'
         cluster, session = self._cluster_session_with_lbp(TokenAwarePolicy(RoundRobinPolicy()))
@@ -516,8 +524,9 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self._query(session, keyspace)
 
         self.coordinator_stats.assert_query_count_equals(1, 0)
-        self.coordinator_stats.assert_query_count_equals(2, 12)
-        self.coordinator_stats.assert_query_count_equals(3, 0)
+        # Scylla may distribute queries across both replicas with shard-aware routing
+        queried = self.coordinator_stats.get_query_count(2) + self.coordinator_stats.get_query_count(3)
+        assert queried == 12, "Expected 12 queries to replicas, got %d" % queried
 
         self.coordinator_stats.reset_counts()
         stop(2)
@@ -530,6 +539,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
         self.coordinator_stats.assert_query_count_equals(3, 12)
 
     def test_token_aware_with_local_table(self):
+        remove_cluster()
         use_singledc()
         cluster, session = self._cluster_session_with_lbp(TokenAwarePolicy(RoundRobinPolicy()))
         self.addCleanup(cluster.shutdown)
@@ -617,6 +627,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
 
         @test_category policy
         """
+        remove_cluster()
         # We can test this with a single dc when CASSANDRA-15670 is fixed
         use_multidc([3, 3])
 
@@ -647,6 +658,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
 
 
     def _set_up_shuffle_test(self, keyspace, replication_factor):
+        remove_cluster()
         use_singledc()
         cluster, session = self._cluster_session_with_lbp(
             TokenAwarePolicy(RoundRobinPolicy(), shuffle_replicas=True)
@@ -678,6 +690,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
             self.coordinator_stats.reset_counts()
 
     def test_white_list(self):
+        remove_cluster()
         use_singledc()
         keyspace = 'test_white_list'
 
@@ -723,6 +736,7 @@ class LoadBalancingPolicyTests(unittest.TestCase):
 
         @test_category policy
         """
+        remove_cluster()
         use_singledc()
         keyspace = 'test_black_list_with_hfp'
         ignored_address = (IP_FORMAT % 2)

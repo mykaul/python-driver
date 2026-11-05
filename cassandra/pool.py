@@ -16,9 +16,9 @@
 Connection pooling and host management.
 """
 from concurrent.futures import Future
+from contextlib import contextmanager
 from functools import total_ordering
 import logging
-import socket
 import time
 import random
 import copy
@@ -30,11 +30,13 @@ try:
 except ImportError:
     from cassandra.util import WeakSet  # NOQA
 
-from cassandra import AuthenticationFailed
-from cassandra.connection import ConnectionException, EndPoint, DefaultEndPoint
+from cassandra import AuthenticationFailed, _lifecycle
+from cassandra.connection import (ConnectionException, ConnectionSendError, EndPoint,
+                                  DefaultEndPoint, UnixSocketEndPoint)
 from cassandra.policies import HostDistance
 
 log = logging.getLogger(__name__)
+_NOT_SET = object()
 
 
 class NoConnectionsAvailable(Exception):
@@ -51,11 +53,6 @@ class Host(object):
     Represents a single Cassandra node.
     """
 
-    endpoint = None
-    """
-    The :class:`~.connection.EndPoint` to connect to the node.
-    """
-
     broadcast_address = None
     """
     broadcast address configured for the node, *if available*:
@@ -63,8 +60,7 @@ class Host(object):
     'system.local.broadcast_address' or 'system.peers.peer' (Cassandra 2-3)
     'system.local.broadcast_address' or 'system.peers_v2.peer' (Cassandra 4)
 
-    This is not present in the ``system.local`` table for older versions of Cassandra. It
-    is also not queried if :attr:`~.Cluster.token_metadata_enabled` is ``False``.
+    This is not present in the ``system.local`` table for older versions of Cassandra.
     """
 
     broadcast_port = None
@@ -99,9 +95,8 @@ class Host(object):
 
     'system.local.listen_address'
 
-    This is only available in the ``system.local`` table for newer versions of Cassandra. It is also not
-    queried if :attr:`~.Cluster.token_metadata_enabled` is ``False``. Usually the same as ``broadcast_address``
-    unless configured differently in cassandra.yaml.
+    This is only available in the ``system.local`` table for newer versions of Cassandra. Usually the
+    same as ``broadcast_address`` unless configured differently in cassandra.yaml.
     """
 
     listen_port = None
@@ -132,11 +127,6 @@ class Host(object):
     release_version as queried from the control connection system tables
     """
 
-    host_id = None
-    """
-    The unique identifier of the cassandra node
-    """
-
     dse_version = None
     """
     dse_version as queried from the control connection system tables. Only populated when connecting to
@@ -158,12 +148,20 @@ class Host(object):
     Not queried if :attr:`~.Cluster.token_metadata_enabled` is ``False``.
     """
 
+    _host_id = None
     _datacenter = None
     _rack = None
     _reconnection_handler = None
     lock = None
 
     _currently_handling_node_up = False
+    _currently_handling_node_down = False
+    _down_event_generation = 0
+    _health_generation = 0
+    _lifecycle_pending = False
+    _pending_host_addition = False
+    _pending_host_addition_notification = False
+    _pending_host_addition_callback = None
 
     sharding_info = None
 
@@ -173,13 +171,27 @@ class Host(object):
         if conviction_policy_factory is None:
             raise ValueError("conviction_policy_factory may not be None")
 
-        self.endpoint = endpoint if isinstance(endpoint, EndPoint) else DefaultEndPoint(endpoint)
+        if not isinstance(host_id, uuid.UUID):
+            raise TypeError("host_id must be a uuid.UUID")
+        if host_id.int == 0:
+            raise ValueError("host_id may not be the nil UUID")
+
+        self._endpoint = endpoint if isinstance(endpoint, EndPoint) else DefaultEndPoint(endpoint)
+        self._host_id = host_id
+        self._is_removed = False
         self.conviction_policy = conviction_policy_factory(self)
-        if not host_id:
-            raise ValueError("host_id may not be None")
-        self.host_id = host_id
         self.set_location_info(datacenter, rack)
         self.lock = RLock()
+
+    @property
+    def endpoint(self):
+        """
+        The read-only :class:`~.connection.EndPoint` to connect to the node.
+
+        When the endpoint changes, the driver replaces this Host with a new
+        object carrying the same :attr:`host_id` and retires the old object.
+        """
+        return self._endpoint
 
     @property
     def address(self):
@@ -188,6 +200,13 @@ class Host(object):
         """
         # backward compatibility
         return self.endpoint.address
+
+    @property
+    def host_id(self):
+        """
+        The immutable unique identifier of the Cassandra node.
+        """
+        return self._host_id
 
     @property
     def datacenter(self):
@@ -233,17 +252,25 @@ class Host(object):
             self._reconnection_handler = new_handler
             return old
 
+    def _clear_reconnection_handler(self, handler):
+        with self.lock:
+            if self._reconnection_handler is not handler:
+                return False
+            self._reconnection_handler = None
+            return not self._is_removed
+
     def __eq__(self, other):
-        if isinstance(other, Host):
-            return self.endpoint == other.endpoint
-        else:  # TODO Backward compatibility, remove next major
-            return self.endpoint.address == other
+        if not isinstance(other, Host):
+            return NotImplemented
+        return self.host_id == other.host_id
 
     def __hash__(self):
-        return hash(self.endpoint)
+        return hash(self.host_id)
 
     def __lt__(self, other):
-        return self.endpoint < other.endpoint
+        if not isinstance(other, Host):
+            return NotImplemented
+        return self.host_id < other.host_id
 
     def __str__(self):
         return str(self.endpoint)
@@ -260,6 +287,12 @@ class _ReconnectionHandler(object):
     """
 
     _cancelled = False
+    _clear_handler_before_reconnection = False
+
+    # Whether on_reconnection() keeps the connection it is handed. A handler
+    # that only uses it to probe the host leaves this False and run() closes
+    # the connection for it.
+    _keeps_connection = False
 
     def __init__(self, scheduler, schedule, callback, *callback_args, **callback_kwargs):
         self.scheduler = scheduler
@@ -281,6 +314,7 @@ class _ReconnectionHandler(object):
             return
 
         conn = None
+        handed_off = False
         try:
             conn = self.try_reconnect()
         except Exception as exc:
@@ -300,14 +334,28 @@ class _ReconnectionHandler(object):
                     self.scheduler.schedule(next_delay, self.run)
         else:
             if not self._cancelled:
+                # Mark the handoff before it happens: on_reconnection() adopts
+                # the connection and may then raise (installing the new control
+                # connection closes the old one, which runs user callbacks). If
+                # the flag were set afterwards, that raise would leave us
+                # closing a connection the subclass is already using.
+                handed_off = self._keeps_connection
+                if (self._clear_handler_before_reconnection and
+                        not self._release_reconnection_handler()):
+                    return
                 self.on_reconnection(conn)
-                self.callback(*(self.callback_args), **(self.callback_kwargs))
+                if not self._clear_handler_before_reconnection:
+                    self._release_reconnection_handler()
         finally:
-            if conn:
+            if conn and not handed_off:
                 conn.close()
 
     def cancel(self):
         self._cancelled = True
+
+    def _release_reconnection_handler(self):
+        self.callback(*(self.callback_args), **(self.callback_kwargs))
+        return True
 
     def try_reconnect(self):
         """
@@ -344,6 +392,12 @@ class _ReconnectionHandler(object):
 
 class _HostReconnectionHandler(_ReconnectionHandler):
 
+    # Host reconnection callbacks can synchronously start another reconnector
+    # when rebuilding pools fails. Clear this handler first so that failure is
+    # not suppressed as already reconnecting and post-callback cleanup cannot
+    # clear the successor.
+    _clear_handler_before_reconnection = True
+
     def __init__(self, host, connection_factory, is_host_addition, on_add, on_up, *args, **kwargs):
         _ReconnectionHandler.__init__(self, *args, **kwargs)
         self.is_host_addition = is_host_addition
@@ -352,8 +406,23 @@ class _HostReconnectionHandler(_ReconnectionHandler):
         self.host = host
         self.connection_factory = connection_factory
 
+    def start(self):
+        try:
+            _ReconnectionHandler.start(self)
+        except StopIteration:
+            # An empty schedule means this handler will never run.
+            self._release_slot()
+
+    def _release_slot(self):
+        with self.host.lock:
+            if self.host._reconnection_handler is self:
+                self.host._reconnection_handler = None
+
     def try_reconnect(self):
         return self.connection_factory()
+
+    def _release_reconnection_handler(self):
+        return self.host._clear_reconnection_handler(self)
 
     def on_reconnection(self, connection):
         log.info("Successful reconnection to %s, marking node up if it isn't already", self.host)
@@ -364,12 +433,19 @@ class _HostReconnectionHandler(_ReconnectionHandler):
 
     def on_exception(self, exc, next_delay):
         if isinstance(exc, AuthenticationFailed):
-            return False
+            keep_retrying = False
         else:
             log.warning("Error attempting to reconnect to %s, scheduling retry in %s seconds: %s",
                         self.host, next_delay, exc)
             log.debug("Reconnection error details", exc_info=True)
-            return True
+            keep_retrying = True
+
+        if not keep_retrying or next_delay is None:
+            # This handler will never run again. Release the slot it occupies,
+            # or a later DOWN event will mistake it for a live reconnector.
+            self._release_slot()
+
+        return keep_retrying
 
 
 class HostConnection(object):
@@ -391,17 +467,25 @@ class HostConnection(object):
     # the number below, all excess connections will be closed.
     max_excess_connections_per_shard_multiplier = 3
 
-    tablets_routing_v1 = False
+    supports_tablet_routing = False
 
-    def __init__(self, host, host_distance, session):
+    def __init__(self, host, host_distance, session, _ownership=None):
         self.host = host
+        self.endpoint = host.endpoint
         self.host_distance = host_distance
         self._session = weakref.proxy(session)
+        self._session_ref = weakref.ref(session)
         self._lock = Lock()
+        # Failure reservations hold membership while return_connection and
+        # shutdown re-enter it.
+        self._membership_lock = RLock()
+        self._ownership = _ownership or _lifecycle.PoolOwnershipReservation(
+            session, host, self.endpoint)
         # this is used in conjunction with the connection streams. Not using the connection lock because the connection can be replaced in the lifetime of the pool.
         self._stream_available_condition = Condition(Lock())
-        self._is_replacing = False
+        self._replacement_connections = {}
         self._connecting = set()
+        self._connection_attempts = {}
         self._connections = {}
         self._pending_connections = []
         # A pool of additional connections which are not used but affect how Scylla
@@ -422,27 +506,46 @@ class HostConnection(object):
 
         if host_distance == HostDistance.IGNORED:
             log.debug("Not opening connection to ignored host %s", self.host)
+            self._ownership.published = _ownership is None
             return
         elif host_distance == HostDistance.REMOTE and not session.cluster.connect_to_remote_hosts:
             log.debug("Not opening connection to remote host %s", self.host)
+            self._ownership.published = _ownership is None
             return
 
         log.debug("Initializing connection for host %s", self.host)
-        first_connection = session.cluster.connection_factory(self.host.endpoint, on_orphaned_stream_released=self.on_orphaned_stream_released)
-        log.debug("First connection created to %s for shard_id=%i", self.host, first_connection.features.shard_id)
-        self._connections[first_connection.features.shard_id] = first_connection
+        first_connection = session.cluster.connection_factory(self.endpoint, on_orphaned_stream_released=self.on_orphaned_stream_released)
+        log.debug("First connection created to %s for shard_id=%s", self.host, first_connection.features.shard_id)
         self._keyspace = session.keyspace
-
-        if self._keyspace:
-            first_connection.set_keyspace_blocking(self._keyspace)
+        try:
+            published = self._sync_keyspace(first_connection, expected=None)
+        except Exception:
+            first_connection.close()
+            raise
+        if not published:
+            first_connection.close()
+            return
         if first_connection.features.sharding_info and not self._session.cluster.shard_aware_options.disable:
-            self.host.sharding_info = first_connection.features.sharding_info
-            self._open_connections_for_all_shards(first_connection.features.shard_id)
-        self.tablets_routing_v1 = first_connection.features.tablets_routing_v1
+            with self._connection_guard() as current:
+                if current:
+                    self.host.sharding_info = first_connection.features.sharding_info
+            if not current:
+                self.shutdown()
+                return
+            try:
+                self._open_connections_for_all_shards(
+                    first_connection.features.shard_id)
+            except Exception:
+                self.shutdown()
+                raise
+
+        self.supports_tablet_routing = first_connection.features.tablets_routing_v1 \
+                                       or first_connection.features.tablets_routing_v2
 
         log.debug("Finished initializing connection for host %s", self.host)
+        self._ownership.published = _ownership is None
 
-    def _get_connection_for_routing_key(self, routing_key=None, keyspace=None, table=None):
+    def _get_connection_for_routing_key(self, routing_key=None, keyspace=None, table=None, routing_token=None):
         if self.is_shutdown:
             raise ConnectionException(
                 "Pool for %s is shutdown" % (self.host,), self.host)
@@ -452,22 +555,32 @@ class HostConnection(object):
 
         shard_id = None
         if not self._session.cluster.shard_aware_options.disable and self.host.sharding_info and routing_key:
-            t = self._session.cluster.metadata.token_map.token_class.from_key(routing_key)
-            
-            shard_id = None
-            if self.tablets_routing_v1 and table is not None:
+            # Reuse the token computed once for this request when available, so
+            # the routing-key hash runs once per request instead of again here;
+            # fall back to hashing the routing key directly otherwise. The caller
+            # leaves the token unset when the cluster's partitioner cannot be
+            # hashed (see Session._create_response_future), so the fallback has to
+            # make the same check rather than retry a hash that would raise.
+            metadata = self._session.cluster.metadata
+            t = routing_token
+            if t is None and metadata.token_map is not None and metadata.can_support_partitioner():
+                t = metadata.token_map.token_class.from_key(routing_key)
+            if t is not None and self.supports_tablet_routing and table is not None:
                 if keyspace is None:
                     keyspace = self._keyspace
 
                 tablet = self._session.cluster.metadata._tablets.get_tablet_for_key(keyspace, table, t)
 
+                # In both V1 and V2 the request is sent to this host, so we pick
+                # the shard that this host owns for the tablet. Leader-aware host
+                # selection (V2) happens earlier, in the load balancing policy.
                 if tablet is not None:
                     for replica in tablet.replicas:
                         if replica[0] == self.host.host_id:
                             shard_id = replica[1]
                             break
 
-            if shard_id is None:
+            if shard_id is None and t is not None:
                 shard_id = self.host.sharding_info.shard_id_from_token(t.value)
 
         conn = self._connections.get(shard_id)
@@ -476,18 +589,11 @@ class HostConnection(object):
         # optimistic try to connect to it
         if shard_id is not None:
             if conn:
-                log.debug(
-                    "Using connection to shard_id=%i on host %s for routing_key=%s",
-                    shard_id,
-                    self.host,
-                    routing_key
-                )
                 if conn.orphaned_threshold_reached and shard_id not in self._connecting:
                     # The connection has met its orphaned stream ID limit
                     # and needs to be replaced. Start opening a connection
                     # to the same shard and replace when it is opened.
-                    self._connecting.add(shard_id)
-                    self._session.submit(self._open_connection_to_missing_shard, shard_id)
+                    self._submit_shard_attempt(shard_id, _coalesce=True)
                     log.debug(
                         "Connection to shard_id=%i reached orphaned stream limit, replacing on host %s (%s/%i)",
                         shard_id,
@@ -497,8 +603,7 @@ class HostConnection(object):
                     )
             elif shard_id not in self._connecting:
                 # rate controlled optimistic attempt to connect to a missing shard
-                self._connecting.add(shard_id)
-                self._session.submit(self._open_connection_to_missing_shard, shard_id)
+                self._submit_shard_attempt(shard_id, _coalesce=True)
                 log.debug(
                     "Trying to connect to missing shard_id=%i on host %s (%s/%i)",
                     shard_id,
@@ -514,21 +619,36 @@ class HostConnection(object):
             return random.choice(active_connections)
         return random.choice(list(self._connections.values()))
 
-    def borrow_connection(self, timeout, routing_key=None, keyspace=None, table=None):
-        conn = self._get_connection_for_routing_key(routing_key, keyspace, table)
+    def borrow_connection(self, timeout, routing_key=None, keyspace=None, table=None,
+                          routing_token=None, allow_keyspace_mismatch=False):
+        conn = self._get_connection_for_routing_key(routing_key, keyspace, table, routing_token)
         start = time.time()
         remaining = timeout
         last_retry = False
         while True:
             if conn.is_closed:
                 # The connection might have been closed in the meantime - if so, try again
-                conn = self._get_connection_for_routing_key(routing_key, keyspace, table)
+                conn = self._get_connection_for_routing_key(routing_key, keyspace, table, routing_token)
             with conn.lock:
-                if (not conn.is_closed or last_retry) and conn.in_flight < conn.max_request_id:
+                if (allow_keyspace_mismatch or conn.keyspace == self._keyspace) and \
+                        (not conn.is_closed or last_retry) and \
+                        conn.in_flight < conn.max_request_id:
                     # On last retry we ignore connection status, since it is better to return closed connection than
                     #  raise Exception
                     conn.in_flight += 1
                     return conn, conn.get_request_id()
+            if not allow_keyspace_mismatch and conn.keyspace != self._keyspace:
+                alternate = next((candidate for candidate in tuple(self._connections.values())
+                                  if candidate is not conn and not candidate.is_closed and
+                                  candidate.keyspace == self._keyspace), None)
+                if alternate is not None:
+                    conn = alternate
+                    continue
+                # Waiting here could block the reactor thread that must
+                # deliver the pending USE response. Let the request try another
+                # host or fail while this pool finishes synchronizing.
+                raise NoConnectionsAvailable(
+                    "No connection has the current session keyspace")
             if timeout is not None:
                 remaining = timeout - time.time() + start
                 if remaining < 0:
@@ -542,10 +662,16 @@ class HostConnection(object):
                     conn = self._get_connection()
                 else:
                     self._stream_available_condition.wait(remaining)
+            conn = self._get_connection_for_routing_key(
+                routing_key, keyspace, table, routing_token)
 
+        if not allow_keyspace_mismatch and conn.keyspace != self._keyspace:
+            raise NoConnectionsAvailable(
+                "No connection has the current session keyspace")
         raise NoConnectionsAvailable("All request IDs are currently in use")
 
-    def return_connection(self, connection, stream_was_orphaned=False):
+    def return_connection(self, connection, stream_was_orphaned=False,
+                          replace_only=False, heartbeat_failed=False):
         if not stream_was_orphaned:
             with connection.lock:
                 connection.in_flight -= 1
@@ -553,31 +679,62 @@ class HostConnection(object):
                 self._stream_available_condition.notify()
 
         if connection.is_defunct or connection.is_closed:
-            if connection.signaled_error and not self.shutdown_on_error:
+            # Claim the transport before pool work: a redundant reactor
+            # callback must return while that work waits for its response.
+            with connection.lock:
+                if connection.signaled_error and not replace_only and \
+                        (not self.shutdown_on_error or
+                         (isinstance(connection.last_error, ConnectionSendError) and
+                          not heartbeat_failed)):
+                    return
+                report_failure = not replace_only and not connection.signaled_error
+                connection.signaled_error = True
+            reservation = _lifecycle.ConnectionFailureReservation(self, connection)
+            with reservation.locked():
+                current = reservation.owns_locked()
+            if not current:
+                with self._lock:
+                    self._trash.discard(connection)
+                # A stale completion still releases its stream above, but its
+                # failed transport cannot affect the current pool or shard.
+                connection.close()
                 return
 
             is_down = False
-            if not connection.signaled_error:
+            if report_failure:
                 log.debug("Defunct or closed connection (%s) returned to pool, potentially "
                           "marking host %s as down", id(connection), self.host)
                 is_down = self.host.signal_connection_failure(connection.last_error)
-                connection.signaled_error = True
 
-            if self.shutdown_on_error and not is_down:
+            if self.shutdown_on_error and not is_down and not replace_only:
                 is_down = True
 
             if is_down:
-                self.shutdown()
-                self._session.cluster.on_down(self.host, is_host_addition=False)
+                # Retire before inspecting other sessions: concurrent failures
+                # must not discount each other's doomed sibling connections.
+                self.shutdown(_failure=reservation)
+                if reservation.is_current():
+                    self._session.cluster.on_down(
+                        self.host, is_host_addition=False,
+                        _pool_failure=reservation)
+                elif not reservation.retired:
+                    with self._lock:
+                        self._trash.discard(connection)
+                    connection.close()
             else:
+                schedule_replacement = False
+                with reservation.locked():
+                    if reservation.owns_locked():
+                        with self._membership_lock:
+                            self._connections.pop(connection.features.shard_id)
+                        self._replacement_connections[
+                            connection.features.shard_id] = connection
+                        schedule_replacement = True
+                if not schedule_replacement:
+                    with self._lock:
+                        self._trash.discard(connection)
                 connection.close()
-                with self._lock:
-                    if self.is_shutdown:
-                        return
-                    self._connections.pop(connection.features.shard_id, None)
-                    if self._is_replacing:
-                        return
-                    self._is_replacing = True
+                if schedule_replacement:
                     self._session.submit(self._replace, connection)
         elif connection in self._trash:
             with connection.lock:
@@ -601,48 +758,119 @@ class HostConnection(object):
             self._stream_available_condition.notify()
 
     def _replace(self, connection):
+        reservation = _lifecycle.ConnectionFailureReservation(
+            self, connection, replacing=True)
+        if not reservation.is_current():
+            with self._lock:
+                shard_id = connection.features.shard_id
+                if self._replacement_connections.get(shard_id) is connection:
+                    self._replacement_connections.pop(shard_id)
+            return
+        new_connection = None
+        published = False
+        retry = False
+        attempt = None
+        expected = _NOT_SET
         with self._lock:
-            if self.is_shutdown:
-                return
-
-            log.debug("Replacing connection (%s) to %s", id(connection), self.host)
+            shard_id = connection.features.shard_id
+            with self._connection_guard() as current_owner:
+                current = self._connections.get(shard_id)
+                if (not current_owner or
+                        (current is not None and current is not connection) or
+                        (current is None and
+                         self._replacement_connections.get(shard_id) is not connection)):
+                    return
+                self._connections.pop(shard_id, None)
+            log.debug("Replacing connection (%s) to %s",
+                      id(connection), self.host)
+            self._replacement_connections[shard_id] = connection
             try:
-                if connection.features.shard_id in self._connections:
-                    del self._connections[connection.features.shard_id]
-                if self.host.sharding_info and not self._session.cluster.shard_aware_options.disable:
-                    self._connecting.add(connection.features.shard_id)
-                    self._session.submit(self._open_connection_to_missing_shard, connection.features.shard_id)
-                else:
-                    connection = self._session.cluster.connection_factory(self.host.endpoint,
-                                                                          on_orphaned_stream_released=self.on_orphaned_stream_released)
-                    if self._keyspace:
-                        connection.set_keyspace_blocking(self._keyspace)
-                    self._connections[connection.features.shard_id] = connection
-            except Exception:
-                log.warning("Failed reconnecting %s. Retrying." % (self.host.endpoint,))
-                self._session.submit(self._replace, connection)
-            else:
-                self._is_replacing = False
-                with self._stream_available_condition:
-                    self._stream_available_condition.notify()
+                if (self.host.sharding_info and not
+                        self._session.cluster.shard_aware_options.disable):
+                    self._submit_shard_attempt(shard_id)
+                    return
+                attempt = self._begin_shard_attempt(shard_id)
+                if attempt is None:
+                    return
+                new_connection = self._session.cluster.connection_factory(
+                    self.endpoint,
+                    on_orphaned_stream_released=self.on_orphaned_stream_released)
+                log.debug("Received replacement connection (%s) to %s, "
+                          "assigned shard_id=%s", id(new_connection),
+                          self.host,
+                          new_connection.features.shard_id)
+                expected = self._connections.get(new_connection.features.shard_id)
+                if expected is None or expected.orphaned_threshold_reached:
+                    published = self._sync_keyspace(
+                        new_connection, attempt=attempt, expected=expected)
+            except Exception as exc:
+                # Only the original owner may retry a failed connection.
+                with self._connection_guard(
+                        attempt, new_connection, expected) as current_owner:
+                    retry = (current_owner and
+                             self._replacement_connections.get(shard_id)
+                             is connection)
+                if retry:
+                    log.warning("Failed reconnecting %s. Retrying: %s",
+                                self.endpoint, exc)
+                    try:
+                        retry = self._session.submit(
+                            self._replace, connection) is not None
+                    except Exception as retry_exc:
+                        retry = False
+                        with self._connection_guard() as current_owner:
+                            report_error = (
+                                current_owner and
+                                self._replacement_connections.get(shard_id)
+                                is connection)
+                        if report_error:
+                            log.warning(
+                                "Failed scheduling reconnection to %s: %s",
+                                self.endpoint, retry_exc)
+            finally:
+                if attempt is not None:
+                    self._finish_shard_attempt(attempt)
+                if (not retry and
+                        self._replacement_connections.get(shard_id) is connection):
+                    self._replacement_connections.pop(shard_id)
+        if new_connection is not None and not published:
+            log.debug("Closing unpublished replacement connection (%s) to %s",
+                      id(new_connection), self.host)
+            new_connection.close()
 
-    def shutdown(self):
+    def shutdown(self, _failure=None):
         log.debug("Shutting down connections to %s", self.host)
-        with self._lock:
-            if self.is_shutdown:
+        if _failure is None:
+            # Revoke before waiting for work that may be synchronizing USE.
+            with self._membership_lock:
+                self._ownership.retired = True
+        shutdown_lock = _failure.locked() if _failure is not None else self._lock
+        with shutdown_lock:
+            if (_failure is not None and not _failure.owns_locked()):
                 return
-            else:
+            with self._membership_lock:
+                if self.is_shutdown:
+                    return
+                if _failure is not None:
+                    # Only this reservation may retain failure authority after
+                    # its own guarded retirement clears the shard slots.
+                    _failure.retired = True
+                self._ownership.retired = True
                 self.is_shutdown = True
+                connections_to_close = self._connections.copy()
+                self._connections.clear()
+                self._connection_attempts.clear()
+                self._connecting.clear()
+                futures_to_cancel = tuple(self._shard_connections_futures)
             with self._stream_available_condition:
                 self._stream_available_condition.notify_all()
 
-            for future in self._shard_connections_futures:
-                future.cancel()
-
-            connections_to_close = self._connections.copy()
+            self._replacement_connections.clear()
             pending_connections_to_close = self._pending_connections.copy()
-            self._connections.clear()
             self._pending_connections.clear()
+
+        for future in futures_to_cancel:
+            future.cancel()
 
         # connection.close can call pool.return_connection, which will
         #  obtain self._lock via self._stream_available_condition.
@@ -667,12 +895,17 @@ class HostConnection(object):
             for conn in trash_conns:
                 conn.close()
 
-    def _close_excess_connections(self):
+    def _close_excess_connections(self, _attempt=None):
+        guard = (self._connection_guard(_attempt) if _attempt is not None
+                 else self._membership_lock)
         with self._lock:
-            if not self._excess_connections:
-                return
-            conns = self._excess_connections.copy()
-            self._excess_connections.clear()
+            with guard as current:
+                if _attempt is not None and not current:
+                    return
+                if not self._excess_connections:
+                    return
+                conns = self._excess_connections.copy()
+                self._excess_connections.clear()
 
         for c in conns:
             log.debug("Closing excess connection (%s) to %s", id(c), self.host)
@@ -683,198 +916,237 @@ class HostConnection(object):
         self.advanced_shardaware_block_until = max(time.time() + secs, self.advanced_shardaware_block_until)
 
     def _get_shard_aware_endpoint(self):
-        if (self.advanced_shardaware_block_until and self.advanced_shardaware_block_until < time.time()) or \
+        """
+        Return an endpoint for the advertised shard-aware port, if usable.
+
+        Plaintext clusters use shard_aware_port. SSL-enabled clusters use only
+        shard_aware_port_ssl; if it is absent, return None so the pool opens a
+        regular SSL connection instead of falling back to the plaintext port.
+        Explicit ssl_options={}, like ssl_context, marks the cluster SSL-enabled.
+        Unix sockets bypass advertised TCP ports and source-port shard targeting.
+        """
+        if isinstance(self.endpoint, UnixSocketEndPoint):
+            return None
+
+        if (self.advanced_shardaware_block_until and self.advanced_shardaware_block_until > time.time()) or \
            self._session.cluster.shard_aware_options.disable_shardaware_port:
             return None
 
+        cluster = self._session.cluster
+        ssl_enabled = cluster.ssl_context is not None or cluster.ssl_options is not None
+
         endpoint = None
-        if self._session.cluster.ssl_options and self.host.sharding_info.shard_aware_port_ssl:
-            endpoint = copy.copy(self.host.endpoint)
+        if ssl_enabled and self.host.sharding_info.shard_aware_port_ssl:
+            endpoint = copy.copy(self.endpoint)
             endpoint._port = self.host.sharding_info.shard_aware_port_ssl
-        elif self.host.sharding_info.shard_aware_port:
-            endpoint = copy.copy(self.host.endpoint)
+        elif not ssl_enabled and self.host.sharding_info.shard_aware_port:
+            endpoint = copy.copy(self.endpoint)
             endpoint._port = self.host.sharding_info.shard_aware_port
+
+        if endpoint is not None:
+            # Another listener of this same node, with the same TLS
+            # credentials, so it offers and refreshes the session cached for
+            # the node rather than one of its own.
+            endpoint._tls_session_cache_key_override = \
+                self.endpoint.tls_session_cache_key
 
         return endpoint
 
-    def _open_connection_to_missing_shard(self, shard_id):
-        """
-        Creates a new connection, checks its shard_id and populates our shard
-        aware connections if the current shard_id is missing a connection.
+    @contextmanager
+    def _connection_guard(self, attempt=None, conn=None, expected=_NOT_SET):
+        # Membership -> Session -> Host matches pool publication. Never take
+        # the work lock or run I/O/callbacks inside these short guards.
+        with self._membership_lock:
+            with self._ownership.locked():
+                current = self._ownership.owns_locked(self)
+                if attempt is not None:
+                    shard_id, token = attempt
+                    current = (current and
+                               self._connection_attempts.get(shard_id) is token)
+                if conn is not None and expected is not _NOT_SET:
+                    current = (current and self._connections.get(
+                        conn.features.shard_id) is expected)
+                yield current
 
-        The `shard_id` parameter is only here to control parallelism on
-        attempts to connect. This means that if this attempt finds another
-        missing shard_id, we will keep it anyway.
+    def _begin_shard_attempt(self, shard_id, _coalesce=False):
+        with self._connection_guard() as current:
+            if not current or (_coalesce and shard_id in self._connecting):
+                return None
+            # Tokens fence late completions and cleanup independently of
+            # creation generations and exact installed pool ownership.
+            token = object()
+            self._connection_attempts[shard_id] = token
+            self._connecting.add(shard_id)
+            return shard_id, token
 
-        NOTE: This is an optimistic implementation since we cannot control
-        which shard we want to connect to from the client side and depend on
-        the round-robin of the system.clients shard_id attribution.
+    def _finish_shard_attempt(self, attempt):
+        shard_id, token = attempt
+        with self._membership_lock:
+            if self._connection_attempts.get(shard_id) is token:
+                self._connection_attempts.pop(shard_id)
+                self._connecting.discard(shard_id)
 
-        If we get a duplicate connection to some shard, we put it into the
-        excess connection pool. The more connections a particular shard has,
-        the smaller the chance that further connections will be assigned
-        to that shard.
-        """
-        with self._lock:
-            if self.is_shutdown:
-                return
-        shard_aware_endpoint = self._get_shard_aware_endpoint()
-        log.debug("shard_aware_endpoint=%r", shard_aware_endpoint)
-        if shard_aware_endpoint:
-            try:
-                conn = self._session.cluster.connection_factory(shard_aware_endpoint, host_conn=self, on_orphaned_stream_released=self.on_orphaned_stream_released,
-                                                                shard_id=shard_id,
-                                                                total_shards=self.host.sharding_info.shards_count)
-                conn.original_endpoint = self.host.endpoint
-            except Exception as exc:
-                log.error("Failed to open connection to %s, on shard_id=%i: %s", self.host, shard_id, exc)
-                raise
-        else:
-            conn = self._session.cluster.connection_factory(self.host.endpoint, host_conn=self, on_orphaned_stream_released=self.on_orphaned_stream_released)
-
-        log.debug(
-            "Received a connection %s for shard_id=%i on host %s",
-            id(conn),
-            conn.features.shard_id if conn.features.shard_id is not None else -1,
-            self.host)
-        if self.is_shutdown:
-            log.debug("Pool for host %s is in shutdown, closing the new connection (%s)", self.host, id(conn))
-            conn.close()
+    def _submit_shard_attempt(self, shard_id, _coalesce=False):
+        attempt = self._begin_shard_attempt(shard_id, _coalesce=_coalesce)
+        if attempt is None:
             return
+        try:
+            future = self._session.submit(
+                self._open_connection_to_missing_shard, shard_id, attempt)
+        except Exception:
+            self._finish_shard_attempt(attempt)
+            raise
+        if isinstance(future, Future):
+            with self._membership_lock:
+                self._shard_connections_futures.append(future)
+                cancel_pending = self._ownership.retired or self.is_shutdown
 
-        if shard_aware_endpoint and shard_id != conn.features.shard_id:
-            # connection didn't land on expected shared
-            # assuming behind a NAT, disabling advanced shard aware for a while
-            self.disable_advanced_shard_aware(10 * 60)
+            def finished(completed):
+                with self._membership_lock:
+                    self._shard_connections_futures.remove(completed)
+                if completed.cancelled():
+                    self._finish_shard_attempt(attempt)
 
-        old_conn = self._connections.get(conn.features.shard_id)
-        if old_conn is None or old_conn.orphaned_threshold_reached:
-            log.debug(
-                "New connection (%s) created to shard_id=%i on host %s",
-                id(conn),
-                conn.features.shard_id,
-                self.host
-            )
-            old_conn = None
-            with self._lock:
-                is_shutdown = self.is_shutdown
-                if not is_shutdown:
-                    if conn.features.shard_id in self._connections:
-                        # Move the current connection to the trash and use the new one from now on
-                        old_conn = self._connections[conn.features.shard_id]
-                        log.debug(
-                            "Replacing overloaded connection (%s) with (%s) for shard %i for host %s",
-                            id(old_conn),
-                            id(conn),
-                            conn.features.shard_id,
-                            self.host
-                        )
-                    if self._keyspace:
-                        conn.set_keyspace_blocking(self._keyspace)
-                    self._connections[conn.features.shard_id] = conn
+            future.add_done_callback(finished)
+            if cancel_pending:
+                # Submission can return after shutdown took its snapshot.
+                # cancel() runs callbacks, so keep it outside membership.
+                future.cancel()
+        if future is None:
+            self._finish_shard_attempt(attempt)
 
-            if is_shutdown:
+    def _open_connection_to_missing_shard(self, shard_id, _attempt=None):
+        """Open an optimistic shard connection, retaining its original owner.
+
+        The server may assign another shard. Capture that slot when it is
+        known, then require it to remain unchanged through keyspace setup.
+        """
+        attempt = _attempt or self._begin_shard_attempt(shard_id)
+        if attempt is None:
+            return
+        conn = None
+        retained = False
+        old_conn = None
+        expected = _NOT_SET
+        try:
+            with self._connection_guard(attempt) as current:
+                if not current:
+                    return
+            shard_aware_endpoint = self._get_shard_aware_endpoint()
+            if shard_aware_endpoint:
+                conn = self._session.cluster.connection_factory(
+                    shard_aware_endpoint, host_conn=self,
+                    on_orphaned_stream_released=self.on_orphaned_stream_released,
+                    shard_id=shard_id,
+                    total_shards=self.host.sharding_info.shards_count)
+                conn.original_endpoint = self.endpoint
+            else:
+                conn = self._session.cluster.connection_factory(
+                    self.endpoint, host_conn=self,
+                    on_orphaned_stream_released=self.on_orphaned_stream_released)
+
+            log.debug("Received connection (%s) to %s for shard_id=%i, "
+                      "assigned shard_id=%s", id(conn), self.host, shard_id,
+                      conn.features.shard_id)
+            with self._connection_guard(attempt) as current:
+                if not current:
+                    return
+                expected = self._connections.get(conn.features.shard_id)
+            if shard_aware_endpoint and shard_id != conn.features.shard_id:
+                # A different assigned shard may indicate NAT changed the
+                # source port. Back off advanced shard awareness for ten
+                # minutes.
+                self.disable_advanced_shard_aware(10 * 60)
+
+            if expected is None or expected.orphaned_threshold_reached:
+                with self._lock:
+                    retained = self._sync_keyspace(
+                        conn, attempt=attempt, expected=expected)
+                    if retained:
+                        old_conn = expected
+                        if old_conn is not None:
+                            remaining = old_conn.in_flight - len(old_conn.orphaned_request_ids)
+                            if remaining:
+                                self._trash.add(old_conn)
+                                log.debug("Draining replaced connection (%s) "
+                                          "to %s, shard_id=%s: %i requests",
+                                          id(old_conn), self.host,
+                                          old_conn.features.shard_id,
+                                          remaining)
+                                old_conn = None
+                if retained:
+                    log.debug("Published connection (%s) to %s, shard_id=%s",
+                              id(conn), self.host, conn.features.shard_id)
+                if retained and self.num_missing_or_needing_replacement == 0:
+                    self._close_excess_connections(_attempt=attempt)
+            else:
+                if len(self._excess_connections) >= self._excess_connection_limit:
+                    self._close_excess_connections(_attempt=attempt)
+                with self._connection_guard(attempt, conn, expected) as current:
+                    if current and self.num_missing_or_needing_replacement != 0:
+                        self._excess_connections.add(conn)
+                        retained = True
+                if retained:
+                    log.debug("Keeping excess connection (%s) to %s, "
+                              "shard_id=%s", id(conn), self.host,
+                              conn.features.shard_id)
+        except Exception as exc:
+            with self._connection_guard(
+                    attempt, conn, conn if retained else expected) as current:
+                report_error = current
+            if report_error:
+                log.error(
+                    "Failed to open connection to %s, on shard_id=%i: %s",
+                    self.host, shard_id, exc)
+                raise
+        finally:
+            self._finish_shard_attempt(attempt)
+            # close() can return requests or run callbacks; keep it outside
+            # both ownership guards and the pool work lock.
+            if conn is not None and not retained:
+                log.debug("Closing unpublished connection (%s) to %s, "
+                          "shard_id=%s", id(conn), self.host,
+                          conn.features.shard_id)
                 conn.close()
-                return
-
             if old_conn is not None:
-                remaining = old_conn.in_flight - len(old_conn.orphaned_request_ids)
-                if remaining == 0:
-                    log.debug(
-                        "Immediately closing the old connection (%s) for shard %i on host %s",
-                        id(old_conn),
-                        old_conn.features.shard_id,
-                        self.host
-                    )
-                    old_conn.close()
-                else:
-                    log.debug(
-                        "Moving the connection (%s) for shard %i to trash on host %s, %i requests remaining",
-                        id(old_conn),
-                        old_conn.features.shard_id,
-                        self.host,
-                        remaining,
-                    )
-                    with self._lock:
-                        is_shutdown = self.is_shutdown
-                        if not is_shutdown:
-                            self._trash.add(old_conn)
-                    if is_shutdown:
-                        conn.close()
-            num_missing_or_needing_replacement = self.num_missing_or_needing_replacement
-            log.debug(
-                "Connected to %s/%i shards on host %s (%i missing or needs replacement)",
-                len(self._connections),
-                self.host.sharding_info.shards_count,
-                self.host,
-                num_missing_or_needing_replacement
-            )
-            if num_missing_or_needing_replacement == 0:
-                log.debug(
-                    "All shards of host %s have at least one connection, closing %i excess connections",
-                    self.host,
-                    len(self._excess_connections)
-                )
-                self._close_excess_connections()
-        elif self.host.sharding_info.shards_count == len(self._connections) and self.num_missing_or_needing_replacement == 0:
-            log.debug(
-                "All shards are already covered, closing newly opened excess connection %s for host %s",
-                id(self),
-                self.host
-            )
-            conn.close()
-        else:
-            if len(self._excess_connections) >= self._excess_connection_limit:
-                log.debug(
-                    "After connection %s is created excess connection pool size limit (%i) reached for host %s, closing all %i of them",
-                    id(conn),
-                    self._excess_connection_limit,
-                    self.host,
-                    len(self._excess_connections)
-                )
-                self._close_excess_connections()
-
-            log.debug(
-                "Putting a connection %s to shard %i to the excess pool of host %s",
-                id(conn),
-                conn.features.shard_id,
-                self.host
-            )
-            close_connection = False
-            with self._lock:
-                if self.is_shutdown:
-                    close_connection = True
-                else:
-                    self._excess_connections.add(conn)
-            if close_connection:
-                conn.close()
-        self._connecting.discard(shard_id)
+                log.debug("Closing replaced connection (%s) to %s, "
+                          "shard_id=%s",
+                          id(old_conn), self.host, old_conn.features.shard_id)
+                old_conn.close()
 
     def _open_connections_for_all_shards(self, skip_shard_id=None):
-        """
-        Loop over all the shards and try to open a connection to each one.
-        """
+        """Schedule shard attempts, including for an unpublished candidate."""
         with self._lock:
             if self.is_shutdown:
                 return
-
             for shard_id in range(self.host.sharding_info.shards_count):
                 if skip_shard_id is not None and skip_shard_id == shard_id:
                     continue
-                future = self._session.submit(self._open_connection_to_missing_shard, shard_id)
-                if isinstance(future, Future):
-                    self._connecting.add(shard_id)
-                    self._shard_connections_futures.append(future)
+                self._submit_shard_attempt(shard_id)
 
-        trash_conns = None
-        with self._lock:
-            if self._trash:
-                trash_conns = self._trash
-                self._trash = set()
+    def _sync_keyspace(self, conn, attempt=None, expected=_NOT_SET):
+        """Synchronize and publish only while pool, attempt and slot still own.
 
-        if trash_conns is not None:
-            for conn in self._trash:
-                conn.close()
+        Network waits carry no ownership guards. Revalidate after each wait,
+        including corrective USE when the pool target changed concurrently.
+        """
+        while True:
+            with self._connection_guard(attempt, conn, expected) as current:
+                if not current:
+                    return False
+                target = self._keyspace
+            if target and conn.keyspace != target:
+                conn.set_keyspace_blocking(target)
+            with self._connection_guard(attempt, conn, expected) as current:
+                if not current:
+                    return False
+                if self._keyspace != target:
+                    continue
+                self._connections[conn.features.shard_id] = conn
+                break
+        with self._stream_available_condition:
+            self._stream_available_condition.notify_all()
+        return True
 
     def _set_keyspace_for_all_conns(self, keyspace, callback):
         """
@@ -882,7 +1154,12 @@ class HostConnection(object):
         connections have been set, `callback` will be called with two
         arguments: this pool, and a list of any errors that occurred.
         """
-        remaining_callbacks = set(self._connections.values())
+        # Pair the target and member snapshot with final synchronized
+        # insertion. Never take the broad work lock here: it can await
+        # this reply thread.
+        with self._membership_lock:
+            self._keyspace = keyspace
+            remaining_callbacks = set(self._connections.values())
         remaining_callbacks_lock = Lock()
         errors = []
 
@@ -890,23 +1167,63 @@ class HostConnection(object):
             callback(self, errors)
             return
 
-        def connection_finished_setting_keyspace(conn, error):
-            self.return_connection(conn)
+        def connection_finished_setting_keyspace(conn, error,
+                                                 release_connection=True):
+            # set_keyspace_async reserves one stream for every call. Retire
+            # this reply before a corrective USE reserves the next stream.
+            if release_connection:
+                self.return_connection(conn)
+            else:
+                # A synchronous send error already returned the stream, but
+                # a defunct connection still needs normal pool replacement.
+                self.return_connection(conn, stream_was_orphaned=True)
+            if error is None and self._keyspace and conn.keyspace != self._keyspace:
+                # An older USE may finish after a newer one on this shared
+                # connection. Converge on the current pool target before the
+                # callback publishes this connection as synchronized.
+                try:
+                    conn.set_keyspace_async(
+                        self._keyspace, connection_finished_setting_keyspace)
+                except Exception as exc:
+                    error = exc
+                else:
+                    return
             with remaining_callbacks_lock:
                 remaining_callbacks.remove(conn)
-            if error:
-                errors.append(error)
+                if error:
+                    errors.append(error)
+                all_finished = not remaining_callbacks
+            with self._stream_available_condition:
+                self._stream_available_condition.notify_all()
 
-            if not remaining_callbacks:
+            if all_finished:
                 callback(self, errors)
 
-        self._keyspace = keyspace
-        for conn in list(self._connections.values()):
-            conn.set_keyspace_async(keyspace, connection_finished_setting_keyspace)
+        for conn in list(remaining_callbacks):
+            try:
+                conn.set_keyspace_async(keyspace, connection_finished_setting_keyspace)
+            except Exception as exc:
+                # A synchronous send failure has already returned its stream
+                # in Connection.set_keyspace_async; no reply callback follows.
+                connection_finished_setting_keyspace(
+                    conn, exc, release_connection=False)
 
     def get_connections(self):
         connections = self._connections
         return list(connections.values()) if connections else []
+
+    @contextmanager
+    def _lock_usable_connection(self):
+        # Publication owns _membership_lock, then Session and Host locks.
+        # Host must precede Connection, matching ResponseFuture's send path.
+        if not self.is_shutdown:
+            for connection in self._connections.values():
+                with connection.lock:
+                    if not (connection.is_closed or connection.is_defunct):
+                        # Keep this member usable through health publication.
+                        yield True
+                        return
+        yield False
 
     def get_state(self):
         in_flights = [c.in_flight for c in list(self._connections.values())]
@@ -926,5 +1243,3 @@ class HostConnection(object):
     @property
     def _excess_connection_limit(self):
         return self.host.sharding_info.shards_count * self.max_excess_connections_per_shard_multiplier
-
-
