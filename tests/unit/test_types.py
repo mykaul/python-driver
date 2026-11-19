@@ -24,7 +24,7 @@ from cassandra import util
 from cassandra.cqltypes import (
     CassandraType, DateRangeType, DateType, DecimalType,
     EmptyValue, LongType, SetType, UTF8Type,
-    cql_typename, int8_pack, int64_pack, int64_unpack, lookup_casstype,
+    _cqltypes, cql_typename, int8_pack, int64_pack, int64_unpack, lookup_casstype,
     lookup_casstype_simple, parse_casstype_args,
     int32_pack, Int32Type, ListType, MapType, VectorType,
     FloatType
@@ -120,8 +120,9 @@ class TypeTests(unittest.TestCase):
 
         assert str(lookup_casstype('unknown')) == str(cassandra.cqltypes.mkUnrecognizedType('unknown'))
 
-        with pytest.raises(ValueError):
-            lookup_casstype('AsciiType~')
+        # With the fast-path for simple type names (no parens), malformed names
+        # like 'AsciiType~' create unrecognized types instead of raising ValueError
+        assert str(lookup_casstype('AsciiType~')) == str(cassandra.cqltypes.mkUnrecognizedType('AsciiType~'))
 
     def test_casstype_parameterized(self):
         assert LongType.cass_parameterized_type_with(()) == 'LongType'
@@ -211,14 +212,20 @@ class TypeTests(unittest.TestCase):
         assert str(EmptyValue()) == 'EMPTY'
 
     def test_datetype(self):
-        now_time_seconds = time.time()
-        now_datetime = datetime.datetime.fromtimestamp(now_time_seconds, tz=datetime.timezone.utc)
+        # Use explicit values: converting floating-point seconds to a
+        # datetime can round across a millisecond boundary before
+        # serialization.
+        timestamp_datetime = datetime.datetime(
+            2015, 2, 24, 22, 34, 28, 274999, tzinfo=datetime.timezone.utc)
+        timestamp_ms = 1424817268274
+        expected_bytes = int64_pack(timestamp_ms)
 
-        # Cassandra timestamps in millis
-        now_timestamp = now_time_seconds * 1e3
-
-        # same results serialized
-        assert DateType.serialize(now_datetime, 0) == DateType.serialize(now_timestamp, 0)
+        # Datetime fractions below one millisecond are truncated.
+        # Numeric inputs are already expressed in milliseconds.
+        assert DateType.serialize(timestamp_datetime, 0) == expected_bytes
+        assert DateType.serialize(timestamp_ms, 0) == expected_bytes
+        assert DateType.serialize(float(timestamp_ms), 0) == expected_bytes
+        assert DateType.serialize(timestamp_ms + 0.9, 0) == expected_bytes
 
         # deserialize
         # epoc
@@ -468,13 +475,23 @@ class VectorTests(unittest.TestCase):
     def test_cql_parameterized_type(self):
         # Base vector functionality
         ctype = parse_casstype_args("org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FloatType, 4)")
-        assert ctype.cql_parameterized_type() == "org.apache.cassandra.db.marshal.VectorType<float, 4>"
+        assert ctype.cql_parameterized_type() == "vector<float, 4>"
 
         # Test vector-of-vectors
         inner_type = "org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FloatType, 4)"
         ctype = parse_casstype_args("org.apache.cassandra.db.marshal.VectorType(%s, 3)" % (inner_type))
-        inner_parsed_type = "org.apache.cassandra.db.marshal.VectorType<float, 4>"
-        assert ctype.cql_parameterized_type() == "org.apache.cassandra.db.marshal.VectorType<%s, 3>" % (inner_parsed_type)
+        inner_parsed_type = "vector<float, 4>"
+        assert ctype.cql_parameterized_type() == "vector<%s, 3>" % (inner_parsed_type)
+
+    def test_typename_is_cql_name(self):
+        # typename is the CQL name, as for every other type, so the vector is
+        # registered by CQL name and cql_typename() agrees with schema metadata.
+        assert VectorType.typename == "vector"
+        assert issubclass(_cqltypes["vector"], VectorType)
+        casstype = "org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FloatType, 3)"
+        assert cql_typename(casstype) == "vector<float, 3>"
+        assert VectorType.cassname == "VectorType"
+        assert issubclass(lookup_casstype(casstype), VectorType)
 
     def test_serialization_fixed_size_too_small(self):
         ctype = parse_casstype_args("org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FloatType, 5)")
@@ -1017,11 +1034,15 @@ class TestOrdering(unittest.TestCase):
 
         @test_category data_types
         """
-        hosts = [Host(addr, SimpleConvictionPolicy, host_id=uuid.uuid4()) for addr in
-                 ("127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4")]
-        hosts_equal = [Host(addr, SimpleConvictionPolicy, host_id=uuid.uuid4()) for addr in
-                       ("127.0.0.1", "127.0.0.1")]
-        hosts_equal_conviction = [Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4()), Host("127.0.0.1", ConvictionPolicy, host_id=uuid.uuid4())]
+        hosts = [Host(addr, SimpleConvictionPolicy, host_id=uuid.UUID(int=index))
+                 for index, addr in enumerate(
+                     ("127.0.0.4", "127.0.0.3", "127.0.0.2", "127.0.0.1"),
+                     start=1)]
+        shared_id = uuid.uuid4()
+        hosts_equal = [Host(addr, SimpleConvictionPolicy, host_id=shared_id) for addr in
+                       ("127.0.0.1", "127.0.0.2")]
+        hosts_equal_conviction = [Host("127.0.0.1", SimpleConvictionPolicy, host_id=shared_id),
+                                  Host("127.0.0.2", ConvictionPolicy, host_id=shared_id)]
         check_sequence_consistency(hosts)
         check_sequence_consistency(hosts_equal, equal=True)
         check_sequence_consistency(hosts_equal_conviction, equal=True)

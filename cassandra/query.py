@@ -29,6 +29,7 @@ from cassandra import ConsistencyLevel, OperationTimedOut
 from cassandra.util import unix_time_from_uuid1, maybe_add_timeout_to_query
 from cassandra.encoder import Encoder
 import cassandra.encoder
+from cassandra.marshal import uint16_pack
 from cassandra.policies import ColDesc
 from cassandra.protocol import _UNSET_VALUE
 from cassandra.util import OrderedDict, _sanitize_identifiers
@@ -299,9 +300,17 @@ class Statement(object):
         self.is_idempotent = is_idempotent
 
     def _key_parts_packed(self, parts):
+        _pack = uint16_pack
         for p in parts:
-            l = len(p)
-            yield struct.pack(">H%dsB" % l, l, p, 0)
+            # Normalize to bytes so any buffer-protocol object (bytearray,
+            # memoryview, including non-contiguous slices, etc.) is accepted,
+            # matching (and slightly broadening) what struct.pack used to
+            # tolerate here. This is a cheap no-op when p is already bytes.
+            if not isinstance(p, bytes):
+                p = bytes(p)
+            # Single allocation via join(), instead of chained `+` which
+            # would create an extra intermediate bytes object.
+            yield b''.join((_pack(len(p)), p, b'\x00'))
 
     def _get_routing_key(self):
         return self._routing_key
@@ -451,13 +460,16 @@ class PreparedStatement(object):
     protocol_version = None
     query_id = None
     query_string = None
-    result_metadata = None
-    result_metadata_id = None
+    _result_metadata_and_id = (None, None)
     column_encryption_policy = None
     routing_key_indexes = None
     _routing_key_index_set = None
     serial_consistency_level = None  # TODO never used?
     _is_lwt = False
+    # Set once we've logged the "new metadata id without column metadata" anomaly
+    # for this statement, to avoid logging it on every execute while a misbehaving
+    # server keeps returning it. Re-armed whenever the metadata is updated.
+    _warned_missing_column_metadata = False
 
     def __init__(self, column_metadata, query_id, routing_key_indexes, query,
                  keyspace, protocol_version, result_metadata, result_metadata_id,
@@ -468,11 +480,56 @@ class PreparedStatement(object):
         self.query_string = query
         self.keyspace = keyspace
         self.protocol_version = protocol_version
-        self.result_metadata = result_metadata
-        self.result_metadata_id = result_metadata_id
+        self._result_metadata_and_id = (result_metadata, result_metadata_id)
         self.column_encryption_policy = column_encryption_policy
         self.is_idempotent = False
         self._is_lwt = is_lwt
+
+    @property
+    def result_metadata_and_id(self):
+        """
+        The cached result metadata and its metadata id as one immutable
+        ``(result_metadata, result_metadata_id)`` pair.
+
+        Read this property when both values are needed together: the tuple is
+        replaced atomically by :meth:`update_result_metadata`, so a single read
+        can never observe the metadata of one schema version paired with the
+        metadata id of another.
+        """
+        return self._result_metadata_and_id
+
+    @property
+    def result_metadata(self):
+        """
+        Cached result metadata (column definitions) from PREPARE. Read-only:
+        :meth:`update_result_metadata` is the only way to replace it, so it can
+        never be assigned separately from the id it belongs to.
+        """
+        return self._result_metadata_and_id[0]
+
+    @property
+    def result_metadata_id(self):
+        """
+        Cached result metadata id (hash) from PREPARE. Read-only:
+        :meth:`update_result_metadata` is the only way to replace it, so it can
+        never be assigned separately from the metadata it describes.
+        """
+        return self._result_metadata_and_id[1]
+
+    def update_result_metadata(self, result_metadata, result_metadata_id):
+        """
+        Replace the cached result metadata and metadata id together, in a single
+        atomic attribute store. Response callbacks may update a statement while
+        request threads read it; updating the pair in one step (rather than the
+        two fields separately) prevents a reader from pairing a fresh metadata id
+        with stale metadata — a state in which the server would skip sending
+        metadata and rows would be decoded against the wrong columns.
+
+        Also re-arms :attr:`_warned_missing_column_metadata`, so an anomaly that
+        recurs after the metadata was recovered is logged again.
+        """
+        self._result_metadata_and_id = (result_metadata, result_metadata_id)
+        self._warned_missing_column_metadata = False
 
     @classmethod
     def from_message(cls, query_id, column_metadata, pk_indexes, cluster_metadata,
@@ -565,6 +622,7 @@ class BoundStatement(Statement):
         self.custom_payload = prepared_statement.custom_payload
         self.is_idempotent = prepared_statement.is_idempotent
         self.values = []
+        self._routing_key_cache = None
 
         meta = prepared_statement.column_metadata
         if meta:
@@ -581,7 +639,15 @@ class BoundStatement(Statement):
         and returns this instance.  Note that `values` *must* be:
 
         * a sequence, even if you are only binding one value, or
-        * a dict that relates 1-to-1 between dict keys and columns
+        * a dict that maps prepared marker names to values
+
+        Bind anonymous ``?`` markers with a sequence, in marker order. The server
+        supplies names for anonymous markers (for example, ``IN(column)``), but
+        those names can change between server versions. Dictionary keys are
+        matched exactly against prepared metadata, so relying on synthesized
+        names can fail during an upgrade. Use explicit ``:name`` markers when
+        dictionary binding is needed. Dictionary lookup happens locally; values
+        are always sent to the coordinator positionally.
 
         .. versionchanged:: 2.6.0
 
@@ -634,14 +700,13 @@ class BoundStatement(Statement):
                 "Too few arguments provided to bind() (got %d, required %d for routing key)" %
                 (value_len, len(self.prepared_statement.routing_key_indexes)))
 
-        self.raw_values = values
-        self.values = []
+        serialized_values = []
         for value, col_spec in zip(values, col_meta):
             if value is None:
-                self.values.append(None)
+                serialized_values.append(None)
             elif value is UNSET_VALUE:
                 if proto_version >= 4:
-                    self._append_unset_value()
+                    self._append_unset_value(serialized_values)
                 else:
                     raise ValueError("Attempt to bind UNSET_VALUE while using unsuitable protocol version (%d < 4)" % proto_version)
             else:
@@ -652,7 +717,7 @@ class BoundStatement(Statement):
                     col_bytes = col_type.serialize(value, proto_version)
                     if uses_ce:
                         col_bytes = ce_policy.encrypt(col_desc, col_bytes)
-                    self.values.append(col_bytes)
+                    serialized_values.append(col_bytes)
                 except (TypeError, struct.error) as exc:
                     actual_type = type(value)
                     message = ('Received an argument of invalid type for column "%s". '
@@ -660,19 +725,26 @@ class BoundStatement(Statement):
                     raise TypeError(message)
 
         if proto_version >= 4:
-            diff = col_meta_len - len(self.values)
+            diff = col_meta_len - len(serialized_values)
             if diff:
                 for _ in range(diff):
-                    self._append_unset_value()
+                    self._append_unset_value(serialized_values)
 
+        # Replace the values and their cached key only after a successful
+        # bind, so serialization failures preserve the previous bound state.
+        self.raw_values = values
+        self.values = serialized_values
+        self._routing_key_cache = None
         return self
 
-    def _append_unset_value(self):
-        next_index = len(self.values)
+    def _append_unset_value(self, serialized_values=None):
+        if serialized_values is None:
+            serialized_values = self.values
+        next_index = len(serialized_values)
         if self.prepared_statement.is_routing_key_index(next_index):
             col_meta = self.prepared_statement.column_metadata[next_index]
             raise ValueError("Cannot bind UNSET_VALUE as a part of the routing key '%s'" % col_meta.name)
-        self.values.append(UNSET_VALUE)
+        serialized_values.append(UNSET_VALUE)
 
     @property
     def routing_key(self):
@@ -682,13 +754,16 @@ class BoundStatement(Statement):
         if self._routing_key is not None:
             return self._routing_key
 
+        if self._routing_key_cache is not None:
+            return self._routing_key_cache
+
         routing_indexes = self.prepared_statement.routing_key_indexes
         if len(routing_indexes) == 1:
-            self._routing_key = self.values[routing_indexes[0]]
+            self._routing_key_cache = self.values[routing_indexes[0]]
         else:
-            self._routing_key = b"".join(self._key_parts_packed(self.values[i] for i in routing_indexes))
+            self._routing_key_cache = b"".join(self._key_parts_packed(self.values[i] for i in routing_indexes))
 
-        return self._routing_key
+        return self._routing_key_cache
 
     def is_lwt(self):
         return self.prepared_statement.is_lwt()
@@ -1021,7 +1096,7 @@ class QueryTrace(object):
         This can be used to query events from partial sessions.
 
         `query_cl` specifies a consistency level to use for polling the trace tables,
-        if it should be different than the session default.
+        if different from the session default.
         """
         attempt = 0
         start = time.time()
@@ -1046,7 +1121,7 @@ class QueryTrace(object):
             if is_complete:
                 log.debug("Fetched trace info for trace ID: %s", self.trace_id)
             else:
-                log.debug("Fetching parital trace info for trace ID: %s", self.trace_id)
+                log.debug("Fetching partial trace info for trace ID: %s", self.trace_id)
 
             self.request_type = session_row.request
             self.duration = timedelta(microseconds=session_row.duration) if is_complete else None

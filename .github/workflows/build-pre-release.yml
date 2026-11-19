@@ -14,8 +14,8 @@ on:
         default: "linux,macos-x86,macos-arm,windows,linux-aarch64"
 
 jobs:
-  build-and-publish:
-    uses: ./.github/workflows/lib-build-and-push.yml
+  build:
+    uses: ./.github/workflows/lib-build.yml
     with:
       python-version: ${{ inputs.python-version }}
       target: ${{ inputs.target }}

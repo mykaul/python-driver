@@ -20,13 +20,14 @@ from cassandra.protocol import (
     write_stringmultimap, write_int, write_string, SupportedMessage, ReadyMessage, ServerError
 )
 from cassandra.connection import DefaultEndPoint
-from tests import is_monkey_patched
 
 import io
 import random
 from functools import wraps
 from itertools import cycle
 from io import BytesIO
+from queue import Empty, Queue
+from threading import Event
 from unittest.mock import Mock, MagicMock
 
 import errno
@@ -51,11 +52,11 @@ class TimerCallback(object):
 
     def __init__(self, expected_wait):
         self.invoked = False
-        self.created_time = time.time()
+        self.created_time = time.monotonic()
         self.expected_wait = expected_wait
 
     def invoke(self):
-        self.invoked_time = time.time()
+        self.invoked_time = time.monotonic()
         self.invoked = True
 
     def was_invoked(self):
@@ -108,41 +109,47 @@ def submit_and_wait_for_completion(unit_test, create_timer, start, end, incremen
    :param split_range: True to split the range between incrementing and decrementing.
    """
 
-    # Various lists for tracking callback as completed or pending
-    pending_callbacks = []
-    completed_callbacks = []
+    completed = Queue()
+    callbacks = []
+    timers = []
+    timeouts = [get_timeout(t, start, end, precision, split_range)
+                for t in range(start, end, increment)]
+    deadline = time.monotonic() + max(timeouts, default=0) + 5
 
-    # submit timers with various timeouts
-    for gross_time in range(start, end, increment):
-        timeout = get_timeout(gross_time, start, end, precision, split_range)
-        callback = TimerCallback(timeout)
-        create_timer(timeout, callback.invoke)
-        pending_callbacks.append(callback)
+    def on_timeout(callback):
+        callback.invoke()
+        completed.put(callback)
 
-    # wait for all the callbacks associated with the timers to be invoked
-    while len(pending_callbacks) is not 0:
-        for callback in pending_callbacks:
-            if callback.was_invoked():
-                pending_callbacks.remove(callback)
-                completed_callbacks.append(callback)
-        time.sleep(.1)
+    try:
+        for timeout in timeouts:
+            callback = TimerCallback(timeout)
+            callbacks.append(callback)
+            timers.append(create_timer(
+                timeout, lambda cb=callback: on_timeout(cb)))
 
-    # ensure they are all called back in a timely fashion
-    # Use a generous tolerance (500ms) to account for CI environments under heavy load,
-    # especially Windows during wheel building where timing can be significantly less precise
-    for callback in completed_callbacks:
-        assert callback.expected_wait == pytest.approx(callback.get_wait_time(), abs=.5)
-
-
-def noop_if_monkey_patched(f):
-    if is_monkey_patched():
-        @wraps(f)
-        def noop(*args, **kwargs):
-            return
-        return noop
-
-    return f
-
+        remaining = set(callbacks)
+        while remaining:
+            try:
+                callback = completed.get(
+                    timeout=max(0, deadline - time.monotonic()))
+            except Empty:
+                pytest.fail(
+                    'Timers did not complete: {} callbacks pending'.format(
+                        len(remaining)))
+            assert callback in remaining, (
+                'Timer callback invoked more than once')
+            remaining.remove(callback)
+            assert callback.invoked_time <= deadline, (
+                'Timer completed after batch deadline')
+            # A reactor must not fire timers early. Scheduling can delay
+            # callbacks, so the overall deadline guards liveness instead
+            # of imposing a per-callback host scheduling latency limit
+            # (#359).
+            assert callback.get_wait_time() >= callback.expected_wait - .01
+        assert completed.empty(), 'Timer callback invoked more than once'
+    finally:
+        for timer in timers:
+            timer.cancel()
 
 class TimerTestMixin(object):
 
@@ -180,12 +187,20 @@ class TimerTestMixin(object):
         callback = TimerCallback(timeout)
         timer = self.create_timer(timeout, callback.invoke)
         timer.cancel()
-        # Release context allow for timer thread to run.
-        time.sleep(timeout * 2)
+        # A later timer proves the reactor serviced the cancelled timer,
+        # even when a busy runner delays it beyond the requested
+        # timeout.
+        serviced = Event()
+        sentinel = self.create_timer(timeout * 2, serviced.set)
+        try:
+            assert serviced.wait(10), 'reactor did not service the timer queue'
+        finally:
+            sentinel.cancel()
         timer_manager = self._timers
-        # Assert that the cancellation was honored
-        assert not timer_manager._queue
-        assert not timer_manager._new_timers
+        # The sentinel may still be queued until its callback returns.
+        assert all(entry[1] is not timer for entry in timer_manager._queue)
+        assert all(
+            entry[1] is not timer for entry in timer_manager._new_timers)
         assert not callback.was_invoked()
 
 

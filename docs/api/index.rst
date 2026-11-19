@@ -8,6 +8,7 @@ Core Driver
 
    cassandra
    cassandra/cluster
+   cassandra/client-routes
    cassandra/policies
    cassandra/auth
    cassandra/metadata
@@ -19,14 +20,12 @@ Core Driver
    cassandra/decoder
    cassandra/concurrent
    cassandra/connection
+   cassandra/ssl-session-cache
    cassandra/util
    cassandra/timestamps
    cassandra/io/asyncioreactor
    cassandra/io/asyncorereactor
-   cassandra/io/eventletreactor
    cassandra/io/libevreactor
-   cassandra/io/geventreactor
-   cassandra/io/twistedreactor
 
 .. _om_api:
 

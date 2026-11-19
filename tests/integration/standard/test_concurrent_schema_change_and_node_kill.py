@@ -1,14 +1,15 @@
-import os
 import logging
 import unittest
 
+from cassandra import ConsistencyLevel
+from cassandra.query import SimpleStatement
 from tests.integration import use_cluster, get_node, local, TestCluster
 
 LOGGER = logging.getLogger(__name__)
 
 
 def setup_module():
-    use_cluster('test_concurrent_schema_change_and_node_kill', [3], start=True)
+    use_cluster('test_schema_kill', [3], start=True)
 
 @local
 class TestConcurrentSchemaChangeAndNodeKill(unittest.TestCase):
@@ -27,10 +28,14 @@ class TestConcurrentSchemaChangeAndNodeKill(unittest.TestCase):
             "DROP KEYSPACE IF EXISTS ks_deadlock;")
         self.session.execute(
             "CREATE KEYSPACE IF NOT EXISTS ks_deadlock "
-            "WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '2' };")
+            "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '2' };")
         self.session.set_keyspace('ks_deadlock')
         self.session.execute("CREATE TABLE IF NOT EXISTS some_table(k int, c int, v int, PRIMARY KEY (k, v));")
         self.session.execute("INSERT INTO some_table (k, c, v) VALUES (1, 2, 3);")
         node2.stop(wait=False, gently=False)
         self.session.execute("ALTER TABLE some_table ADD v2 int;", timeout=180)
-        print(self.session.execute("SELECT * FROM some_table WHERE k = 1;").all())
+        # Stopping node2 may leave only one live replica for this partition.
+        # Verify schema progress without requiring a local quorum for the read.
+        query = SimpleStatement("SELECT * FROM some_table WHERE k = 1;",
+                                consistency_level=ConsistencyLevel.LOCAL_ONE)
+        print(self.session.execute(query).all())
