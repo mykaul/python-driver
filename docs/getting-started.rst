@@ -38,6 +38,11 @@ of these nodes it will *automatically discover* the rest of the
 nodes in the cluster and connect to them, so you don't need to list
 every node in your cluster.
 
+The application must still be able to reach every discovered node that its
+load-balancing policy may use. See :doc:`connectivity/direct-connectivity` for
+direct and VPC-peered networks, or :doc:`connectivity/client-routes` when nodes
+are exposed through per-node proxies.
+
 If you need to use a non-standard port, use SSL, or customize the driver's
 behavior in some other way, this is the place to do it:
 
@@ -182,9 +187,49 @@ which can be used in place of :class:`~.SimpleStatement` instances or literal
 string queries.  It is automatically prepared against all nodes, and the driver
 handles re-preparing against new nodes and restarted nodes when necessary.
 
-Note that the placeholders for prepared statements are ``?`` characters.  This
-is different than for simple, non-prepared statements (although future versions
-of the driver may use the same placeholders for both).
+Binding prepared markers
+++++++++++++++++++++++++
+Bind anonymous ``?`` markers with a sequence, in their order in the query.
+For an ``IN`` restriction, one marker can represent a whole list:
+
+.. code-block:: python
+
+    lookup = session.prepare("SELECT * FROM users WHERE user_id IN ?")
+    session.execute(lookup, ([first_user_id, second_user_id],))
+
+For dictionary binding, give the markers explicit names in CQL:
+
+.. code-block:: python
+
+    lookup = session.prepare("SELECT * FROM users WHERE user_id IN :ids")
+    session.execute(lookup, {"ids": [first_user_id, second_user_id]})
+
+The server also reports names for anonymous markers in prepared metadata. These
+are implementation details, not stable application names. For example,
+``IN(user_id)`` can become ``in(user_id)`` after a server upgrade. Do not bind
+anonymous markers using those synthesized names, even when an ordinary column
+name appears to work. Dictionary keys are matched exactly against the prepared
+metadata. Missing keys become unset values with protocol v4 or later, or raise
+``KeyError`` with earlier protocols. When routing-key indexes are available,
+unset values at those indexes are rejected locally.
+
+The driver resolves dictionary keys locally and sends prepared values to the
+coordinator by position. During a mixed-version rollout, positional binding and
+explicit marker names avoid reliance on which node supplied the metadata.
+Automatic repreparation after an ``UNPREPARED`` response replaces all bind
+metadata, including names, types, keyspace and table, while keeping the original
+routing-key indexes. A direct prepared execution updates the statement object
+being executed; a batch updates the driver's cached statement for that query id.
+If the same query was prepared more than once, other statement objects retain
+their metadata. Subsequent binds on the updated object use the new metadata.
+The current request is retried with its already serialized positional values;
+the driver does not reinterpret or serialize those values again.
+Changes to parameter types or layout require a fresh call to
+:meth:`~.Session.prepare()` and binding new values. Repreparing on another node
+cannot make synthesized names safe to use as application dictionary keys.
+
+Prepared markers (``?`` or ``:name``) differ from the ``%s`` and ``%(name)s``
+placeholders used by simple, non-prepared statements.
 
 Passing Parameters to CQL Queries
 ---------------------------------
@@ -391,7 +436,8 @@ The consistency level used for a query determines how many of the
 replicas of the data you are interacting with need to respond for
 the query to be considered a success.
 
-By default, :attr:`.ConsistencyLevel.LOCAL_ONE` will be used for all queries.
+By default, :attr:`.ConsistencyLevel.LOCAL_QUORUM` will be used for all queries.
+This requires a quorum of replicas in the local data center to respond.
 You can specify a different default by setting the :attr:`.ExecutionProfile.consistency_level`
 for the execution profile with key :data:`~.cluster.EXEC_PROFILE_DEFAULT`.
 To specify a different consistency level per request, wrap queries

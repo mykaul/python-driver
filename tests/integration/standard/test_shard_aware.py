@@ -11,9 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import time
-import random
 from subprocess import run
 import logging
 
@@ -24,16 +21,16 @@ import pytest
 
 from cassandra.cluster import Cluster
 from cassandra.policies import TokenAwarePolicy, RoundRobinPolicy, ConstantReconnectionPolicy
-from cassandra import OperationTimedOut, ConsistencyLevel
+from cassandra import OperationTimedOut
 
 from tests.integration import use_cluster, get_node, PROTOCOL_VERSION
+from tests.util import wait_until_not_raised
 
 LOGGER = logging.getLogger(__name__)
 
 
 def setup_module():
-    os.environ['SCYLLA_EXT_OPTS'] = "--smp 2"
-    use_cluster('shard_aware', [3], start=True)
+    use_cluster('cluster_tests', [3], start=True, smp=2)
 
 
 class TestShardAwareIntegration(unittest.TestCase):
@@ -77,7 +74,7 @@ class TestShardAwareIntegration(unittest.TestCase):
         self.session.execute(
             """
             CREATE KEYSPACE preparedtests
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '3'}
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '3'} AND tablets = {'enabled': false}
             """)
 
         self.session.execute("USE preparedtests")
@@ -131,17 +128,75 @@ class TestShardAwareIntegration(unittest.TestCase):
         if verify_in_tracing:
             self.verify_same_shard_in_tracing(results, "shard 0")
 
-    def test_all_tracing_coming_one_shard(self):
-        """
-        Testing that shard aware driver is sending the requests to the correct shards
+    def _assert_blocked_node_disconnected(self, node_ip_address, node_port):
+        control_connection = self.cluster.control_connection
+        active_control_connection = control_connection._connection if control_connection else None
+        if active_control_connection and \
+                active_control_connection.endpoint.address == node_ip_address and \
+                active_control_connection.endpoint.port == node_port:
+            assert active_control_connection.is_closed or active_control_connection.is_defunct
 
-        using the traces to validate that all the action been executed on the the same shard.
-        this test is using prepared SELECT statements for this validation
-        """
+        pools = getattr(self.session, '_pools', None) or {}
+        for pool in pools.values():
+            host = pool.host
+            if host.endpoint.address != node_ip_address or host.endpoint.port != node_port:
+                continue
 
+            open_connections = [
+                connection for connection in pool._connections.values()
+                if not (connection.is_closed or connection.is_defunct)
+            ]
+            assert not open_connections
+
+            pending_connections = [
+                connection for connection in pool._pending_connections
+                if not (connection.is_closed or connection.is_defunct)
+            ]
+            assert not pending_connections
+
+    def test_prepared_queries_use_correct_shards(self):
+        """
+        Verify prepared queries use the token's shard.
+
+        Requires tablets to be disabled.
+        """
         self.create_ks_and_cf()
         self.create_data(self.session)
-        self.query_data(self.session)
+        prepared = self.session.prepare('SELECT * FROM cf0 WHERE a=? AND b=?')
+        # These keys cover both shards of the two-shard test cluster.
+        # Independent expectations catch incorrect shard formulas.
+        cases = [(('a', 'b', 'c'), 0), (('100002', 'f', 'g'), 1),
+                 (('e', 'f', 'g'), 0)]
+        hosts = self.cluster.metadata.all_hosts()
+        assert len(hosts) == 3
+
+        for host in hosts:
+            def check_pool():
+                pool = self.session._pools.get(host)
+                assert pool is not None
+                assert host.sharding_info is not None
+                for shard_id in range(host.sharding_info.shards_count):
+                    connection = pool._connections.get(shard_id)
+                    assert connection is not None
+                    assert not connection.is_closed
+                    assert not connection.is_defunct
+
+            wait_until_not_raised(check_pool, delay=0.1, max_attempts=300)
+            tested_shards = set()
+            for row, expected_shard in cases:
+                bound = prepared.bind(row[:2])
+                token = self.cluster.metadata.token_map.token_class.from_key(
+                    bound.routing_key)
+                shard_id = host.sharding_info.shard_id_from_token(token.value)
+                assert shard_id == expected_shard
+                tested_shards.add(expected_shard)
+                future = self.session.execute_async(bound, host=host)
+                assert future.result() == [row]
+                assert future._current_host is host
+                assert (future._connection.endpoint.address ==
+                        host.endpoint.address)
+                assert future._connection.features.shard_id == expected_shard
+            assert tested_shards == set(range(host.sharding_info.shards_count))
 
     def test_connect_from_multiple_clients(self):
         """
@@ -162,27 +217,66 @@ class TestShardAwareIntegration(unittest.TestCase):
             for result in as_completed(futures):
                 print(result)
 
-    @pytest.mark.skip(reason='https://github.com/scylladb/python-driver/issues/221')
     def test_closing_connections(self):
         """
-        Verify that reconnection is working as expected, when connection are being closed.
+        Verify queries use replacements for closed shard connections.
         """
         self.create_ks_and_cf()
         self.create_data(self.session)
-        self.query_data(self.session)
 
-        for i in range(6):
-            assert self.session._pools
-            pool = list(self.session._pools.values())[0]
-            if not pool._connections:
-                continue
-            shard_id = random.choice(list(pool._connections.keys()))
-            pool._connections.get(shard_id).close()
-            time.sleep(5)
-            self.query_data(self.session, verify_in_tracing=False)
+        # Detect closed idle connections promptly. Keep the shared
+        # client's heartbeat configuration for the other shard tests.
+        contact_points = [
+            host.endpoint for host in self.cluster.metadata.all_hosts()]
+        with Cluster(contact_points=contact_points,
+                     protocol_version=PROTOCOL_VERSION,
+                     load_balancing_policy=TokenAwarePolicy(
+                         RoundRobinPolicy()),
+                     reconnection_policy=ConstantReconnectionPolicy(1),
+                     idle_heartbeat_interval=0.1) as cluster:
+            session = cluster.connect('preparedtests', wait_for_all_pools=True)
+            prepared = session.prepare('SELECT * FROM cf0 WHERE a=? AND b=?')
+            rows = [('a', 'b', 'c'), ('100002', 'f', 'g'), ('e', 'f', 'g')]
 
-        time.sleep(10)
-        self.query_data(self.session)
+            def wait_for_shard(host, shard_id, closed_connection=None):
+                def check():
+                    pool = session._pools.get(host)
+                    assert pool is not None
+                    connection = pool._connections.get(shard_id)
+                    assert connection is not None
+                    assert connection is not closed_connection
+                    assert not connection.is_closed
+                    assert not connection.is_defunct
+                    assert connection.features.shard_id == shard_id
+                    return connection
+
+                return wait_until_not_raised(
+                    check, delay=0.1, max_attempts=300)
+
+            for host in cluster.metadata.all_hosts():
+                assert host.sharding_info is not None
+                tested_shards = set()
+                for row in rows:
+                    bound = prepared.bind(row[:2])
+                    token = cluster.metadata.token_map.token_class.from_key(
+                        bound.routing_key)
+                    shard_id = host.sharding_info.shard_id_from_token(
+                        token.value)
+                    tested_shards.add(shard_id)
+                    wait_for_shard(host, shard_id)
+                    future = session.execute_async(bound, host=host)
+                    assert future.result() == [row]
+                    connection = future._connection
+                    assert connection.features.shard_id == shard_id
+                    connection.close()
+
+                    wait_for_shard(host, shard_id, connection)
+                    future = session.execute_async(bound, host=host)
+                    assert future.result() == [row]
+                    assert future._connection is not connection
+                    assert future._connection.features.shard_id == shard_id
+                assert tested_shards == set(
+                    range(host.sharding_info.shards_count))
 
     @pytest.mark.skip
     def test_blocking_connections(self):
@@ -212,13 +306,18 @@ class TestShardAwareIntegration(unittest.TestCase):
                  '--destination {node1_ip_address}/32 -j REJECT --reject-with icmp-port-unreachable'
                  ).format(node1_ip_address=node1_ip_address, node1_port=node1_port).split(' ')
                 )
-            time.sleep(5)
+
+            wait_until_not_raised(
+                lambda: self._assert_blocked_node_disconnected(node1_ip_address, node1_port),
+                delay=0.1,
+                max_attempts=50)
             try:
                 self.query_data(self.session, verify_in_tracing=False)
             except OperationTimedOut:
                 pass
             remove_iptables()
-            time.sleep(5)
-            self.query_data(self.session, verify_in_tracing=False)
+            wait_until_not_raised(
+                lambda: self.query_data(self.session, verify_in_tracing=False),
+                delay=0.5, max_attempts=30)
 
         self.query_data(self.session)

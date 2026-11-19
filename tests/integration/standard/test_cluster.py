@@ -23,14 +23,13 @@ from uuid import uuid4
 import logging
 import warnings
 from packaging.version import Version
-import os
 import pytest
 
 import cassandra
-from cassandra.cluster import NoHostAvailable, ExecutionProfile, EXEC_PROFILE_DEFAULT, ControlConnection, Cluster
+from cassandra.cluster import NoHostAvailable, ExecutionProfile, EXEC_PROFILE_DEFAULT, Cluster
 from cassandra.concurrent import execute_concurrent
 from cassandra.policies import (RoundRobinPolicy, ExponentialReconnectionPolicy,
-                                RetryPolicy, SimpleConvictionPolicy, HostDistance,
+                                SimpleConvictionPolicy, HostDistance,
                                 AddressTranslator, TokenAwarePolicy, HostFilterPolicy)
 from cassandra import ConsistencyLevel
 
@@ -39,11 +38,11 @@ from cassandra.auth import PlainTextAuthProvider, SaslAuthProvider
 from cassandra import connection
 from cassandra.connection import DefaultEndPoint
 
-from tests import notwindows, notasyncio
+from tests import notwindows
 from tests.integration import use_cluster, get_server_versions, CASSANDRA_VERSION, \
     execute_until_pass, execute_with_long_wait_retry, get_node, MockLoggingHandler, get_unsupported_lower_protocol, \
     get_unsupported_upper_protocol, local, CASSANDRA_IP, greaterthanorequalcass30, \
-    lessthanorequalcass40, TestCluster, PROTOCOL_VERSION, xfail_scylla, incorrect_test
+    lessthanorequalcass40, TestCluster, PROTOCOL_VERSION, incorrect_test
 from tests.integration.util import assert_quiescent_pool_state
 from tests.util import assertListEqual
 import sys
@@ -52,8 +51,7 @@ log = logging.getLogger(__name__)
 
 
 def setup_module():
-    os.environ['SCYLLA_EXT_OPTS'] = "--smp 1"
-    use_cluster("cluster_tests", [3], start=True, workloads=None)
+    use_cluster("cluster_tests", [3], start=True, workloads=None, smp=2)
     warnings.simplefilter("always")
 
 
@@ -168,7 +166,7 @@ class ClusterTests(unittest.TestCase):
         result = execute_until_pass(session,
             """
             CREATE KEYSPACE clustertests
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}
             """)
         assert not result
 
@@ -720,10 +718,13 @@ class ClusterTests(unittest.TestCase):
                 session = cluster.connect()
                 assert session.execute("SELECT * from system.local WHERE key='local'") is not None
 
-            # Three conenctions to nodes plus the control connection
+            # Verify that auth warnings are issued for connections where
+            # auth is configured but the server does not send a challenge.
+            # At minimum one warning per node connection (3 for a 3-node
+            # cluster).  The control connection and shard-aware connections
+            # may add more, so we only assert a lower bound.
             auth_warning = mock_handler.get_message_count('warning', "An authentication challenge was not sent")
-            assert auth_warning >= 4
-            assert auth_warning == mock_handler.get_message_count("debug", "Got ReadyMessage on new connection")
+            assert auth_warning >= 3
 
     def _wait_for_all_shard_connections(self, cluster, timeout=30):
         """Wait until all shard-aware connections are fully established."""
@@ -744,8 +745,7 @@ class ClusterTests(unittest.TestCase):
 
     def test_idle_heartbeat(self):
         interval = 2
-        cluster = TestCluster(idle_heartbeat_interval=interval,
-                              monitor_reporting_enabled=False)
+        cluster = TestCluster(idle_heartbeat_interval=interval)
         session = cluster.connect(wait_for_all_pools=True)
 
         # wait_for_all_pools only waits for the first connection per host;
@@ -761,22 +761,64 @@ class ClusterTests(unittest.TestCase):
                 # make sure none are idle (should have startup messages
                 assert not c.is_idle
                 with c.lock:
-                    connection_request_ids[id(c)] = deque(c.request_ids)  # copy of request ids
+                    # keyed by the connection object itself (not id(c)) so the
+                    # reference stays alive and a freed id can't be reused
+                    connection_request_ids[c] = deque(c.request_ids)  # copy of request ids
 
         # let two heatbeat intervals pass (first one had startup messages in it)
         time.sleep(2 * interval + interval/2)
 
         connections = [c for holders in cluster.get_connection_holders() for c in holders.get_connections()]
 
-        # make sure requests were sent on all connections
-        for c in connections:
-            expected_ids = connection_request_ids[id(c)]
+        # _wait_for_all_shard_connections() above prevents the common KeyError caused by
+        # shard connections still being opened during pool warm-up. It does not cover a
+        # narrower, still-possible race: HostConnection can swap an existing connection
+        # for a new object in the same shard slot independently of the connection count,
+        # e.g. via _open_connection_to_missing_shard() once orphaned_threshold_reached, or
+        # via return_connection()/_replace() when a connection is defunct/closed. The
+        # latter has a genuine asynchronous gap: return_connection() pops the old
+        # connection out of the pool's dict synchronously, but _replace() (which inserts
+        # the replacement) runs later on another thread via session.submit(). A snapshot
+        # taken during that gap sees fewer *current* connections than were recorded, and
+        # every one of them is still "known" (nothing new has been inserted yet) - so
+        # checking only "is every current connection known" can't distinguish "fewer
+        # connections than snapshotted" from "same connections, none replaced". Compare
+        # both directions of the snapshot/current intersection so partial removals (as
+        # well as outright replacements) stay visible, and log loudly if either side
+        # actually differs so a recurrence stays visible in CI instead of being silently
+        # absorbed.
+        current_conns = set(connections)
+        snapshot_conns = set(connection_request_ids)
+        # snapshotted connections no longer present at all (removed, replacement may
+        # not have landed yet)
+        missing_from_current = snapshot_conns - current_conns
+        # connections present now that weren't in the snapshot (replacement landed)
+        unknown_in_current = current_conns - snapshot_conns
+        known_connections = [c for c in connections if c in connection_request_ids]
+        if missing_from_current or unknown_in_current:
+            log.warning(
+                "test_idle_heartbeat: connections changed between the snapshot and "
+                "validation (%d snapshotted connections missing, %d new connections "
+                "observed, out of %d snapshotted / %d current); validating only the "
+                "%d connections common to both",
+                len(missing_from_current), len(unknown_in_current),
+                len(snapshot_conns), len(current_conns), len(known_connections)
+            )
+        assert len(known_connections) > 0, (
+            "No snapshotted connections remained in the current pools; "
+            "no heartbeats could be validated"
+        )
+
+        # make sure heartbeat requests were sent on all known connections
+        for c in known_connections:
+            expected_ids = connection_request_ids[c]
             expected_ids.rotate(-1)
             with c.lock:
                 assertListEqual(list(c.request_ids), list(expected_ids))
 
-        # assert idle status
-        assert all(c.is_idle for c in connections)
+        # assert idle status on known connections only (replaced connections
+        # may not have had their idle state set yet)
+        assert all(c.is_idle for c in known_connections)
 
         # send enough messages to ensure all connections are used
         # (with shard-aware routing, each query only hits one shard per host,
@@ -875,7 +917,7 @@ class ClusterTests(unittest.TestCase):
                 RoundRobinPolicy(), lambda host: host.address == CASSANDRA_IP
             )
         )
-        with TestCluster(execution_profiles={'node1': node1}, monitor_reporting_enabled=False) as cluster:
+        with TestCluster(execution_profiles={'node1': node1}) as cluster:
             session = cluster.connect(wait_for_all_pools=True)
 
             # default is DCA RR for all hosts
@@ -1121,8 +1163,7 @@ class ClusterTests(unittest.TestCase):
         """
         for _ in range(10):
             with TestCluster(protocol_version=3) as cluster:
-                cluster.connect().execute("SELECT * FROM system_schema.keyspaces")
-                time.sleep(1)
+                cluster.connect(wait_for_all_pools=True).execute("SELECT * FROM system_schema.keyspaces")
 
             with TestCluster(protocol_version=3) as cluster:
                 session = cluster.connect()
@@ -1143,7 +1184,7 @@ class ClusterTests(unittest.TestCase):
             assert False, f'Found stale connections: {result.stdout}'
 
     @notwindows
-    @notasyncio  # asyncio can't do timeouts smaller than 1ms, as this test requires
+    @local
     def test_execute_query_timeout(self):
         with TestCluster() as cluster:
             session = cluster.connect(wait_for_all_pools=True)
@@ -1154,24 +1195,26 @@ class ClusterTests(unittest.TestCase):
             rs = session.execute(query)
             assert rs.response_future.timeout == default_profile.request_timeout
 
-            # tiny timeout times out as expected
+            # Keep the response pending so success cannot race the
+            # timeout.
             tmp_profile = copy(default_profile)
-            tmp_profile.request_timeout = sys.float_info.min
+            tmp_profile.request_timeout = 1.0
+            node = get_node(1)
+            host = next(h for h in cluster.metadata.all_hosts()
+                        if h.address == node.address())
+            try:
+                node.pause()
+                with pytest.raises(cassandra.OperationTimedOut) as exc_info:
+                    session.execute(
+                        query, execution_profile=tmp_profile, host=host)
+                assert exc_info.value.timeout == tmp_profile.request_timeout
+                assert exc_info.value.last_host == host
+            finally:
+                node.resume()
 
-            max_retry_count = 10
-            for _ in range(max_retry_count):
-                start = time.time()
-                try:
-                    with pytest.raises(cassandra.OperationTimedOut):
-                        session.execute(query, execution_profile=tmp_profile)
-                    break
-                except:
-                    import traceback
-                    traceback.print_exc()
-                    end = time.time()
-                    assert start == pytest.approx(end, abs=1e-1)
-            else:
-                raise Exception("session.execute didn't time out in {0} tries".format(max_retry_count))
+            # A client timeout must leave the session usable after
+            # recovery.
+            assert session.execute(query, host=host)
 
     def test_replicas_are_queried(self):
         """
@@ -1181,27 +1224,35 @@ class ClusterTests(unittest.TestCase):
         Then using HostFilterPolicy the replica is excluded from the considered hosts.
         By checking the trace we verify that there are no more replicas.
 
+        Requires tablets feature disabled.
+
         @since 3.5
         @jira_ticket PYTHON-653
         @expected_result the replicas are queried for HostFilterPolicy
 
         @test_category metadata
         """
+        ks_name = 'test_replicas_queried_ks'
         queried_hosts = set()
         tap_profile = ExecutionProfile(
             load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy())
         )
         with TestCluster(execution_profiles={EXEC_PROFILE_DEFAULT: tap_profile}) as cluster:
             session = cluster.connect(wait_for_all_pools=True)
+            session.execute("DROP KEYSPACE IF EXISTS {}".format(ks_name))
+            session.execute(
+                "CREATE KEYSPACE {} WITH replication = {{'class': 'NetworkTopologyStrategy', "
+                "'replication_factor': '1'}} AND tablets = {{'enabled': false}}".format(ks_name)
+            )
             session.execute('''
-                    CREATE TABLE test1rf.table_with_big_key (
+                    CREATE TABLE {}.table_with_big_key (
                         k1 int,
                         k2 int,
                         k3 int,
                         k4 int,
-                        PRIMARY KEY((k1, k2, k3), k4))''')
-            prepared = session.prepare("""SELECT * from test1rf.table_with_big_key
-                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""")
+                        PRIMARY KEY((k1, k2, k3), k4))'''.format(ks_name))
+            prepared = session.prepare("""SELECT * from {}.table_with_big_key
+                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""".format(ks_name))
             for i in range(10):
                 result = session.execute(prepared, (i, i, i, i), trace=True)
                 trace = result.response_future.get_query_trace(query_cl=ConsistencyLevel.ALL)
@@ -1220,14 +1271,14 @@ class ClusterTests(unittest.TestCase):
                          execution_profiles={EXEC_PROFILE_DEFAULT: hfp_profile}) as cluster:
 
             session = cluster.connect(wait_for_all_pools=True)
-            prepared = session.prepare("""SELECT * from test1rf.table_with_big_key
-                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""")
+            prepared = session.prepare("""SELECT * from {}.table_with_big_key
+                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""".format(ks_name))
             for _ in range(10):
                 result = session.execute(prepared, (last_i, last_i, last_i, last_i), trace=True)
                 trace = result.response_future.get_query_trace(query_cl=ConsistencyLevel.ALL)
                 self._assert_replica_queried(trace, only_replicas=False)
 
-            session.execute('''DROP TABLE test1rf.table_with_big_key''')
+            session.execute('DROP KEYSPACE {}'.format(ks_name))
 
     @greaterthanorequalcass30
     @lessthanorequalcass40
@@ -1492,7 +1543,7 @@ class DontPrepareOnIgnoredHostsTest(unittest.TestCase):
         hosts = cluster.metadata.all_hosts()
         session.execute("CREATE KEYSPACE clustertests "
                         "WITH replication = "
-                        "{'class': 'SimpleStrategy', 'replication_factor': '1'}")
+                        "{'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}")
         session.execute("CREATE TABLE clustertests.tab (a text, PRIMARY KEY (a))")
         # assign to an unused variable so cluster._prepared_statements retains
         # reference

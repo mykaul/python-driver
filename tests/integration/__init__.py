@@ -14,10 +14,13 @@
 
 import re
 import os
+import errno
 from typing import Callable
 from cassandra.cluster import Cluster
 
 from tests import connection_class, EVENT_LOOP_MANAGER
+from tests.integration._ccm_logs import (
+    ccm_boundary, directory_exists, copy_cluster_logs)
 
 if connection_class is not None:
     Cluster.connection_class = connection_class
@@ -31,6 +34,9 @@ import sys
 import time
 import traceback
 import platform
+from pathlib import Path
+from contextlib import contextmanager
+from uuid import uuid4
 from threading import Event
 from subprocess import call
 from itertools import groupby
@@ -52,6 +58,8 @@ try:
 except ImportError as e:
     CCMClusterFactory = None
 
+    CCMCluster = object  # importable without ccmlib (Windows wheel unit tests)
+
 log = logging.getLogger(__name__)
 
 CLUSTER_NAME = 'test_cluster'
@@ -72,8 +80,116 @@ path = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'ccm')
 if not os.path.exists(path):
     os.mkdir(path)
 
+_failed_reports = []
+_preserved_ccm_log_scopes = set()
+_log_artifact_dir = os.environ.get(
+    'INTEGRATION_LOG_ARTIFACT_DIR', 'integration-test-logs')
+_provisional_log_failure = None
+_log_snapshot_count = 0
+_current_log_failure = None
+
 cass_version = None
 cql_version = None
+
+
+def _new_log_failure_dir():
+    failure_name = 'failure-%04d-%s' % (
+        len(_failed_reports) + 1, uuid4().hex[:8])
+    return Path(_log_artifact_dir) / failure_name
+
+
+def record_failed_test_report(report):
+    global _current_log_failure, _provisional_log_failure
+    if report.failed:
+        if _current_log_failure is None:
+            _current_log_failure = (
+                _provisional_log_failure or _new_log_failure_dir())
+            _provisional_log_failure = None
+        _failed_reports.append(report)
+        destination = Path(_log_artifact_dir)
+        try:
+            _current_log_failure.mkdir(parents=True, exist_ok=True)
+            line = '%s %s [%s]\n' % (
+                report.when, report.nodeid, _current_log_failure.name)
+            with (destination / 'failed-tests.txt').open('a') as failed_tests:
+                failed_tests.write(line)
+            failure_report = _current_log_failure / 'failed-tests.txt'
+            with failure_report.open('a') as failed_tests:
+                failed_tests.write(line)
+        except OSError as exc:
+            log.warning("Failed to preserve test report: %s", exc)
+
+    # Reports arrive after the phase's fixtures and finalizers finish.
+    # Keep provisional captures until teardown's final report arrives.
+    if report.when == 'teardown' and _current_log_failure is not None:
+        preserve_ccm_logs_on_failure()
+    _preserved_ccm_log_scopes.clear()
+    if report.when == 'teardown':
+        # Failed captures already live at their final artifact path.
+        # Only discard a provisional directory when no test phase failed.
+        if _provisional_log_failure is not None:
+            try:
+                shutil.rmtree(_provisional_log_failure)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("Failed to discard temporary ccm logs: %s", exc)
+            try:
+                Path(_log_artifact_dir).rmdir()
+            except OSError as exc:
+                if exc.errno not in (
+                        errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
+                    log.warning(
+                        "Failed to discard temporary ccm logs: %s", exc)
+        _provisional_log_failure = None
+        _current_log_failure = None
+
+
+def _ccm_directory_exists(directory):
+    return directory_exists(directory, ccm_boundary(Path(path)))
+
+
+def preserve_ccm_logs_on_failure(cluster_name=None):
+    global _provisional_log_failure, _log_snapshot_count
+    try:
+        ccm_root = Path(path)
+        if not _ccm_directory_exists(ccm_root):
+            return
+        cluster_roots = ([ccm_root / cluster_name] if cluster_name else
+                         list(ccm_root.iterdir()))
+        for cluster_root in cluster_roots:
+            if (cluster_root.name in _preserved_ccm_log_scopes or
+                    not _ccm_directory_exists(cluster_root)):
+                continue
+            _preserved_ccm_log_scopes.add(cluster_root.name)
+            if _current_log_failure is None:
+                if _provisional_log_failure is None:
+                    _provisional_log_failure = _new_log_failure_dir()
+                destination = _provisional_log_failure
+            else:
+                destination = _current_log_failure
+            _log_snapshot_count += 1
+            snapshot = destination / ('snapshot-%06d' % _log_snapshot_count)
+            _preserve_ccm_cluster_logs(
+                cluster_root, snapshot / 'ccm' / cluster_root.name)
+    except OSError as exc:
+        log.warning("Failed to preserve ccm diagnostics: %s", exc)
+
+
+@contextmanager
+def preserve_ccm_logs_before_cleanup(cluster_name):
+    preserve_ccm_logs_on_failure(cluster_name)
+    try:
+        yield
+    finally:
+        # Cleanup may leave a new incarnation at the same path, even
+        # when it raises after partially completing the operation.
+        _preserved_ccm_log_scopes.discard(cluster_name)
+
+
+def _preserve_ccm_cluster_logs(ccm_root, ccm_destination):
+    return copy_cluster_logs(
+        ccm_root, ccm_destination, ccm_boundary(Path(path)))
 
 
 def get_server_versions():
@@ -122,7 +238,6 @@ def cmd_line_args_to_dict(env_var):
             args[cmd_arg.lstrip('-')] = cmd_arg_value
     return args
 
-USE_CASS_EXTERNAL = bool(os.getenv('USE_CASS_EXTERNAL', False))
 KEEP_TEST_CLUSTER = bool(os.getenv('KEEP_TEST_CLUSTER', False))
 SIMULACRON_JAR = os.getenv('SIMULACRON_JAR', None)
 
@@ -136,9 +251,11 @@ else:
     mcv_string = os.getenv('MAPPED_CASSANDRA_VERSION', None)
 try:
     cassandra_version = Version(cv_string)  # env var is set to test-dse for DDAC
-except:
-    # fallback to MAPPED_CASSANDRA_VERSION
-    cassandra_version = Version(mcv_string)
+except Exception:
+    if cv_string and not mcv_string:
+        raise  # a malformed explicit version must not silently become 3.11.4
+    # mapped version (DDAC), else 3.11.4 so the module imports with nothing set
+    cassandra_version = Version(mcv_string or '3.11.4')
 
 CASSANDRA_VERSION = Version(mcv_string) if mcv_string else cassandra_version
 CCM_VERSION = mcv_string if mcv_string else cv_string
@@ -250,7 +367,7 @@ PROTOCOL_VERSION = int(os.getenv('PROTOCOL_VERSION', default_protocol_version))
 
 
 def local_decorator_creator():
-    if USE_CASS_EXTERNAL or not CASSANDRA_IP.startswith("127.0.0."):
+    if not CASSANDRA_IP.startswith("127.0.0."):
         return unittest.skip('Tests only runs against local C*')
 
     def _id_and_mark(f):
@@ -292,6 +409,7 @@ lessthancass30 = unittest.skipUnless(CASSANDRA_VERSION < Version('3.0'), 'Cassan
 # 1. unittest doesn't skip setUpClass when used on class and we need it sometimes
 # 2. unittest doesn't have conditional xfail, and I prefer to use pytest than custom decorator
 # 3. unittest doesn't have a reason argument, so you don't see the reason in pytest report
+requires_scylla = pytest.mark.skipif(SCYLLA_VERSION is None, reason='Requires ScyllaDB')
 requires_collection_indexes = pytest.mark.skipif(SCYLLA_VERSION is not None and Version(get_scylla_version(SCYLLA_VERSION)) < Version('5.2'),
                                               reason='Scylla supports collection indexes from 5.2 onwards')
 requires_custom_indexes = pytest.mark.skipif(SCYLLA_VERSION is not None,
@@ -373,35 +491,39 @@ def check_log_error():
 
 
 def remove_cluster():
-    if USE_CASS_EXTERNAL or KEEP_TEST_CLUSTER:
+    if KEEP_TEST_CLUSTER:
         return
 
     global CCM_CLUSTER
     if CCM_CLUSTER:
         check_log_error()
         log.debug("Removing cluster {0}".format(CCM_CLUSTER.name))
-        tries = 0
-        while tries < 100:
-            try:
-                CCM_CLUSTER.remove()
-                CCM_CLUSTER = None
-                return
-            except OSError:
-                ex_type, ex, tb = sys.exc_info()
-                log.warning("{0}: {1} Backtrace: {2}".format(ex_type.__name__, ex, traceback.extract_tb(tb)))
-                del tb
-                tries += 1
-                time.sleep(1)
+        with preserve_ccm_logs_before_cleanup(CCM_CLUSTER.name):
+            tries = 0
+            while tries < 100:
+                try:
+                    CCM_CLUSTER.remove()
+                    CCM_CLUSTER = None
+                    return
+                except OSError:
+                    ex_type, ex, tb = sys.exc_info()
+                    log.warning("{0}: {1} Backtrace: {2}".format(
+                        ex_type.__name__, ex, traceback.extract_tb(tb)))
+                    del tb
+                    tries += 1
+                    time.sleep(1)
 
         raise RuntimeError("Failed to remove cluster after 100 attempts")
 
 
-def is_current_cluster(cluster_name, node_counts, workloads):
+def is_current_cluster(cluster_name, node_counts, workloads, smp=None):
     global CCM_CLUSTER
     if CCM_CLUSTER and CCM_CLUSTER.name == cluster_name:
         if [len(list(nodes)) for dc, nodes in
                 groupby(CCM_CLUSTER.nodelist(), lambda n: n.data_center)] == node_counts:
             for node in CCM_CLUSTER.nodelist():
+                if SCYLLA_VERSION and smp is not None and node.smp() != smp:
+                    return False
                 if set(getattr(node, 'workloads', [])) != set(workloads):
                     print("node workloads don't match creating new cluster")
                     return False
@@ -418,8 +540,10 @@ def start_cluster_wait_for_up(cluster):
     log.debug("Binary port are open")
 
 
-def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, set_keyspace=True, ccm_options=None,
-                configuration_options=None, dse_options=None, use_single_interface=USE_SINGLE_INTERFACE):
+def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None,
+                set_keyspace=True, ccm_options=None,
+                configuration_options=None, dse_options=None,
+                use_single_interface=USE_SINGLE_INTERFACE, smp=None):
     configuration_options = configuration_options or {}
     dse_options = dse_options or {}
     workloads = workloads or []
@@ -430,22 +554,7 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, 
     cassandra_version = ccm_options.get('version', CCM_VERSION)
 
     global CCM_CLUSTER
-    if USE_CASS_EXTERNAL:
-        if CCM_CLUSTER:
-            log.debug("Using external CCM cluster {0}".format(CCM_CLUSTER.name))
-        else:
-            ccm_path = os.getenv("CCM_PATH", None)
-            ccm_name = os.getenv("CCM_NAME", None)
-            if ccm_path and ccm_name:
-                CCM_CLUSTER = CCMClusterFactory.load(ccm_path, ccm_name)
-                log.debug("Using external CCM cluster {0}".format(CCM_CLUSTER.name))
-            else:
-                log.debug("Using unnamed external cluster")
-        if set_keyspace and start:
-            setup_keyspace(ipformat=ipformat, wait=False)
-        return
-
-    if is_current_cluster(cluster_name, nodes, workloads):
+    if is_current_cluster(cluster_name, nodes, workloads, smp=smp):
         log.debug("Using existing cluster, matching topology: {0}".format(cluster_name))
     else:
         if CCM_CLUSTER:
@@ -455,7 +564,8 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, 
         try:
             CCM_CLUSTER = CCMClusterFactory.load(path, cluster_name)
             log.debug("Found existing CCM cluster, {0}; clearing.".format(cluster_name))
-            CCM_CLUSTER.clear()
+            with preserve_ccm_logs_before_cleanup(cluster_name):
+                CCM_CLUSTER.clear()
             CCM_CLUSTER.set_install_dir(**ccm_options)
             CCM_CLUSTER.set_configuration_options(configuration_options)
             CCM_CLUSTER.set_dse_configuration_options(dse_options)
@@ -471,7 +581,8 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, 
             # Make sure we cleanup old cluster dir if it exists
             cluster_path = os.path.join(path, cluster_name)
             if os.path.exists(cluster_path):
-                shutil.rmtree(cluster_path)
+                with preserve_ccm_logs_before_cleanup(cluster_name):
+                    shutil.rmtree(cluster_path)
 
             if SCYLLA_VERSION:
                 # `experimental: True` enable all experimental features.
@@ -511,13 +622,16 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, 
     try:
         jvm_args = []
 
+        # CCM ignores --smp in SCYLLA_EXT_OPTS. Set each node's shard
+        # count before startup so it survives subsequent restarts.
+        if SCYLLA_VERSION and smp is not None:
+            for node in CCM_CLUSTER.nodelist():
+                node.set_smp(smp)
+
         # This will enable the Mirroring query handler which will echo our custom payload k,v pairs back
 
-        if 'graph' in workloads:
-            jvm_args += ['-Xms1500M', '-Xmx1500M']
-        else:
-            if PROTOCOL_VERSION >= 4 and not SCYLLA_VERSION:
-                jvm_args = [" -Dcassandra.custom_query_handler_class=org.apache.cassandra.cql3.CustomPayloadMirroringQueryHandler"]
+        if PROTOCOL_VERSION >= 4 and not SCYLLA_VERSION:
+            jvm_args = [" -Dcassandra.custom_query_handler_class=org.apache.cassandra.cql3.CustomPayloadMirroringQueryHandler"]
         if len(workloads) > 0:
             for node in CCM_CLUSTER.nodes.values():
                 node.set_workloads(workloads)
@@ -549,16 +663,18 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, 
 
 
 def teardown_package():
-    if USE_CASS_EXTERNAL or KEEP_TEST_CLUSTER:
+    if KEEP_TEST_CLUSTER:
         return
     # when multiple modules are run explicitly, this runs between them
     # need to make sure CCM_CLUSTER is properly cleared for that case
+    preserve_ccm_logs_on_failure()
     remove_cluster()
     for cluster_name in [CLUSTER_NAME, MULTIDC_CLUSTER_NAME]:
         try:
             cluster = CCMClusterFactory.load(path, cluster_name)
             try:
-                cluster.remove()
+                with preserve_ccm_logs_before_cleanup(cluster_name):
+                    cluster.remove()
                 log.info('Removed cluster: %s' % cluster_name)
             except Exception:
                 log.exception('Failed to remove cluster: %s' % cluster_name)
@@ -600,7 +716,7 @@ def execute_with_long_wait_retry(session, query, timeout=30):
             del tb
             tries += 1
 
-    raise RuntimeError("Failed to execute query after 100 attempts: {0}".format(query))
+    raise RuntimeError("Failed to execute query after 10 attempts: {0}".format(query))
 
 
 def execute_with_retry_tolerant(session, query, retry_exceptions, escape_exception):
@@ -632,11 +748,7 @@ def drop_keyspace_shutdown_cluster(keyspace_name, session, cluster):
         cluster.shutdown()
 
 
-def setup_keyspace(ipformat=None, wait=True, protocol_version=None, port=9042):
-    # wait for nodes to startup
-    if wait:
-        time.sleep(10)
-
+def setup_keyspace(ipformat=None, protocol_version=None, port=9042):
     if protocol_version:
         _protocol_version = protocol_version
     else:
@@ -655,17 +767,17 @@ def setup_keyspace(ipformat=None, wait=True, protocol_version=None, port=9042):
 
         ddl = '''
             CREATE KEYSPACE test3rf
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '3'}'''
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '3'}'''
         execute_with_long_wait_retry(session, ddl)
 
         ddl = '''
             CREATE KEYSPACE test2rf
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '2'}'''
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '2'}'''
         execute_with_long_wait_retry(session, ddl)
 
         ddl = '''
             CREATE KEYSPACE test1rf
-            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}'''
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}'''
         execute_with_long_wait_retry(session, ddl)
 
         ddl_3f = '''
@@ -691,29 +803,76 @@ def is_scylla_enterprise(version: Version) -> bool:
     return version > Version('2000.1.1')
 
 
-def xfail_scylla_version_lt(reason, oss_scylla_version, ent_scylla_version, *args, **kwargs):
+def get_client_options(session):
+    """
+    The ``client_options`` of every connection listed in the cluster's clients
+    table, skipping the rows the server has not filled in yet.
+
+    The table has lived in both ``system`` and ``system_views`` across versions,
+    so try each in turn. Only :exc:`.InvalidRequest` is caught, which is what an
+    absent table answers with: catching more would report a timeout or a
+    ``NoHostAvailable`` on the first query as a failure of the second, and this
+    runs inside polling loops where that would repeat.
+    """
+    try:
+        rows = list(session.execute("SELECT client_options FROM system.clients"))
+    except InvalidRequest:
+        rows = list(session.execute("SELECT client_options FROM system_views.clients"))
+    # Indexed rather than named: the query selects the one column, so this works
+    # whatever row factory the caller's session is using.
+    return [row[0] for row in rows if row[0]]
+
+
+def xfail_scylla_version_lt(reason, scylla_version, *args, **kwargs):
     """
     It is used to mark tests that are going to fail on certain scylla versions.
     :param reason: message to fail test with
-    :param oss_scylla_version: str, oss version from which test supposed to succeed
-    :param ent_scylla_version: str, enterprise version from which test supposed to succeed
+    :param scylla_version: str, version from which test supposed to succeed
     """
     if not (reason.startswith("scylladb/scylladb#") or reason.startswith("scylladb/scylla-enterprise#")):
         raise ValueError('reason should start with scylladb/scylladb#<issue-id> or scylladb/scylla-enterprise#<issue-id> to reference issue in scylla repo')
 
-    if not isinstance(ent_scylla_version, str):
-        raise ValueError('ent_scylla_version should be a str')
+    if not isinstance(scylla_version, str):
+        raise ValueError('scylla_version should be a str')
 
     if SCYLLA_VERSION is None:
         return pytest.mark.skipif(False, reason="It is just a NoOP Decor, should not skip anything")
 
     current_version = Version(get_scylla_version(SCYLLA_VERSION))
 
-    if is_scylla_enterprise(current_version):
-        return pytest.mark.xfail(current_version < Version(ent_scylla_version),
-                                 reason=reason, *args, **kwargs)
+    return pytest.mark.xfail(current_version < Version(scylla_version), reason=reason, *args, **kwargs)
 
-    return pytest.mark.xfail(current_version < Version(oss_scylla_version), reason=reason, *args, **kwargs)
+
+def get_tablets_disabled_ddl_suffix(scylla_version='2026.1'):
+    """
+    Returns DDL option string for disabling tablets on ScyllaDB versions older than scylla_version.
+    Used to work around features not yet supported with tablets (e.g. MVs, secondary indexes, counters).
+    :param scylla_version: str, version from which tablets support the feature
+    """
+    if SCYLLA_VERSION is not None and Version(get_scylla_version(SCYLLA_VERSION)) < Version(scylla_version):
+        return " AND tablets = {'enabled': false}"
+    return ""
+
+
+def skip_scylla_version_lt(reason, scylla_version):
+    """
+    Skip tests on scylla versions older than the specified thresholds.
+    :param reason: message explaining why the test is skipped
+    :param scylla_version: str, version from which test supposed to work
+    """
+    if not (reason.startswith("scylladb/scylladb#") or reason.startswith("scylladb/scylla-enterprise#")):
+        raise ValueError('reason should start with scylladb/scylladb#<issue-id> or scylladb/scylla-enterprise#<issue-id> to reference issue in scylla repo')
+
+    if not isinstance(scylla_version, str):
+        raise ValueError('scylla_version should be a str')
+
+    if SCYLLA_VERSION is None:
+        return pytest.mark.skipif(False, reason="It is just a NoOP Decor, should not skip anything")
+
+    current_version = Version(get_scylla_version(SCYLLA_VERSION))
+
+    return pytest.mark.skipif(current_version < Version(scylla_version), reason=reason)
+
 
 class UpDownWaiter(object):
 
@@ -762,7 +921,7 @@ class BasicKeyspaceUnitTestCase(unittest.TestCase):
 
     @classmethod
     def create_keyspace(cls, rf):
-        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '{1}'}}".format(cls.ks_name, rf)
+        ddl = "CREATE KEYSPACE {0} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': '{1}'}}".format(cls.ks_name, rf)
         execute_with_long_wait_retry(cls.session, ddl)
 
     @classmethod
@@ -969,9 +1128,9 @@ class TestCluster(object):
 # introduced by CASSANDRA-15234
 class Cassandra41CCMCluster(CCMCluster):
     __test__ = False
-    IN_MS_REGEX = re.compile('^(\w+)_in_ms$')
-    IN_KB_REGEX = re.compile('^(\w+)_in_kb$')
-    ENABLE_REGEX = re.compile('^enable_(\w+)$')
+    IN_MS_REGEX = re.compile(r'^(\w+)_in_ms$')
+    IN_KB_REGEX = re.compile(r'^(\w+)_in_kb$')
+    ENABLE_REGEX = re.compile(r'^enable_(\w+)$')
 
     def _get_config_key(self, k, v):
         if "." in k:

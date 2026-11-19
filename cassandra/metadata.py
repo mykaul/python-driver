@@ -16,6 +16,8 @@ from binascii import unhexlify
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Mapping
+from contextlib import contextmanager
+from enum import Enum
 from functools import total_ordering
 from hashlib import md5
 import json
@@ -125,6 +127,8 @@ class Metadata(object):
         self.keyspaces = {}
         self.dbaas = False
         self._hosts = {}
+        # Secondary index for EndPoint lookup;
+        # _hosts (keyed by immutable host_id) owns host identity.
         self._host_id_by_endpoint = {}
         self._hosts_lock = RLock()
         self._tablets = Tablets({})
@@ -139,10 +143,16 @@ class Metadata(object):
     def refresh(self, connection, timeout, target_type=None, change_type=None, fetch_size=None,
                 metadata_request_timeout=None, **kwargs):
 
-        host = self.get_host(connection.original_endpoint)
+        bound_host = vars(connection).get('_control_connection_host')
+        if bound_host is not None:
+            host = (bound_host if self.get_host_by_host_id(bound_host.host_id)
+                    is bound_host else None)
+        else:
+            host_id = getattr(connection, '_control_connection_host_id', None)
+            host = (self.get_host_by_host_id(host_id) if host_id is not None
+                    else self.get_host(connection.original_endpoint))
         server_version = host.release_version if host else None
-        dse_version = host.dse_version if host else None
-        parser = get_schema_parser(connection, server_version, dse_version, timeout, metadata_request_timeout, fetch_size)
+        parser = get_schema_parser(connection, server_version, None, timeout, metadata_request_timeout, fetch_size)
 
         if not target_type:
             self._rebuild_all(parser)
@@ -194,7 +204,8 @@ class Metadata(object):
             keyspace_meta.functions = old_keyspace_meta.functions
             keyspace_meta.aggregates = old_keyspace_meta.aggregates
             keyspace_meta.views = old_keyspace_meta.views
-            if (keyspace_meta.replication_strategy != old_keyspace_meta.replication_strategy):
+            if (keyspace_meta.replication_strategy != old_keyspace_meta.replication_strategy or
+                    keyspace_meta._consistency_mode != old_keyspace_meta._consistency_mode):
                 self._keyspace_updated(ks_name)
         else:
             self._keyspace_added(ks_name)
@@ -225,6 +236,7 @@ class Metadata(object):
         except KeyError:
             # can happen if keyspace disappears while processing async event
             pass
+        self._table_removed(keyspace, table)
 
     def _update_type(self, type_meta):
         try:
@@ -344,23 +356,124 @@ class Metadata(object):
                 self._hosts[host.host_id] = host
                 return host, True
 
-    def remove_host(self, host):
-        self._tablets.drop_tablets_by_host_id(host.host_id)
+    def _add_or_replace_host(self, host, allow_replace=True):
+        """Publish a new host and retire the previous endpoint owner together.
+
+        Returns ``(host, new, replaced_host)``. Callers notify listeners only
+        after the replacement is visible in both host indexes.
+        """
         with self._hosts_lock:
-            self._host_id_by_endpoint.pop(host.endpoint, False)
-            return bool(self._hosts.pop(host.host_id, False))
+            existing = self._hosts.get(host.host_id)
+            if existing is not None:
+                return existing, False, None
+            old_id = self._host_id_by_endpoint.get(host.endpoint)
+            if old_id is not None and not allow_replace:
+                raise ValueError("Replacing an endpoint owner requires host addition signaling")
+            replaced_host = self._hosts.pop(old_id, None)
+            self._hosts[host.host_id] = host
+            self._host_id_by_endpoint[host.endpoint] = host.host_id
+
+        if replaced_host is not None:
+            self._tablets.drop_tablets_by_host_id(replaced_host.host_id)
+        return host, True, replaced_host
+
+    def replace_host_endpoint(self, old_host, replacement):
+        """Atomically replace a Host object after its endpoint changes.
+
+        The host ID remains the identity. A new object fences work attached to
+        the old endpoint; both endpoint indexes change under one lock.
+        """
+        self.replace_host_endpoints([(old_host, replacement)])
+
+    def replace_host_endpoints(self, replacements):
+        """Publish a batch of endpoint moves under one hosts lock.
+
+        Every source must still be the exact current Host. A destination can
+        belong to another source in this batch, allowing chains and swaps.
+        Validation finishes before either index changes.
+        """
+        replacements = list(replacements)
+        source_ids = set()
+        destinations = set()
+        with self._hosts_lock:
+            for old_host, replacement in replacements:
+                if old_host.host_id != replacement.host_id:
+                    raise ValueError("Endpoint replacement must preserve host_id")
+                if old_host.endpoint == replacement.endpoint:
+                    raise ValueError("Endpoint replacement requires a new endpoint")
+                if old_host.host_id in source_ids:
+                    raise ValueError("Host appears more than once in endpoint replacement")
+                if replacement.endpoint in destinations:
+                    raise ValueError(
+                        "Endpoint appears more than once in endpoint replacement")
+                if self._hosts.get(old_host.host_id) is not old_host:
+                    raise ValueError("Host is no longer current in metadata")
+                source_ids.add(old_host.host_id)
+                destinations.add(replacement.endpoint)
+
+            for old_host, replacement in replacements:
+                owner_id = self._host_id_by_endpoint.get(replacement.endpoint)
+                if owner_id is not None and owner_id not in source_ids:
+                    raise ValueError("New endpoint belongs to another host")
+
+            for old_host, _ in replacements:
+                if self._host_id_by_endpoint.get(old_host.endpoint) == old_host.host_id:
+                    self._host_id_by_endpoint.pop(old_host.endpoint)
+            for _, replacement in replacements:
+                self._hosts[replacement.host_id] = replacement
+                self._host_id_by_endpoint[replacement.endpoint] = replacement.host_id
+
+    @contextmanager
+    def _host_ownership_guard(self, host):
+        """Keep exact Host ownership stable through a short state publication.
+
+        Callers acquire Session, Host and any Connection locks first. Policy
+        callbacks, network waits and cleanup must run outside this guard.
+        """
+        with self._hosts_lock:
+            yield self._hosts.get(host.host_id) is host
+
+    def _update_host_location(self, host, datacenter, rack):
+        """Publish a current Host's location with fresh replica-map caches."""
+        with self._hosts_lock:
+            if self._hosts.get(host.host_id) is not host:
+                return False
+            host.set_location_info(datacenter, rack)
+            token_map = self.token_map
+            if token_map is not None:
+                # A concurrent lazy replica calculation can finish on the old
+                # TokenMap without repopulating caches on the current one.
+                self.token_map = TokenMap(
+                    token_map.token_class, token_map.token_to_host_owner,
+                    token_map.ring, self)
+            return True
+
+    def remove_host(self, host):
+        with self._hosts_lock:
+            if self._hosts.get(host.host_id) is not host:
+                return False
+            if self._host_id_by_endpoint.get(host.endpoint) == host.host_id:
+                self._host_id_by_endpoint.pop(host.endpoint)
+            self._hosts.pop(host.host_id)
+        self._tablets.drop_tablets_by_host_id(host.host_id)
+        return True
 
     def remove_host_by_host_id(self, host_id, endpoint=None):
-        self._tablets.drop_tablets_by_host_id(host_id)
         with self._hosts_lock:
-            if endpoint and self._host_id_by_endpoint[endpoint] == host_id:
-                self._host_id_by_endpoint.pop(endpoint, False)
-            return bool(self._hosts.pop(host_id, False))
+            host = self._hosts.get(host_id)
+            if host is None or (endpoint is not None and host.endpoint != endpoint):
+                return False
+            if endpoint and self._host_id_by_endpoint.get(endpoint) == host_id:
+                self._host_id_by_endpoint.pop(endpoint)
+            self._hosts.pop(host_id)
+        self._tablets.drop_tablets_by_host_id(host_id)
+        return True
 
     def update_host(self, host, old_endpoint):
         host, created = self.add_or_return_host(host)
         with self._hosts_lock:
-            self._host_id_by_endpoint.pop(old_endpoint, False)
+            if self._host_id_by_endpoint.get(old_endpoint) == host.host_id:
+                self._host_id_by_endpoint.pop(old_endpoint)
             self._host_id_by_endpoint[host.endpoint] = host.host_id
 
     def get_host(self, endpoint_or_address, port=None):
@@ -733,6 +846,47 @@ class LocalStrategy(ReplicationStrategy):
         return isinstance(other, LocalStrategy)
 
 
+class _ConsistencyMode(Enum):
+    """
+    Per-keyspace consistency option reported by ScyllaDB in
+    ``system_schema.scylla_keyspaces``. The server represents an
+    eventually-consistent keyspace as ``'eventual'`` or null.
+
+    ScyllaDB only implements ``GLOBAL`` so far, so it is currently the only mode
+    under which a keyspace's tablets have a Raft leader. ``LOCAL`` is reserved
+    for a mode that does not exist yet, and until it does it behaves exactly like
+    ``EVENTUAL`` everywhere in the driver.
+    """
+    EVENTUAL = 'eventual'
+    LOCAL = 'local'
+    GLOBAL = 'global'
+
+
+def _consistency_mode_from_string(value: Optional[str]) -> _ConsistencyMode:
+    """
+    Map the ``consistency`` option ScyllaDB reports to a :class:`._ConsistencyMode`.
+
+    The comparison is case-insensitive, since the option is a free-form string on
+    the wire. A null value -- which is how the server reports an
+    eventually-consistent keyspace -- or an unrecognized one mean eventually consistent:
+    the driver must not refuse to build metadata because a server reported a mode it
+    does not know.
+    """
+
+    # Unfortunately, we need to handle the case of None separately.
+    # When the code is compiled with Cython, calling lower() on
+    # None will result in a segmentation fault, not an AttributeError.
+    # That most likely happens as an optimization based on the type
+    # hint.
+    if value is None:
+        return _ConsistencyMode.EVENTUAL
+
+    try:
+        return _ConsistencyMode(value.lower())
+    except ValueError:
+        return _ConsistencyMode.EVENTUAL
+
+
 class KeyspaceMetadata(object):
     """
     A representation of the schema for a single keyspace.
@@ -796,15 +950,19 @@ class KeyspaceMetadata(object):
     .. versionadded:: 3.15
     """
 
-    graph_engine = None
+    _consistency_mode = _ConsistencyMode.EVENTUAL
     """
-    A string indicating whether a graph engine is enabled for this keyspace (Core/Classic).
+    The consistency mode of the keyspace, derived from the the ``consistency``
+    column ScyllaDB stores in ``system_schema.scylla_keyspaces``.
+
+    Private and unstable: it backs leader-aware routing and is not part of the
+    public API, so the name and semantics may change.
     """
 
     _exc_info = None
     """ set if metadata parsing failed """
 
-    def __init__(self, name, durable_writes, strategy_class, strategy_options, graph_engine=None):
+    def __init__(self, name, durable_writes, strategy_class, strategy_options):
         self.name = name
         self.durable_writes = durable_writes
         self.replication_strategy = ReplicationStrategy.create(strategy_class, strategy_options)
@@ -814,27 +972,19 @@ class KeyspaceMetadata(object):
         self.functions = {}
         self.aggregates = {}
         self.views = {}
-        self.graph_engine = graph_engine
-
-    @property
-    def is_graph_enabled(self):
-        return self.graph_engine is not None
+        self._consistency_mode = _ConsistencyMode.EVENTUAL
 
     def export_as_string(self):
         """
         Returns a CQL query string that can be used to recreate the entire keyspace,
         including user-defined types and tables.
         """
-        # Make sure tables with vertex are exported before tables with edges
-        tables_with_vertex = [t for t in self.tables.values() if hasattr(t, 'vertex') and t.vertex]
-        other_tables = [t for t in self.tables.values() if t not in tables_with_vertex]
-
         cql = "\n\n".join(
             [self.as_cql_query() + ';'] +
             self.user_type_strings() +
             [f.export_as_string() for f in self.functions.values()] +
             [a.export_as_string() for a in self.aggregates.values()] +
-            [t.export_as_string() for t in tables_with_vertex + other_tables])
+            [t.export_as_string() for t in self.tables.values()])
 
         if self._exc_info:
             import traceback
@@ -861,9 +1011,16 @@ class KeyspaceMetadata(object):
         ret = "CREATE KEYSPACE %s WITH replication = %s " % (
             protect_name(self.name),
             self.replication_strategy.export_for_schema())
+
+        if self._consistency_mode != _ConsistencyMode.EVENTUAL:
+            # Eventual consistency is the server's default, so it is left out.
+            # Any other mode is spelled exactly as the server reported it -- that
+            # string is where the member's value came from -- which keeps this
+            # correct for a mode added later without touching this method. Note
+            # that 'local' consistency is not implemented in ScyllaDB yet.
+            ret = ret + (" AND consistency = '%s'" % self._consistency_mode.value)
+
         ret = ret + (' AND durable_writes = %s' % ("true" if self.durable_writes else "false"))
-        if self.graph_engine is not None:
-            ret = ret + (" AND graph_engine = '%s'" % self.graph_engine)
         return ret
 
     def user_type_strings(self):
@@ -1496,10 +1653,7 @@ class TableMetadataV3(TableMetadata):
     """
     compaction_options = {}
 
-    option_maps = [
-        'compaction', 'compression', 'caching',
-        'nodesync'  # added DSE 6.0
-    ]
+    option_maps = ['compaction', 'compression', 'caching']
 
     @property
     def is_cql_compatible(self):
@@ -1524,52 +1678,6 @@ class TableMetadataV3(TableMetadata):
                 ret.append("%s = %s" % (name, protect_value(value)))
 
         return list(sorted(ret))
-
-
-class TableMetadataDSE68(TableMetadataV3):
-
-    vertex = None
-    """A :class:`.VertexMetadata` instance, if graph enabled"""
-
-    edge = None
-    """A :class:`.EdgeMetadata` instance, if graph enabled"""
-
-    def as_cql_query(self, formatted=False):
-        ret = super(TableMetadataDSE68, self).as_cql_query(formatted)
-
-        if self.vertex:
-            ret += " AND VERTEX LABEL %s" % protect_name(self.vertex.label_name)
-
-        if self.edge:
-            ret += " AND EDGE LABEL %s" % protect_name(self.edge.label_name)
-
-            ret += self._export_edge_as_cql(
-                self.edge.from_label,
-                self.edge.from_partition_key_columns,
-                self.edge.from_clustering_columns, "FROM")
-
-            ret += self._export_edge_as_cql(
-                self.edge.to_label,
-                self.edge.to_partition_key_columns,
-                self.edge.to_clustering_columns, "TO")
-
-        return ret
-
-    @staticmethod
-    def _export_edge_as_cql(label_name, partition_keys,
-                            clustering_columns, keyword):
-        ret = " %s %s(" % (keyword, protect_name(label_name))
-
-        if len(partition_keys) == 1:
-            ret += protect_name(partition_keys[0])
-        else:
-            ret += "(%s)" % ", ".join([protect_name(k) for k in partition_keys])
-
-        if clustering_columns:
-            ret += ", %s" % ", ".join([protect_name(k) for k in clustering_columns])
-        ret += ")"
-
-        return ret
 
 
 class TableExtensionInterface(object):
@@ -1905,7 +2013,7 @@ class MD5Token(HashToken):
     def hash_fn(cls, key):
         if isinstance(key, str):
             key = key.encode('UTF-8')
-        return abs(varint_unpack(md5(key).digest()))
+        return abs(varint_unpack(md5(key,usedforsecurity=False).digest()))
 
 
 class BytesToken(Token):
@@ -1983,7 +2091,8 @@ class _SchemaParser(object):
         :param result: The resultset in question.
         :expected_failures: An Exception class or an iterable thereof. If the
         query failed, but raised an instance of an expected failure class, this
-        will ignore the failure and return an empty list.
+        will ignore the failure and return an empty list. If a later page fails
+        that way, paging stops and the rows read so far are returned.
         """
         timeout = timeout or self.timeout
         if not success and isinstance(result, expected_failures):
@@ -1997,7 +2106,13 @@ class _SchemaParser(object):
                         next_success, next_result = self.connection.wait_for_response(query_msg, timeout=timeout,
                                                                                       fail_on_error=False)
                         if not next_success and isinstance(next_result, expected_failures):
-                            continue
+                            # There is no paging state to continue from, so
+                            # stop here and keep the rows already read. Warn,
+                            # since the schema built from them is incomplete.
+                            log.warning("Schema query %r failed on a later page (%r); "
+                                        "using only the rows read before it",
+                                        getattr(query_msg, 'query', query_msg), next_result)
+                            break
                         elif not next_success:
                             raise next_result
                         if not next_result.paging_state:
@@ -2026,6 +2141,10 @@ class _SchemaParser(object):
         return [build_func(row) for row in results]
 
 
+# Methods marked 'no cover' below read the Cassandra 2.x schema tables and are
+# overridden by SchemaParserV3. On ScyllaDB and Cassandra 3.0+ they run only
+# when get_schema_parser() cannot determine the server version and falls back
+# to this parser; their queries then fail on the missing legacy tables.
 class SchemaParserV22(_SchemaParser):
     """
     For C* 2.2+
@@ -2112,7 +2231,7 @@ class SchemaParserV22(_SchemaParser):
 
             yield keyspace_meta
 
-    def get_table(self, keyspaces, keyspace, table):
+    def get_table(self, keyspaces, keyspace, table):  # pragma: no cover - Cassandra 2.x only
         cl = ConsistencyLevel.ONE
         where_clause = bind_params(" WHERE keyspace_name = %%s AND %s = %%s" % (self._table_name_col,), (keyspace, table), _encoder)
         cf_query = QueryMessage(
@@ -2175,7 +2294,7 @@ class SchemaParserV22(_SchemaParser):
         return ksm
 
     @staticmethod
-    def _build_keyspace_metadata_internal(row):
+    def _build_keyspace_metadata_internal(row):  # pragma: no cover - Cassandra 2.x only
         name = row["keyspace_name"]
         durable_writes = row["durable_writes"]
         strategy_class = row["strategy_class"]
@@ -2201,7 +2320,7 @@ class SchemaParserV22(_SchemaParser):
                         deterministic, monotonic, monotonic_on)
 
     @classmethod
-    def _build_aggregate(cls, aggregate_row):
+    def _build_aggregate(cls, aggregate_row):  # pragma: no cover - Cassandra 2.x only
         cass_state_type = types.lookup_casstype(aggregate_row['state_type'])
         initial_condition = aggregate_row['initcond']
         if initial_condition is not None:
@@ -2213,7 +2332,7 @@ class SchemaParserV22(_SchemaParser):
                          aggregate_row['final_func'], initial_condition, return_type,
                          aggregate_row.get('deterministic', False))
 
-    def _build_table_metadata(self, row, col_rows=None, trigger_rows=None):
+    def _build_table_metadata(self, row, col_rows=None, trigger_rows=None):  # pragma: no cover - Cassandra 2.x only
         keyspace_name = row["keyspace_name"]
         cfname = row[self._table_name_col]
 
@@ -2373,7 +2492,7 @@ class SchemaParserV22(_SchemaParser):
 
         return table_meta
 
-    def _build_table_options(self, row):
+    def _build_table_options(self, row):  # pragma: no cover - Cassandra 2.x only
         """ Setup the mostly-non-schema table options, like caching settings """
         options = dict((o, row.get(o)) for o in self.recognized_table_options if o in row)
 
@@ -2389,7 +2508,7 @@ class SchemaParserV22(_SchemaParser):
         return options
 
     @classmethod
-    def _build_column_metadata(cls, table_metadata, row):
+    def _build_column_metadata(cls, table_metadata, row):  # pragma: no cover - Cassandra 2.x only
         name = row["column_name"]
         type_string = row["validator"]
         data_type = types.lookup_casstype(type_string)
@@ -2401,7 +2520,7 @@ class SchemaParserV22(_SchemaParser):
         return column_meta
 
     @staticmethod
-    def _build_index_metadata(column_metadata, row):
+    def _build_index_metadata(column_metadata, row):  # pragma: no cover - Cassandra 2.x only
         index_name = row.get("index_name")
         kind = row.get("index_type")
         if index_name or kind:
@@ -2431,13 +2550,13 @@ class SchemaParserV22(_SchemaParser):
             return IndexMetadata(column_metadata.table.keyspace_name, column_metadata.table.name, index_name, kind, options)
 
     @staticmethod
-    def _build_trigger_metadata(table_metadata, row):
+    def _build_trigger_metadata(table_metadata, row):  # pragma: no cover - Cassandra 2.x only
         name = row["trigger_name"]
         options = row["trigger_options"]
         trigger_meta = TriggerMetadata(table_metadata, name, options)
         return trigger_meta
 
-    def _query_all(self):
+    def _query_all(self):  # pragma: no cover - Cassandra 2.x only
         cl = ConsistencyLevel.ONE
         queries = [
             QueryMessage(
@@ -2558,7 +2677,7 @@ class SchemaParserV22(_SchemaParser):
             m[ksname][cfname].append(row)
 
     @staticmethod
-    def _schema_type_to_cql(type_string):
+    def _schema_type_to_cql(type_string):  # pragma: no cover - Cassandra 2.x only
         cass_type = types.lookup_casstype(type_string)
         return _cql_from_cass_type(cass_type)
 
@@ -2576,6 +2695,15 @@ class SchemaParserV3(SchemaParserV22):
     _SELECT_FUNCTIONS = "SELECT * FROM system_schema.functions"
     _SELECT_AGGREGATES = "SELECT * FROM system_schema.aggregates"
     _SELECT_VIEWS = "SELECT * FROM system_schema.views"
+
+    # ScyllaDB-only: per-keyspace consistency option. The column is null for
+    # eventually-consistent keyspaces (and the whole table is absent on Cassandra
+    # and on Scylla versions without strongly-consistent tablets).
+    _SELECT_SCYLLA_KEYSPACES = "SELECT keyspace_name, consistency FROM system_schema.scylla_keyspaces"
+
+    def _is_not_scylla(self):
+        """Check if NOT connected to ScyllaDB by checking for shard awareness."""
+        return getattr(getattr(self.connection, 'features', None), 'shard_id', None) is None
 
     _table_name_col = 'table_name'
 
@@ -2604,14 +2732,63 @@ class SchemaParserV3(SchemaParserV22):
     def __init__(self, connection, timeout, fetch_size, metadata_request_timeout):
         super(SchemaParserV3, self).__init__(connection, timeout, fetch_size, metadata_request_timeout)
         self.indexes_result = []
+        self.scylla_keyspaces_result = []
         self.keyspace_table_index_rows = defaultdict(lambda: defaultdict(list))
         self.keyspace_view_rows = defaultdict(list)
+        self.keyspace_consistency_modes = {}
+
+    def _tablets_routing_v2_negotiated(self):
+        """
+        Whether this connection negotiated ``TABLETS_ROUTING_V2``.
+
+        The per-keyspace consistency option only feeds V2 leader-aware routing,
+        so without the extension there is nothing to route for and the option is
+        not worth a query. This also subsumes a Scylla check: only ScyllaDB
+        advertises the extension.
+        """
+        features = getattr(self.connection, 'features', None)
+        return features is not None and getattr(features, 'tablets_routing_v2', False)
+
+    def _query_keyspace_consistency_mode(self, keyspace):
+        """
+        Read one keyspace's consistency mode from
+        ``system_schema.scylla_keyspaces``.
+
+        Used by the single-keyspace refresh path, which cannot reuse the map
+        ``_query_all`` builds because it does not run ``_query_all`` at all. The
+        read is restricted to ``keyspace``, mirroring the filtered query the
+        superclass uses for the keyspace row itself.
+
+        A keyspace absent from the table, an unrecognized value, and a missing
+        table or column (older ScyllaDB, which answers InvalidRequest --
+        absorbed by _query_build_row) all mean eventually consistent. A transient
+        failure propagates, which aborts the refresh and leaves the previously
+        known mode in place to be retried, rather than resetting the keyspace to
+        eventual and so silently disabling leader routing and evicting its
+        tablets.
+        """
+        if not self._tablets_routing_v2_negotiated():
+            return _ConsistencyMode.EVENTUAL
+
+        where_clause = bind_params(" WHERE keyspace_name = %s", (keyspace,), _encoder)
+        row = self._query_build_row(self._SELECT_SCYLLA_KEYSPACES + where_clause, lambda row: row)
+        if row is None:
+            return _ConsistencyMode.EVENTUAL
+        return _consistency_mode_from_string(row.get("consistency"))
+
+    def get_keyspace(self, keyspaces, keyspace):
+        keyspace_meta = super(SchemaParserV3, self).get_keyspace(keyspaces, keyspace)
+        if keyspace_meta is not None:
+            keyspace_meta._consistency_mode = self._query_keyspace_consistency_mode(keyspace)
+        return keyspace_meta
 
     def get_all_keyspaces(self):
         for keyspace_meta in super(SchemaParserV3, self).get_all_keyspaces():
             for row in self.keyspace_view_rows[keyspace_meta.name]:
                 view_meta = self._build_view_metadata(row)
                 keyspace_meta._add_view_metadata(view_meta)
+            keyspace_meta._consistency_mode = self.keyspace_consistency_modes.get(
+                keyspace_meta.name, _ConsistencyMode.EVENTUAL)
             yield keyspace_meta
 
     def get_table(self, keyspaces, keyspace, table):
@@ -2627,27 +2804,44 @@ class SchemaParserV3(SchemaParserV22):
         indexes_query = QueryMessage(
             query=maybe_add_timeout_to_query(self._SELECT_INDEXES + where_clause, self.metadata_request_timeout),
             consistency_level=cl, fetch_size=fetch_size)
-        triggers_query = QueryMessage(
-            query=maybe_add_timeout_to_query(self._SELECT_TRIGGERS + where_clause, self.metadata_request_timeout),
-            consistency_level=cl, fetch_size=fetch_size)
+
+        # ScyllaDB doesn't have triggers, skip the query
+        if self._is_not_scylla():
+            triggers_query = QueryMessage(
+                query=maybe_add_timeout_to_query(self._SELECT_TRIGGERS + where_clause, self.metadata_request_timeout),
+                consistency_level=cl, fetch_size=fetch_size)
 
         # in protocol v4 we don't know if this event is a view or a table, so we look for both
         where_clause = bind_params(" WHERE keyspace_name = %s AND view_name = %s", (keyspace, table), _encoder)
         view_query = QueryMessage(
             query=maybe_add_timeout_to_query(self._SELECT_VIEWS + where_clause, self.metadata_request_timeout),
             consistency_level=cl, fetch_size=fetch_size)
-        ((cf_success, cf_result), (col_success, col_result),
-         (indexes_sucess, indexes_result), (triggers_success, triggers_result),
-         (view_success, view_result)) = (
-             self.connection.wait_for_responses(
-                 cf_query, col_query, indexes_query, triggers_query,
-                 view_query, timeout=self.timeout, fail_on_error=False)
-        )
+
+        if self._is_not_scylla():
+            ((cf_success, cf_result), (col_success, col_result),
+             (indexes_sucess, indexes_result), (triggers_success, triggers_result),
+             (view_success, view_result)) = (
+                 self.connection.wait_for_responses(
+                     cf_query, col_query, indexes_query, triggers_query,
+                     view_query, timeout=self.timeout, fail_on_error=False)
+            )
+        else:
+            ((cf_success, cf_result), (col_success, col_result),
+             (indexes_sucess, indexes_result),
+             (view_success, view_result)) = (
+                 self.connection.wait_for_responses(
+                     cf_query, col_query, indexes_query,
+                     view_query, timeout=self.timeout, fail_on_error=False)
+            )
+
         table_result = self._handle_results(cf_success, cf_result, query_msg=cf_query)
         col_result = self._handle_results(col_success, col_result, query_msg=col_query)
         if table_result:
             indexes_result = self._handle_results(indexes_sucess, indexes_result, query_msg=indexes_query)
-            triggers_result = self._handle_results(triggers_success, triggers_result, query_msg=triggers_query)
+            if self._is_not_scylla():
+                triggers_result = self._handle_results(triggers_success, triggers_result, query_msg=triggers_query)
+            else:
+                triggers_result = None
             return self._build_table_metadata(table_result[0], col_result, triggers_result, indexes_result)
 
         view_result = self._handle_results(view_success, view_result, query_msg=view_query)
@@ -2696,9 +2890,10 @@ class SchemaParserV3(SchemaParserV22):
 
             self._build_table_columns(table_meta, col_rows, compact_static, is_dense, virtual)
 
-            for trigger_row in trigger_rows:
-                trigger_meta = self._build_trigger_metadata(table_meta, trigger_row)
-                table_meta.triggers[trigger_meta.name] = trigger_meta
+            if self._is_not_scylla():
+                for trigger_row in trigger_rows:
+                    trigger_meta = self._build_trigger_metadata(table_meta, trigger_row)
+                    table_meta.triggers[trigger_meta.name] = trigger_meta
 
             for index_row in index_rows:
                 index_meta = self._build_index_metadata(table_meta, index_row)
@@ -2741,7 +2936,7 @@ class SchemaParserV3(SchemaParserV22):
                 meta.clustering_key.append(meta.columns[r.get('column_name')])
 
         for col_row in (r for r in col_rows
-                        if r.get('kind', None) not in ('partition_key', 'clustering_key')):
+                        if r.get('kind', None) not in ('partition_key', 'clustering')):
             column_meta = self._build_column_metadata(meta, col_row)
             if is_dense and column_meta.cql_type == types.cql_empty_type:
                 continue
@@ -2793,6 +2988,7 @@ class SchemaParserV3(SchemaParserV22):
         trigger_meta = TriggerMetadata(table_metadata, name, options)
         return trigger_meta
 
+
     def _query_all(self):
         cl = ConsistencyLevel.ONE
         fetch_size = self.fetch_size
@@ -2809,35 +3005,65 @@ class SchemaParserV3(SchemaParserV22):
                          fetch_size=fetch_size, consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_AGGREGATES, self.metadata_request_timeout),
                          fetch_size=fetch_size, consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_TRIGGERS, self.metadata_request_timeout),
-                         fetch_size=fetch_size, consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_INDEXES, self.metadata_request_timeout),
                          fetch_size=fetch_size, consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIEWS, self.metadata_request_timeout),
                          fetch_size=fetch_size, consistency_level=cl),
         ]
 
+        # ScyllaDB doesn't have triggers, skip the query
+        if self._is_not_scylla():
+            queries.append(QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_TRIGGERS, self.metadata_request_timeout),
+                                       fetch_size=fetch_size, consistency_level=cl))
+
+        # ScyllaDB-only: the per-keyspace consistency option, which rides along in
+        # this batch instead of costing a round trip of its own.
+        scylla_keyspaces_index = None
+        if self._tablets_routing_v2_negotiated():
+            scylla_keyspaces_index = len(queries)
+            queries.append(QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_SCYLLA_KEYSPACES, self.metadata_request_timeout),
+                                        fetch_size=fetch_size, consistency_level=cl))
+
+        responses = self.connection.wait_for_responses(*queries, timeout=self.timeout, fail_on_error=False)
+
+        # Unpack common responses (always present)
         ((ks_success, ks_result),
          (table_success, table_result),
          (col_success, col_result),
          (types_success, types_result),
          (functions_success, functions_result),
          (aggregates_success, aggregates_result),
-         (triggers_success, triggers_result),
          (indexes_success, indexes_result),
-         (views_success, views_result)) = self.connection.wait_for_responses(
-             *queries, timeout=self.timeout, fail_on_error=False
-        )
+         (views_success, views_result)) = responses[:8]
+
+        # Unpack triggers response if present (Cassandra/DSE only)
+        if self._is_not_scylla():
+            (triggers_success, triggers_result) = responses[8]
 
         self.keyspaces_result = self._handle_results(ks_success, ks_result, query_msg=queries[0])
         self.tables_result = self._handle_results(table_success, table_result, query_msg=queries[1])
         self.columns_result = self._handle_results(col_success, col_result, query_msg=queries[2])
-        self.triggers_result = self._handle_results(triggers_success, triggers_result, query_msg=queries[6])
         self.types_result = self._handle_results(types_success, types_result, query_msg=queries[3])
         self.functions_result = self._handle_results(functions_success, functions_result, query_msg=queries[4])
         self.aggregates_result = self._handle_results(aggregates_success, aggregates_result, query_msg=queries[5])
-        self.indexes_result = self._handle_results(indexes_success, indexes_result, query_msg=queries[7])
-        self.views_result = self._handle_results(views_success, views_result, query_msg=queries[8])
+        self.indexes_result = self._handle_results(indexes_success, indexes_result, query_msg=queries[6])
+        self.views_result = self._handle_results(views_success, views_result, query_msg=queries[7])
+        if self._is_not_scylla():
+            self.triggers_result = self._handle_results(triggers_success, triggers_result, query_msg=queries[8])
+        else:
+            self.triggers_result = []
+
+        if scylla_keyspaces_index is not None:
+            (scylla_ks_success, scylla_ks_result) = responses[scylla_keyspaces_index]
+            # An older ScyllaDB may lack the table or the column and answers
+            # InvalidRequest; that is not an error, it just means no keyspace is
+            # strongly consistent. Any other failure propagates, aborting the
+            # refresh so the modes already known are retried rather than reset.
+            self.scylla_keyspaces_result = self._handle_results(
+                scylla_ks_success, scylla_ks_result, expected_failures=(InvalidRequest,),
+                query_msg=queries[scylla_keyspaces_index])
+        else:
+            self.scylla_keyspaces_result = []
 
         self._aggregate_results()
 
@@ -2854,17 +3080,16 @@ class SchemaParserV3(SchemaParserV22):
         for row in self.views_result:
             m[row["keyspace_name"]].append(row)
 
+        # A keyspace missing from the result -- including every keyspace when the
+        # read was skipped or the table was unavailable -- is eventually
+        # consistent, which get_all_keyspaces applies as the default.
+        self.keyspace_consistency_modes = {
+            row["keyspace_name"]: _consistency_mode_from_string(row.get("consistency"))
+            for row in self.scylla_keyspaces_result}
+
     @staticmethod
     def _schema_type_to_cql(type_string):
         return type_string
-
-
-class SchemaParserDSE60(SchemaParserV3):
-    """
-    For DSE 6.0+
-    """
-    recognized_table_options = (SchemaParserV3.recognized_table_options +
-                                ("nodesync",))
 
 
 class SchemaParserV4(SchemaParserV3):
@@ -2915,8 +3140,6 @@ class SchemaParserV4(SchemaParserV3):
                          fetch_size=fetch_size, consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_AGGREGATES, self.metadata_request_timeout),
                          fetch_size=fetch_size, consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_TRIGGERS, self.metadata_request_timeout),
-                         fetch_size=fetch_size, consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_INDEXES, self.metadata_request_timeout),
                          fetch_size=fetch_size, consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIEWS, self.metadata_request_timeout),
@@ -2930,8 +3153,15 @@ class SchemaParserV4(SchemaParserV3):
                          fetch_size=fetch_size, consistency_level=cl),
         ]
 
+        # ScyllaDB doesn't have triggers, skip the query
+        if self._is_not_scylla():
+            queries.append(QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_TRIGGERS, self.metadata_request_timeout),
+                                       fetch_size=fetch_size, consistency_level=cl))
+
         responses = self.connection.wait_for_responses(
             *queries, timeout=self.timeout, fail_on_error=False)
+
+        # Unpack common responses (always present)
         (
             # copied from V3
             (ks_success, ks_result),
@@ -2940,39 +3170,45 @@ class SchemaParserV4(SchemaParserV3):
             (types_success, types_result),
             (functions_success, functions_result),
             (aggregates_success, aggregates_result),
-            (triggers_success, triggers_result),
             (indexes_success, indexes_result),
             (views_success, views_result),
             # V4-only responses
             (virtual_ks_success, virtual_ks_result),
             (virtual_table_success, virtual_table_result),
-            (virtual_column_success, virtual_column_result)
-        ) = responses
+            (virtual_column_success, virtual_column_result),
+        ) = responses[:11]
+
+        # Unpack triggers response if present (Cassandra/DSE only)
+        if self._is_not_scylla():
+            (triggers_success, triggers_result) = responses[11]
 
         # copied from V3
         self.keyspaces_result = self._handle_results(ks_success, ks_result, query_msg=queries[0])
         self.tables_result = self._handle_results(table_success, table_result, query_msg=queries[1])
         self.columns_result = self._handle_results(col_success, col_result, query_msg=queries[2])
-        self.triggers_result = self._handle_results(triggers_success, triggers_result, query_msg=queries[6])
         self.types_result = self._handle_results(types_success, types_result, query_msg=queries[3])
         self.functions_result = self._handle_results(functions_success, functions_result, query_msg=queries[4])
         self.aggregates_result = self._handle_results(aggregates_success, aggregates_result, query_msg=queries[5])
-        self.indexes_result = self._handle_results(indexes_success, indexes_result, query_msg=queries[7])
-        self.views_result = self._handle_results(views_success, views_result, query_msg=queries[8])
+        self.indexes_result = self._handle_results(indexes_success, indexes_result, query_msg=queries[6])
+        self.views_result = self._handle_results(views_success, views_result, query_msg=queries[7])
+        if self._is_not_scylla():
+            self.triggers_result = self._handle_results(triggers_success, triggers_result, query_msg=queries[11])
+        else:
+            self.triggers_result = []
         # V4-only results
         # These tables don't exist in some DSE versions reporting 4.X so we can
         # ignore them if we got an error
         self.virtual_keyspaces_result = self._handle_results(
             virtual_ks_success, virtual_ks_result,
-            expected_failures=(InvalidRequest,), query_msg=queries[9]
+            expected_failures=(InvalidRequest,), query_msg=queries[8]
         )
         self.virtual_tables_result = self._handle_results(
             virtual_table_success, virtual_table_result,
-            expected_failures=(InvalidRequest,), query_msg=queries[10]
+            expected_failures=(InvalidRequest,), query_msg=queries[9]
         )
         self.virtual_columns_result = self._handle_results(
             virtual_column_success, virtual_column_result,
-            expected_failures=(InvalidRequest,), query_msg=queries[11]
+            expected_failures=(InvalidRequest,), query_msg=queries[10]
         )
 
         self._aggregate_results()
@@ -3017,213 +3253,6 @@ class SchemaParserV4(SchemaParserV3):
         row["replication"] = row.get("replication", {})
         row["replication"]["class"] = row["replication"].get("class", None)
         return super(SchemaParserV4, SchemaParserV4)._build_keyspace_metadata_internal(row)
-
-
-class SchemaParserDSE67(SchemaParserV4):
-    """
-    For DSE 6.7+
-    """
-    recognized_table_options = (SchemaParserV4.recognized_table_options +
-                                ("nodesync",))
-
-
-class SchemaParserDSE68(SchemaParserDSE67):
-    """
-    For DSE 6.8+
-    """
-
-    _SELECT_VERTICES = "SELECT * FROM system_schema.vertices"
-    _SELECT_EDGES = "SELECT * FROM system_schema.edges"
-
-    _table_metadata_class = TableMetadataDSE68
-
-    def __init__(self, connection, timeout, fetch_size, metadata_request_timeout):
-        super(SchemaParserDSE68, self).__init__(connection, timeout, fetch_size, metadata_request_timeout)
-        self.keyspace_table_vertex_rows = defaultdict(lambda: defaultdict(list))
-        self.keyspace_table_edge_rows = defaultdict(lambda: defaultdict(list))
-
-    def get_all_keyspaces(self):
-        for keyspace_meta in super(SchemaParserDSE68, self).get_all_keyspaces():
-            self._build_graph_metadata(keyspace_meta)
-            yield keyspace_meta
-
-    def get_table(self, keyspaces, keyspace, table):
-        table_meta = super(SchemaParserDSE68, self).get_table(keyspaces, keyspace, table)
-        cl = ConsistencyLevel.ONE
-        where_clause = bind_params(" WHERE keyspace_name = %%s AND %s = %%s" % (self._table_name_col), (keyspace, table), _encoder)
-        vertices_query = QueryMessage(
-            query=maybe_add_timeout_to_query(self._SELECT_VERTICES + where_clause, self.metadata_request_timeout),
-            consistency_level=cl,
-        )
-        edges_query = QueryMessage(
-            query=maybe_add_timeout_to_query(self._SELECT_EDGES + where_clause, self.metadata_request_timeout),
-            consistency_level=cl,
-        )
-
-        (vertices_success, vertices_result), (edges_success, edges_result) \
-            = self.connection.wait_for_responses(vertices_query, edges_query, timeout=self.timeout, fail_on_error=False)
-        vertices_result = self._handle_results(vertices_success, vertices_result)
-        edges_result = self._handle_results(edges_success, edges_result)
-
-        try:
-            if vertices_result:
-                table_meta.vertex = self._build_table_vertex_metadata(vertices_result[0])
-            elif edges_result:
-                table_meta.edge = self._build_table_edge_metadata(keyspaces[keyspace], edges_result[0])
-        except Exception:
-            table_meta.vertex = None
-            table_meta.edge = None
-            table_meta._exc_info = sys.exc_info()
-            log.exception("Error while parsing graph metadata for table %s.%s.", keyspace, table)
-
-        return table_meta
-
-    @staticmethod
-    def _build_keyspace_metadata_internal(row):
-        name = row["keyspace_name"]
-        durable_writes = row.get("durable_writes", None)
-        replication = dict(row.get("replication")) if 'replication' in row else {}
-        replication_class = replication.pop("class") if 'class' in replication else None
-        graph_engine = row.get("graph_engine", None)
-        return KeyspaceMetadata(name, durable_writes, replication_class, replication, graph_engine)
-
-    def _build_graph_metadata(self, keyspace_meta):
-
-        def _build_table_graph_metadata(table_meta):
-            for row in self.keyspace_table_vertex_rows[keyspace_meta.name][table_meta.name]:
-                table_meta.vertex = self._build_table_vertex_metadata(row)
-
-            for row in self.keyspace_table_edge_rows[keyspace_meta.name][table_meta.name]:
-                table_meta.edge = self._build_table_edge_metadata(keyspace_meta, row)
-
-        try:
-            # Make sure we process vertices before edges
-            for table_meta in [t for t in keyspace_meta.tables.values()
-                               if t.name in self.keyspace_table_vertex_rows[keyspace_meta.name]]:
-                _build_table_graph_metadata(table_meta)
-
-            # all other tables...
-            for table_meta in [t for t in keyspace_meta.tables.values()
-                               if t.name not in self.keyspace_table_vertex_rows[keyspace_meta.name]]:
-                _build_table_graph_metadata(table_meta)
-        except Exception:
-            # schema error, remove all graph metadata for this keyspace
-            for t in keyspace_meta.tables.values():
-                t.edge = t.vertex = None
-            keyspace_meta._exc_info = sys.exc_info()
-            log.exception("Error while parsing graph metadata for keyspace %s", keyspace_meta.name)
-
-    @staticmethod
-    def _build_table_vertex_metadata(row):
-        return VertexMetadata(row.get("keyspace_name"), row.get("table_name"),
-                              row.get("label_name"))
-
-    @staticmethod
-    def _build_table_edge_metadata(keyspace_meta, row):
-        from_table = row.get("from_table")
-        from_table_meta = keyspace_meta.tables.get(from_table)
-        from_label = from_table_meta.vertex.label_name
-        to_table = row.get("to_table")
-        to_table_meta = keyspace_meta.tables.get(to_table)
-        to_label = to_table_meta.vertex.label_name
-
-        return EdgeMetadata(
-            row.get("keyspace_name"), row.get("table_name"),
-            row.get("label_name"), from_table, from_label,
-            row.get("from_partition_key_columns"),
-            row.get("from_clustering_columns"), to_table, to_label,
-            row.get("to_partition_key_columns"),
-            row.get("to_clustering_columns"))
-
-    def _query_all(self):
-        cl = ConsistencyLevel.ONE
-        queries = [
-            # copied from v4
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_KEYSPACES, self.metadata_request_timeout),
-                         consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_TABLES, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_COLUMNS, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_TYPES, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_FUNCTIONS, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_AGGREGATES, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_TRIGGERS, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_INDEXES, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIEWS, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIRTUAL_KEYSPACES, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIRTUAL_TABLES, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIRTUAL_COLUMNS, self.metadata_request_timeout), consistency_level=cl),
-            # dse6.8 only
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VERTICES, self.metadata_request_timeout), consistency_level=cl),
-            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_EDGES, self.metadata_request_timeout), consistency_level=cl)
-        ]
-
-        responses = self.connection.wait_for_responses(
-            *queries, timeout=self.timeout, fail_on_error=False)
-        (
-            # copied from V4
-            (ks_success, ks_result),
-            (table_success, table_result),
-            (col_success, col_result),
-            (types_success, types_result),
-            (functions_success, functions_result),
-            (aggregates_success, aggregates_result),
-            (triggers_success, triggers_result),
-            (indexes_success, indexes_result),
-            (views_success, views_result),
-            (virtual_ks_success, virtual_ks_result),
-            (virtual_table_success, virtual_table_result),
-            (virtual_column_success, virtual_column_result),
-            # dse6.8 responses
-            (vertices_success, vertices_result),
-            (edges_success, edges_result)
-        ) = responses
-
-        # copied from V4
-        self.keyspaces_result = self._handle_results(ks_success, ks_result)
-        self.tables_result = self._handle_results(table_success, table_result)
-        self.columns_result = self._handle_results(col_success, col_result)
-        self.triggers_result = self._handle_results(triggers_success, triggers_result)
-        self.types_result = self._handle_results(types_success, types_result)
-        self.functions_result = self._handle_results(functions_success, functions_result)
-        self.aggregates_result = self._handle_results(aggregates_success, aggregates_result)
-        self.indexes_result = self._handle_results(indexes_success, indexes_result)
-        self.views_result = self._handle_results(views_success, views_result)
-
-        # These tables don't exist in some DSE versions reporting 4.X so we can
-        # ignore them if we got an error
-        self.virtual_keyspaces_result = self._handle_results(
-            virtual_ks_success, virtual_ks_result,
-            expected_failures=(InvalidRequest,)
-        )
-        self.virtual_tables_result = self._handle_results(
-            virtual_table_success, virtual_table_result,
-            expected_failures=(InvalidRequest,)
-        )
-        self.virtual_columns_result = self._handle_results(
-            virtual_column_success, virtual_column_result,
-            expected_failures=(InvalidRequest,)
-        )
-
-        # dse6.8-only results
-        self.vertices_result = self._handle_results(vertices_success, vertices_result)
-        self.edges_result = self._handle_results(edges_success, edges_result)
-
-        self._aggregate_results()
-
-    def _aggregate_results(self):
-        super(SchemaParserDSE68, self)._aggregate_results()
-
-        m = self.keyspace_table_vertex_rows
-        for row in self.vertices_result:
-            ksname = row["keyspace_name"]
-            cfname = row['table_name']
-            m[ksname][cfname].append(row)
-
-        m = self.keyspace_table_edge_rows
-        for row in self.edges_result:
-            ksname = row["keyspace_name"]
-            cfname = row['table_name']
-            m[ksname][cfname].append(row)
 
 
 class MaterializedViewMetadata(object):
@@ -3334,83 +3363,7 @@ class MaterializedViewMetadata(object):
         return self.as_cql_query(formatted=True) + ";"
 
 
-class VertexMetadata(object):
-    """
-    A representation of a vertex on a table
-    """
-
-    keyspace_name = None
-    """ A string name of the keyspace. """
-
-    table_name = None
-    """ A string name of the table this vertex is on. """
-
-    label_name = None
-    """ A string name of the label of this vertex."""
-
-    def __init__(self, keyspace_name, table_name, label_name):
-        self.keyspace_name = keyspace_name
-        self.table_name = table_name
-        self.label_name = label_name
-
-
-class EdgeMetadata(object):
-    """
-    A representation of an edge on a table
-    """
-
-    keyspace_name = None
-    """A string name of the keyspace """
-
-    table_name = None
-    """A string name of the table this edge is on"""
-
-    label_name = None
-    """A string name of the label of this edge"""
-
-    from_table = None
-    """A string name of the from table of this edge (incoming vertex)"""
-
-    from_label = None
-    """A string name of the from table label of this edge (incoming vertex)"""
-
-    from_partition_key_columns = None
-    """The columns that match the partition key of the incoming vertex table."""
-
-    from_clustering_columns = None
-    """The columns that match the clustering columns of the incoming vertex table."""
-
-    to_table = None
-    """A string name of the to table of this edge (outgoing vertex)"""
-
-    to_label = None
-    """A string name of the to table label of this edge (outgoing vertex)"""
-
-    to_partition_key_columns = None
-    """The columns that match the partition key of the outgoing vertex table."""
-
-    to_clustering_columns = None
-    """The columns that match the clustering columns of the outgoing vertex table."""
-
-    def __init__(
-            self, keyspace_name, table_name, label_name, from_table,
-            from_label, from_partition_key_columns, from_clustering_columns,
-            to_table, to_label, to_partition_key_columns,
-            to_clustering_columns):
-        self.keyspace_name = keyspace_name
-        self.table_name = table_name
-        self.label_name = label_name
-        self.from_table = from_table
-        self.from_label = from_label
-        self.from_partition_key_columns = from_partition_key_columns
-        self.from_clustering_columns = from_clustering_columns
-        self.to_table = to_table
-        self.to_label = to_label
-        self.to_partition_key_columns = to_partition_key_columns
-        self.to_clustering_columns = to_clustering_columns
-
-
-def get_column_from_system_local(connection, column_name: str, timeout, metadata_request_timeout) -> str:
+def _query_column_from_system_local(connection, column_name, timeout, metadata_request_timeout):
     success, local_result = connection.wait_for_response(
         QueryMessage(
             query=maybe_add_timeout_to_query(
@@ -3418,35 +3371,48 @@ def get_column_from_system_local(connection, column_name: str, timeout, metadata
                 metadata_request_timeout),
             consistency_level=ConsistencyLevel.ONE)
         , timeout=timeout, fail_on_error=False)
-    if not success or not local_result.parsed_rows:
-        return ""
+    if not success:
+        return "", local_result
+    if not local_result.parsed_rows:
+        return "", "no row returned"
     local_rows = dict_factory(local_result.column_names, local_result.parsed_rows)
     local_row = local_rows[0]
-    return local_row.get(column_name)
+    return local_row.get(column_name), None
+
+
+def get_column_from_system_local(connection, column_name: str, timeout, metadata_request_timeout) -> str:
+    return _query_column_from_system_local(
+        connection, column_name, timeout, metadata_request_timeout)[0]
 
 
 def get_schema_parser(connection, server_version, dse_version, timeout, metadata_request_timeout, fetch_size=None):
-    if server_version is None and dse_version is None:
-        server_version = get_column_from_system_local(connection, "release_version", timeout, metadata_request_timeout)
-        dse_version = get_column_from_system_local(connection, "dse_version", timeout, metadata_request_timeout)
+    """Select the schema parser for the server's release line.
 
-    version = Version(server_version or "0")
-    if dse_version:
-        v = Version(dse_version)
-        if v >= Version('6.8.0'):
-            return SchemaParserDSE68(connection, timeout, fetch_size, metadata_request_timeout)
-        elif v >= Version('6.7.0'):
-            return SchemaParserDSE67(connection, timeout, fetch_size, metadata_request_timeout)
-        elif v >= Version('6.0.0'):
-            return SchemaParserDSE60(connection, timeout, fetch_size, metadata_request_timeout)
+    Cassandra and Scylla schema families are selected by major version.
 
-    if version >= Version('4-a'):
+    ``dse_version`` is ignored: the DataStax Enterprise (DSE) schema parsers
+    were removed. It is kept so existing positional callers keep working.
+    """
+    missing_release_version_reason = None
+    if not server_version:
+        server_version, error = _query_column_from_system_local(
+            connection, "release_version", timeout, metadata_request_timeout)
+        if not server_version:
+            missing_release_version_reason = error or "empty value"
+
+    version = Version(server_version or "0.0")
+    if version.major >= 4:
         return SchemaParserV4(connection, timeout, fetch_size, metadata_request_timeout)
-    elif version >= Version('3.0.0'):
+    elif version.major >= 3:
         return SchemaParserV3(connection, timeout, fetch_size, metadata_request_timeout)
     else:
         # we could further specialize by version. Right now just refactoring the
         # multi-version parser we have as of C* 2.2.0rc1.
+        if missing_release_version_reason is not None:
+            log.warning(
+                "Could not read release_version from system.local (%s); "
+                "falling back to the oldest schema parser",
+                missing_release_version_reason)
         return SchemaParserV22(connection, timeout, fetch_size, metadata_request_timeout)
 
 
@@ -3461,14 +3427,6 @@ def _cql_from_cass_type(cass_type):
         return cass_type.cql_parameterized_type()
 
 
-class RLACTableExtension(RegisteredTableExtension):
-    name = "DSE_RLACA"
-
-    @classmethod
-    def after_table_cql(cls, table_meta, ext_key, ext_blob):
-        return "RESTRICT ROWS ON %s.%s USING %s;" % (protect_name(table_meta.keyspace_name),
-                                                     protect_name(table_meta.name),
-                                                     protect_name(ext_blob.decode('utf-8')))
 NO_VALID_REPLICA = object()
 
 

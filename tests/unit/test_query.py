@@ -14,7 +14,125 @@
 
 import unittest
 
-from cassandra.query import BatchStatement, PreparedStatement, SimpleStatement
+import pytest
+
+from cassandra.cqltypes import Int32Type, ListType
+from cassandra.protocol import ColumnMetadata
+from cassandra.query import (
+    BatchStatement, BoundStatement, PreparedStatement, SimpleStatement,
+    Statement, UNSET_VALUE)
+
+
+class TestBoundStatementRebind:
+    @staticmethod
+    def make_prepared(routing_key_indexes, protocol_version):
+        return PreparedStatement(
+            column_metadata=[ColumnMetadata('ks', 'tbl', name, Int32Type)
+                             for name in ('pk1', 'pk2', 'v')],
+            query_id=b'query-id', routing_key_indexes=routing_key_indexes,
+            query='INSERT INTO ks.tbl (pk1, pk2, v) VALUES (?, ?, ?)',
+            keyspace='ks', protocol_version=protocol_version,
+            result_metadata=[], result_metadata_id=None)
+
+    @pytest.mark.parametrize('protocol_version', [3, 4, 5])
+    @pytest.mark.parametrize('named', [False, True])
+    @pytest.mark.parametrize('routing_key_indexes,first_key,second_key', [
+        ([0], b'\x00\x00\x00\x01', b'\x00\x00\x00\x02'),
+        ([1, 0], b'\x00\x04\x00\x00\x00\x0a\x00\x00\x04\x00\x00\x00\x01\x00',
+         b'\x00\x04\x00\x00\x00\x14\x00\x00\x04\x00\x00\x00\x02\x00'),
+    ])
+    def test_rebind_recomputes_routing_key(
+            self, protocol_version, named, routing_key_indexes,
+            first_key, second_key):
+        prepared = self.make_prepared(routing_key_indexes, protocol_version)
+        first = (1, 10, 100)
+        second = (2, 20, 200)
+        if named:
+            first = dict(zip(('pk1', 'pk2', 'v'), first))
+            second = dict(zip(('pk1', 'pk2', 'v'), second))
+
+        bound = prepared.bind(first)
+        assert bound.routing_key == first_key
+        assert bound.bind(second) is bound
+        assert bound.routing_key == second_key
+        assert bound.routing_key == second_key
+
+    def test_rebind_to_null_clears_routing_key(self):
+        bound = self.make_prepared([0], 4).bind((1, 10, 100))
+        assert bound.routing_key == b'\x00\x00\x00\x01'
+        bound.bind((None, 20, 200))
+        assert bound.routing_key is None
+        bound.bind((2, 20, 200))
+        assert bound.routing_key == b'\x00\x00\x00\x02'
+
+    def test_rebind_preserves_explicit_routing_key(self):
+        bound = BoundStatement(
+            self.make_prepared([0], 4), routing_key=b'explicit')
+        bound.bind((1, 10, 100))
+        assert bound.routing_key == b'explicit'
+        bound.bind((2, 20, 200))
+        assert bound.routing_key == b'explicit'
+
+    def test_rebind_preserves_updated_routing_override(self):
+        bound = self.make_prepared([0], 4).bind((1, 10, 100))
+        assert bound.routing_key == b'\x00\x00\x00\x01'
+        bound._set_routing_key(b'explicit')
+        bound.bind((2, 20, 200))
+        assert bound.routing_key == b'explicit'
+        bound._del_routing_key()
+        assert bound.routing_key == b'\x00\x00\x00\x02'
+
+    @pytest.mark.parametrize('invalid_values,error', [
+        (('invalid', 20, 200), TypeError),
+        ((2, 'invalid', 200), TypeError),
+        ((UNSET_VALUE, 20, 200), ValueError),
+    ])
+    def test_failed_rebind_preserves_bound_state(self, invalid_values, error):
+        bound = self.make_prepared([0], 4).bind((1, 10, 100))
+        previous_values = bound.values
+        assert bound.routing_key == b'\x00\x00\x00\x01'
+        with pytest.raises(error):
+            bound.bind(invalid_values)
+        assert bound.values is previous_values
+        assert bound.raw_values == (1, 10, 100)
+        assert bound.routing_key == b'\x00\x00\x00\x01'
+        bound.bind((2, 20, 200))
+        assert bound.routing_key == b'\x00\x00\x00\x02'
+
+
+class TestPreparedBindMarkers:
+    @pytest.mark.parametrize('protocol_version', [3, 4, 5])
+    @pytest.mark.parametrize('marker_name', ['IN(ck)', 'in(ck)'])
+    def test_anonymous_in_markers_bind_by_position(self, protocol_version, marker_name):
+        prepared = PreparedStatement(
+            column_metadata=[ColumnMetadata('ks', 'tbl', 'pk', Int32Type),
+                             ColumnMetadata('ks', 'tbl', marker_name,
+                                            ListType.apply_parameters([Int32Type]))],
+            query_id=b'query-id', routing_key_indexes=[0],
+            query='SELECT * FROM ks.tbl WHERE pk = ? AND ck IN ?',
+            keyspace='ks', protocol_version=protocol_version,
+            result_metadata=[], result_metadata_id=None)
+        bound = prepared.bind((1, [2, 3]))
+        assert Int32Type.deserialize(bound.values[0], protocol_version) == 1
+        assert ListType.apply_parameters([Int32Type]).deserialize(
+            bound.values[1], protocol_version) == [2, 3]
+        assert bound.routing_key == bound.values[0]
+
+    @pytest.mark.parametrize('protocol_version', [3, 4, 5])
+    def test_explicit_in_markers_bind_by_name(self, protocol_version):
+        list_type = ListType.apply_parameters([Int32Type])
+        prepared = PreparedStatement(
+            column_metadata=[ColumnMetadata('ks', 'tbl', 'partition', Int32Type),
+                             ColumnMetadata('ks', 'tbl', 'ids', list_type)],
+            query_id=b'query-id', routing_key_indexes=[0],
+            query='SELECT * FROM ks.tbl WHERE pk = :partition AND ck IN :ids',
+            keyspace='ks', protocol_version=protocol_version,
+            result_metadata=[], result_metadata_id=None)
+        # Dictionary insertion order differs from marker order.
+        bound = prepared.bind({'ids': [2, 3], 'partition': 1})
+        assert bound.values == [Int32Type.serialize(1, protocol_version),
+                                list_type.serialize([2, 3], protocol_version)]
+        assert bound.routing_key == bound.values[0]
 
 
 class BatchStatementTest(unittest.TestCase):
@@ -115,3 +233,98 @@ class BatchStatementTest(unittest.TestCase):
         batch_with_simple = BatchStatement()
         batch_with_simple.add(LwtSimpleStatement())
         assert batch_with_simple.is_lwt() is True
+
+
+class KeyPartsPackedTest(unittest.TestCase):
+    """
+    _key_parts_packed() builds the packed segments used to assemble a
+    composite routing key. It must accept any buffer-protocol object
+    (bytes, bytearray, memoryview -- including non-contiguous slices) for
+    each key component, since routing key parts may come from encoders/
+    serializers that hand back something other than a plain bytes object
+    (e.g. a memoryview used to avoid a copy).
+    """
+
+    @staticmethod
+    def _pack(parts):
+        return list(Statement()._key_parts_packed(parts))
+
+    def test_bytes_parts_packed(self):
+        # Plain bytes is the common case; the packed format is
+        # [2-byte big-endian length][value][0x00] per part.
+        result = self._pack([b'abc', b'de'])
+        assert result == [b'\x00\x03abc\x00', b'\x00\x02de\x00']
+
+    def test_bytearray_part_packed_matches_bytes(self):
+        result = self._pack([bytearray(b'abc')])
+        assert result == [b'\x00\x03abc\x00']
+
+    def test_contiguous_memoryview_part_packed_matches_bytes(self):
+        result = self._pack([memoryview(b'abc')])
+        assert result == [b'\x00\x03abc\x00']
+
+    def test_non_contiguous_memoryview_part_does_not_raise(self):
+        # A strided (non-contiguous) memoryview is not directly usable with
+        # bytes concatenation (`b'' + memoryview` raises TypeError for
+        # non-contiguous views), so it must be normalized first.
+        mv = memoryview(b'abcdefgh')[::2]
+        assert not mv.contiguous
+        assert bytes(mv) == b'aceg'
+
+        result = self._pack([mv])
+        assert result == [b'\x00\x04aceg\x00']
+
+    def test_mixed_buffer_types_in_composite_key(self):
+        parts = [b'abc', bytearray(b'de'), memoryview(b'fghi')]
+        result = self._pack(parts)
+        assert result == [b'\x00\x03abc\x00', b'\x00\x02de\x00', b'\x00\x04fghi\x00']
+
+
+class PreparedStatementMetadataPairTest(unittest.TestCase):
+    """
+    result_metadata and result_metadata_id are stored as one tuple replaced in a
+    single attribute assignment: response callbacks update a statement while
+    request threads read it, and a torn pair (fresh id + stale metadata) would
+    make the server skip sending metadata while rows are decoded against the
+    wrong columns.
+    """
+
+    @staticmethod
+    def _make_statement(result_metadata, result_metadata_id):
+        return PreparedStatement(
+            column_metadata=[], query_id=b'qid', routing_key_indexes=None,
+            query="SELECT * FROM foo", keyspace='ks', protocol_version=4,
+            result_metadata=result_metadata, result_metadata_id=result_metadata_id)
+
+    def test_constructor_sets_pair(self):
+        meta = [('ks', 'tb', 'col', None)]
+        ps = self._make_statement(meta, b'hash')
+        assert ps.result_metadata is meta
+        assert ps.result_metadata_id == b'hash'
+        assert ps.result_metadata_and_id == (meta, b'hash')
+
+    def test_update_replaces_pair_atomically(self):
+        ps = self._make_statement([('ks', 'tb', 'old', None)], b'old')
+        snapshot_before = ps.result_metadata_and_id
+
+        new_meta = [('ks', 'tb', 'new', None)]
+        ps.update_result_metadata(new_meta, b'new')
+
+        # a snapshot taken before the update stays internally consistent
+        assert snapshot_before == ([('ks', 'tb', 'old', None)], b'old')
+        assert ps.result_metadata_and_id == (new_meta, b'new')
+
+    def test_halves_of_the_pair_cannot_be_assigned_individually(self):
+        # Assigning one half alone would leave the other stale, which is exactly
+        # the torn state update_result_metadata() exists to prevent, so neither
+        # attribute is writable.
+        meta = [('ks', 'tb', 'col', None)]
+        ps = self._make_statement(meta, b'hash')
+
+        with pytest.raises(AttributeError):
+            ps.result_metadata_id = b'other'
+
+        with pytest.raises(AttributeError):
+            ps.result_metadata = []
+
+        assert ps.result_metadata_and_id == (meta, b'hash')

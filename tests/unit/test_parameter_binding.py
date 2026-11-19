@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import unittest
+from decimal import Decimal
+from unittest.mock import Mock
 import pytest
 
 from cassandra.encoder import Encoder
@@ -20,6 +22,7 @@ from cassandra.protocol import ColumnMetadata
 from cassandra.query import (bind_params, ValueSequence, PreparedStatement,
                              BoundStatement, UNSET_VALUE)
 from cassandra.cqltypes import Int32Type
+from cassandra.marshal import int32_pack
 from cassandra.util import OrderedDict
 
 from tests.util import assertListEqual
@@ -70,6 +73,12 @@ class ParamBindingTest(unittest.TestCase):
     def test_float_precision(self):
         f = 3.4028234663852886e+38
         assert float(bind_params("%s", (f,), Encoder())) == f
+
+    def test_decimal_precision(self):
+        d = Decimal('1234567890.123456789012345678')
+        assert bind_params("%s", (d,), Encoder()) == '1234567890.123456789012345678'
+        assert bind_params("%s", (Decimal('1.50'),), Encoder()) == '1.50'
+        assert bind_params("%s", (Decimal('-Infinity'),), Encoder()) == '-Infinity'
 
 class BoundStatementTestV3(unittest.TestCase):
 
@@ -128,6 +137,22 @@ class BoundStatementTestV3(unittest.TestCase):
         prepared_statement.fetch_size = 1234
         bound_statement = BoundStatement(prepared_statement=prepared_statement)
         assert 1234 == bound_statement.fetch_size
+
+    def test_bind_with_column_encryption_policy(self):
+        policy = Mock()
+        policy.contains_column = Mock(side_effect=lambda cd: cd.col == 'v0')
+        policy.column_type = Mock(return_value=Int32Type)
+        policy.encrypt = Mock(side_effect=lambda cd, b: b'enc' + b)
+        prepared = PreparedStatement(column_metadata=self.prepared.column_metadata,
+                                     query_id=None, routing_key_indexes=[1, 0], query=None,
+                                     keyspace='keyspace', protocol_version=self.protocol_version,
+                                     result_metadata=None, result_metadata_id=None,
+                                     column_encryption_policy=policy)
+
+        bound = prepared.bind((1, 2, 3, 4))
+
+        assert bound.values == [int32_pack(1), int32_pack(2), int32_pack(3), b'enc' + int32_pack(4)]
+        assert policy.encrypt.call_count == 1
 
     def test_too_few_parameters_for_routing_key(self):
         with pytest.raises(ValueError):

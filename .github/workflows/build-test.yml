@@ -4,20 +4,26 @@ on:
   pull_request:
     branches:
       - master
-    paths-ignore:
-     - docs/*
-     - examples/*
-     - .gitignore
-     - '*.rst'
-     - '*.ini'
-     - LICENSE
-     - .github/dependabot.yml
-     - .github/pull_request_template.md
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/select-tests.yml
+
   test-wheels-build:
     name: "Test wheels building"
-    if: "!contains(github.event.pull_request.labels.*.name, 'disable-test-build')"
-    uses: ./.github/workflows/lib-build-and-push.yml
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (needs.changes.result != 'success' || needs.changes.outputs.wheels != 'false') &&
+      !contains(github.event.pull_request.labels.*.name, 'disable-test-build')
+    uses: ./.github/workflows/lib-build.yml
     with:
-      upload: false
+      target: ${{ github.event_name == 'merge_group' && 'linux,linux-aarch64' || 'linux' }}
+      smoke_tests: ${{ github.event_name == 'pull_request' }}

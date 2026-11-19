@@ -21,7 +21,7 @@ from cassandra.cluster import UserTypeDoesNotExist, ExecutionProfile, EXEC_PROFI
 from cassandra.query import dict_factory
 from cassandra.util import OrderedMap
 
-from tests.integration import use_singledc, execute_until_pass, \
+from tests.integration import use_single_node, execute_until_pass, \
     BasicSegregatedKeyspaceUnitTestCase, greaterthancass20, lessthancass30, greaterthanorequalcass36, TestCluster
 from tests.integration.datatype_utils import update_datatypes, PRIMITIVE_DATATYPES, PRIMITIVE_DATATYPES_KEYS, \
     COLLECTION_TYPES, get_sample, get_collection_sample
@@ -32,7 +32,7 @@ nested_collection_udt_nested = namedtuple('nested_collection_udt_nested', ['m', 
 
 
 def setup_module():
-    use_singledc()
+    use_single_node()
     update_datatypes()
 
 
@@ -94,7 +94,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         # use the same UDT name in a different keyspace
         s.execute("""
             CREATE KEYSPACE udt_test_unprepared_registered2
-            WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor': '1' }
+            WITH replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor': '1' }
             """)
         s.set_keyspace("udt_test_unprepared_registered2")
         s.execute("CREATE TYPE user (state text, is_cool boolean)")
@@ -124,14 +124,14 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
 
         s.execute("""
             CREATE KEYSPACE udt_test_register_before_connecting
-            WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor': '1' }
+            WITH replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor': '1' }
             """)
         s.execute("CREATE TYPE udt_test_register_before_connecting.user (age int, name text)")
         s.execute("CREATE TABLE udt_test_register_before_connecting.mytable (a int PRIMARY KEY, b frozen<user>)")
 
         s.execute("""
             CREATE KEYSPACE udt_test_register_before_connecting2
-            WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor': '1' }
+            WITH replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor': '1' }
             """)
         s.execute("CREATE TYPE udt_test_register_before_connecting2.user (state text, is_cool boolean)")
         s.execute("CREATE TABLE udt_test_register_before_connecting2.mytable (a int PRIMARY KEY, b frozen<user>)")
@@ -147,7 +147,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         c.register_user_type("udt_test_register_before_connecting2", "user", User2)
 
         s = c.connect(wait_for_all_pools=True)
-        c.control_connection.wait_for_schema_agreement()
+        s.wait_for_schema_agreement()
 
         s.execute("INSERT INTO udt_test_register_before_connecting.mytable (a, b) VALUES (%s, %s)", (0, User1(42, 'bob')))
         result = s.execute("SELECT b FROM udt_test_register_before_connecting.mytable WHERE a=0")
@@ -193,7 +193,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         # use the same UDT name in a different keyspace
         s.execute("""
             CREATE KEYSPACE udt_test_prepared_unregistered2
-            WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor': '1' }
+            WITH replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor': '1' }
             """)
         s.set_keyspace("udt_test_prepared_unregistered2")
         s.execute("CREATE TYPE user (state text, is_cool boolean)")
@@ -240,7 +240,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         # use the same UDT name in a different keyspace
         s.execute("""
             CREATE KEYSPACE udt_test_prepared_registered2
-            WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor': '1' }
+            WITH replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor': '1' }
             """)
         s.set_keyspace("udt_test_prepared_registered2")
         s.execute("CREATE TYPE user (state text, is_cool boolean)")
@@ -389,7 +389,12 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         with self._cluster_default_dict_factory() as c:
             s = c.connect(self.keyspace_name, wait_for_all_pools=True)
 
-            max_nesting_depth = 16
+            # Scylla caps CQL expression nesting depth at 12 (every recursive
+            # `term` counts). A UDT literal `{value: ...}` adds two term levels
+            # per nesting, so a UDT literal inserted via a simple statement can
+            # be at most 10 levels deep before the server rejects it with
+            # "expression nested too deeply".
+            max_nesting_depth = 10
 
             # create the schema
             self.nested_udt_schema_helper(s, max_nesting_depth)
@@ -417,7 +422,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         with self._cluster_default_dict_factory() as c:
             s = c.connect(self.keyspace_name, wait_for_all_pools=True)
 
-            max_nesting_depth = 16
+            max_nesting_depth = 12
 
             # create the schema
             self.nested_udt_schema_helper(s, max_nesting_depth)
@@ -454,7 +459,12 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         with self._cluster_default_dict_factory() as c:
             s = c.connect(self.keyspace_name, wait_for_all_pools=True)
 
-            max_nesting_depth = 16
+            # Scylla caps CQL expression nesting depth at 12 (every recursive
+            # `term` counts). A UDT literal `{value: ...}` adds two term levels
+            # per nesting, so a UDT literal inserted via a simple statement can
+            # be at most 10 levels deep before the server rejects it with
+            # "expression nested too deeply".
+            max_nesting_depth = 10
 
             # create the schema
             self.nested_udt_schema_helper(s, max_nesting_depth)
