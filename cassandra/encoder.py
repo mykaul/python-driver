@@ -25,7 +25,6 @@ from decimal import Decimal
 import calendar
 import datetime
 import math
-import sys
 import types
 from uuid import UUID
 import ipaddress
@@ -221,4 +220,7 @@ class Encoder(object):
         return "'%s'" % val.compressed
 
     def cql_encode_decimal(self, val):
+        if val.is_finite():
+            # str() keeps every digit; going through float keeps only about 17
+            return str(val)
         return self.cql_encode_float(float(val))

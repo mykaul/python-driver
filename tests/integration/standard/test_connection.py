@@ -15,9 +15,8 @@
 import unittest
 
 from functools import partial
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import logging
-import sys
 import threading
 from threading import Thread, Event
 import time
@@ -29,9 +28,9 @@ from cassandra.cluster import NoHostAvailable, ConnectionShutdown, ExecutionProf
 from cassandra.protocol import QueryMessage
 from cassandra.policies import HostFilterPolicy, RoundRobinPolicy, HostStateListener
 
-from tests import is_monkey_patched
 from tests.integration import use_singledc, get_node, CASSANDRA_IP, local, \
-    requiresmallclockgranularity, greaterthancass20, TestCluster
+    greaterthancass20, TestCluster
+from tests.util import wait_until
 
 try:
     import cassandra.io.asyncorereactor
@@ -140,9 +139,10 @@ class HeartbeatTest(unittest.TestCase):
             # Wait for connections associated with this host go away
             self.wait_for_no_connections(host, self.cluster)
 
-            # Wait to seconds for the driver to be notified
-            time.sleep(2)
-            assert test_listener.host_down
+            # Wait for the driver to detect the host is down
+            wait_until(
+                lambda: test_listener.host_down,
+                delay=0.5, max_attempts=20)
             # Resume paused node
         finally:
             node.resume()
@@ -384,23 +384,40 @@ class ConnectionTests(object):
         for t in threads:
             t.join()
 
-    @requiresmallclockgranularity
     def test_connect_timeout(self):
-        # Underlying socket implementations don't always throw a socket timeout even with min float
-        # This can be timing sensitive, added retry to ensure failure occurs if it can
-        max_retry_count = 10
-        exception_thrown = False
-        for i in range(max_retry_count):
-            start = time.time()
-            try:
-                conn = self.get_connection(timeout=sys.float_info.min)
-                conn.close()
-            except Exception as e:
-                end = time.time()
-                assert start == pytest.approx(end, abs=1e-1)
-                exception_thrown = True
-                break
-        assert exception_thrown
+        # Background cluster reconnects must not use the held handshake.
+        class TimeoutConnection(self.klass):
+            pass
+
+        # Open a real socket, then hold the CQL handshake so even a fast
+        # connection must exercise the timeout path.
+        send_options = Mock()
+
+        def hold_handshake(connection):
+            send_options(connection)
+            self.addCleanup(connection._socket.close)
+            self.addCleanup(connection.close)
+
+        timeout = 0.1
+        # Bind a Python function for Cython-compiled driver builds.
+        with patch.object(TimeoutConnection, '_send_options_message',
+                          hold_handshake):
+            with self.assertRaises(OperationTimedOut) as raised:
+                TimeoutConnection.factory(
+                    endpoint=CASSANDRA_IP, timeout=timeout,
+                    protocol_version=TestCluster.DEFAULT_PROTOCOL_VERSION,
+                    allow_beta_protocol_version=TestCluster.DEFAULT_ALLOW_BETA)
+
+            send_options.assert_called_once()
+            connection = send_options.call_args.args[0]
+            self.assertTrue(connection.is_closed)
+            self.assertEqual(raised.exception.timeout, timeout)
+            wait_until(lambda: connection._socket.fileno() == -1, .05, 100)
+            self.assertEqual(connection._socket.fileno(), -1)
+
+        # Timing out one handshake must leave normal connections usable.
+        connection = self.get_connection()
+        self.addCleanup(connection.close)
 
     def test_subclasses_share_loop(self):
 
@@ -439,8 +456,6 @@ class AsyncoreConnectionTests(ConnectionTests, unittest.TestCase):
     event_loop_name = "asyncore_cassandra_driver_event_loop"
 
     def setUp(self):
-        if is_monkey_patched():
-            raise unittest.SkipTest("Can't test asyncore with monkey patching")
         if AsyncoreConnection is None:
             raise unittest.SkipTest('Unable to import asyncore module')
         ConnectionTests.setUp(self)
@@ -456,8 +471,6 @@ class LibevConnectionTests(ConnectionTests, unittest.TestCase):
     event_loop_name = "event_loop"
 
     def setUp(self):
-        if is_monkey_patched():
-            raise unittest.SkipTest("Can't test libev with monkey patching")
         if LibevConnection is None:
             raise unittest.SkipTest(
                 'libev does not appear to be installed properly')

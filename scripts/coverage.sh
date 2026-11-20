@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Runs the unit suite (all event-loop reactors) and, if SCYLLA_VERSION or
+# CASSANDRA_VERSION is set, the integration suite, all under coverage.py, then
+# combines and reports.
+#
+# CASS_DRIVER_NO_CYTHON=1 forces cluster.py/connection.py/protocol.py/etc. to
+# build as plain Python instead of Cython extensions, since coverage.py can't
+# trace into compiled extensions. Cython-only modules with no .py fallback
+# (obj_parser, numpy_parser, row_parser, ...) are not built at all in this mode
+# and are therefore not measured by this script.
+#
+# Deliberately not `set -e`: a failing test must not skip report generation
+# below, or a broken test leaves no coverage output at all to diagnose it
+# with. Each test invocation instead records its own failure into $status,
+# and the script exits with that status only after combine/report/html/xml
+# have run.
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+
+rm -f .coverage .coverage.* || exit 1
+export CASS_DRIVER_NO_CYTHON=1
+
+# A previous plain `uv sync`/`uv run` may have left Cython-compiled .so/.pyd
+# files in place from a normal (Cython-enabled) build. Python's import system
+# prefers those over the .py source, so they must be removed -- otherwise
+# CASS_DRIVER_NO_CYTHON=1 silently has no effect and coverage reports 0% for
+# every affected module (and, for the Cython-only modules with no .py
+# fallback like row_parser, HAVE_CYTHON would stay True off a stale .so,
+# defeating CASS_DRIVER_NO_CYTHON entirely). Candidates are built from the
+# exact list of optionally-cythonized module names (setup.py's
+# cython_candidates) plus the *current* interpreter's own EXTENSION_SUFFIXES,
+# then only deleted if that exact file exists -- unlike a generic endswith()
+# scan, this can't match a foreign-ABI build of the same module (e.g.
+# cluster.cpython-311-...so when the current interpreter is 3.12) or a
+# module never in the list (cmurmur3, libevwrapper are unaffected by
+# CASS_DRIVER_NO_CYTHON and always left alone since they're simply not
+# candidates). `--reinstall-package` then rebuilds from scratch, producing
+# only the extensions CASS_DRIVER_NO_CYTHON=1 actually allows. If any of
+# this setup fails, there's no point running any tests, so bail out
+# immediately -- failure tolerance below is scoped to test/report commands
+# only.
+uv run python -c "
+import importlib.machinery, pathlib
+candidates = ['cluster', 'concurrent', 'connection', 'cqltypes', 'metadata',
+              'pool', 'protocol', 'query', 'util', 'shard_info']
+for name in candidates:
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        path = pathlib.Path('cassandra') / (name + suffix)
+        if path.exists():
+            path.unlink()
+" || exit 1
+uv sync --reinstall-package scylla-driver || exit 1
+
+status=0
+
+# Unlike the asyncio reactor test below, tests/unit/io/test_asyncorereactor.py
+# is deliberately NOT in the --ignore list: it needs no separate
+# EVENT_LOOP_MANAGER run. The stdlib `asyncore` module was removed in Python
+# 3.12 (PEP 594), so on 3.12+ the PyPI backport `pyasyncore` is added for
+# this step only; without it the file self-skips via ASYNCCORE_AVAILABLE and
+# cassandra/io/asyncorereactor.py goes unmeasured.
+#
+# It is deliberately NOT in the dev dependency group: the default reactor
+# order is libev -> asyncore -> asyncio (conn_fns in cassandra/cluster.py),
+# so with asyncore importable, any environment without libev (e.g. Windows
+# wheel tests, developer machines) would silently switch its default
+# connection class from asyncio to asyncore. `uv run --with` installs it
+# into a throwaway overlay, not the project env, so the asyncio step and
+# integration step below don't see it; libev is installed in this lane, so
+# DefaultConnection stays LibevConnection here either way.
+#
+# `--with lz4` likewise adds the optional `lz4` package (the compress-lz4
+# extra) to this one step only, so the lz4 compression paths (connection.py's
+# lz4 import block, the lz4-dependent test_segment.py tests) get measured.
+# The integration step below deliberately runs without it:
+# Cluster.compression defaults to True and LZ4 is only auto-negotiated when
+# the `lz4` package is installed (see #1088; the Cython lz4 codec isn't built
+# here anyway), so it keeps measuring the default, uncompressed behaviour
+# most users get. The asyncio reactor step needs no lz4 -- it doesn't
+# exercise compression, and the lz4 import block already ran here.
+uv run --with lz4 --with "pyasyncore; python_version >= '3.12'" \
+    coverage run -m pytest tests/unit -v \
+    --ignore=tests/unit/column_encryption \
+    --ignore=tests/unit/io/test_asyncioreactor.py \
+    || status=1
+
+EVENT_LOOP_MANAGER=asyncio uv run coverage run -m pytest tests/unit/io/test_asyncioreactor.py -v || status=1
+
+if [[ -n "${SCYLLA_VERSION:-}" || -n "${CASSANDRA_VERSION:-}" ]]; then
+    uv run coverage run -m pytest tests/integration/standard tests/integration/cqlengine/ -v || status=1
+else
+    echo "SCYLLA_VERSION/CASSANDRA_VERSION not set -- skipping integration coverage."
+fi
+
+uv run coverage combine || status=1
+uv run coverage report -m || status=1
+uv run coverage html || status=1
+uv run coverage xml || status=1
+
+exit "$status"

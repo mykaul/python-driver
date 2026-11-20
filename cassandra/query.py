@@ -20,15 +20,17 @@ queries.
 
 from collections import namedtuple
 from datetime import datetime, timedelta, timezone
+import os
 import re
 import struct
+import threading
 import time
-import warnings
 
 from cassandra import ConsistencyLevel, OperationTimedOut
 from cassandra.util import unix_time_from_uuid1, maybe_add_timeout_to_query
 from cassandra.encoder import Encoder
 import cassandra.encoder
+from cassandra.marshal import uint16_pack
 from cassandra.policies import ColDesc
 from cassandra.protocol import _UNSET_VALUE
 from cassandra.util import OrderedDict, _sanitize_identifiers
@@ -53,16 +55,9 @@ NON_ALPHA_REGEX = re.compile('[^a-zA-Z0-9]')
 START_BADCHAR_REGEX = re.compile('^[^a-zA-Z0-9]*')
 END_BADCHAR_REGEX = re.compile('[^a-zA-Z0-9_]*$')
 
-_clean_name_cache = {}
-
 
 def _clean_column_name(name):
-    try:
-        return _clean_name_cache[name]
-    except KeyError:
-        clean = NON_ALPHA_REGEX.sub("_", START_BADCHAR_REGEX.sub("", END_BADCHAR_REGEX.sub("", name)))
-        _clean_name_cache[name] = clean
-        return clean
+    return NON_ALPHA_REGEX.sub("_", START_BADCHAR_REGEX.sub("", END_BADCHAR_REGEX.sub("", name)))
 
 
 def tuple_factory(colnames, rows):
@@ -110,11 +105,87 @@ class PseudoNamedTupleRow(object):
 
 def pseudo_namedtuple_factory(colnames, rows):
     """
-    Returns each row as a :class:`.PseudoNamedTupleRow`. This is the fallback
-    factory for cases where :meth:`.named_tuple_factory` fails to create rows.
+    Returns each row as a :class:`.PseudoNamedTupleRow`. Not used as an
+    automatic fallback by :meth:`.named_tuple_factory`.
     """
     return [PseudoNamedTupleRow(od)
             for od in ordered_dict_factory(colnames, rows)]
+
+
+_NAMED_TUPLE_ROW_CLASS_CACHE_SIZE = 1024
+
+
+def _build_named_tuple_row_class(colnames):
+    """Return ``(Row class, warning message or None)``; the caller logs only if it inserts."""
+    clean_column_names = [_clean_column_name(c) for c in colnames]
+    try:
+        return namedtuple('Row', clean_column_names), None
+    except Exception:
+        warning = ("Failed creating named tuple for results with column names %s (cleaned: %s) "
+                   "(see Python 'namedtuple' documentation for details on name rules). "
+                   "Results will be returned with positional names. "
+                   "Avoid this by choosing different names, using SELECT \"<col name>\" AS aliases, "
+                   "or specifying a different row_factory on your Session" %
+                   (list(colnames), clean_column_names))
+        return namedtuple('Row', _sanitize_identifiers(clean_column_names)), warning
+
+
+class _NamedTupleRowClassCache(object):
+    """Bounded LRU of ``Row`` classes; builds run unlocked and the first insert wins."""
+
+    def __init__(self, maxsize):
+        self._maxsize = maxsize
+        self._lock = threading.Lock()
+        # A plain dict (insertion order = recency): its lock-free reads stay safe on
+        # free-threaded builds while writers reorder or evict under the lock.
+        self._cache = {}
+        # A fork while another thread holds the lock would leave it held in the child.
+        if hasattr(os, 'register_at_fork'):  # absent on Windows
+            os.register_at_fork(after_in_child=self._reset_lock)
+
+    def _reset_lock(self):
+        self._lock = threading.Lock()
+
+    def __call__(self, colnames):
+        row_class = self._cache.get(colnames)
+        if row_class is not None:
+            # Hits never wait: refresh recency only when the lock is free.
+            if self._lock.acquire(blocking=False):
+                try:
+                    self._touch(colnames)
+                finally:
+                    self._lock.release()
+            return row_class
+        # Recheck under the lock: the lock-free get may have hit a _touch() mid-move.
+        with self._lock:
+            row_class = self._cache.get(colnames)
+        if row_class is not None:
+            return row_class
+        row_class, warning = _build_named_tuple_row_class(colnames)
+        with self._lock:
+            existing = self._cache.get(colnames)
+            if existing is not None:
+                self._touch(colnames)
+                return existing
+            self._cache[colnames] = row_class
+            if len(self._cache) > self._maxsize:
+                del self._cache[next(iter(self._cache))]
+        if warning:
+            log.warning(warning)
+        return row_class
+
+    def _touch(self, colnames):
+        # Re-insert to move to the most-recent end; caller holds the lock.
+        row_class = self._cache.pop(colnames, None)
+        if row_class is not None:
+            self._cache[colnames] = row_class
+
+    def cache_clear(self):
+        with self._lock:
+            self._cache.clear()
+
+
+_named_tuple_row_class = _NamedTupleRowClassCache(_NAMED_TUPLE_ROW_CLASS_CACHE_SIZE)
 
 
 def named_tuple_factory(colnames, rows):
@@ -143,36 +214,14 @@ def named_tuple_factory(colnames, rows):
         >>> print("name: %s, age: %d" % (name, age))
         name: Bob, age: 42
 
+    Invalid identifiers, duplicates and keywords among the column names are
+    sanitized to positional names (``field_0_``, ...), with a warning logged
+    each time the schema's class is built (again after LRU eviction).
+
     .. versionchanged:: 2.0.0
         moved from ``cassandra.decoder`` to ``cassandra.query``
     """
-    clean_column_names = map(_clean_column_name, colnames)
-    try:
-        Row = namedtuple('Row', clean_column_names)
-    except SyntaxError:
-        warnings.warn(
-            "Failed creating namedtuple for a result because there were too "
-            "many columns. This is due to a Python limitation that affects "
-            "namedtuple in Python 3.0-3.6 (see issue18896). The row will be "
-            "created with {substitute_factory_name}, which lacks some namedtuple "
-            "features and is slower. To avoid slower performance accessing "
-            "values on row objects, Upgrade to Python 3.7, or use a different "
-            "row factory. (column names: {colnames})".format(
-                substitute_factory_name=pseudo_namedtuple_factory.__name__,
-                colnames=colnames
-            )
-        )
-        return pseudo_namedtuple_factory(colnames, rows)
-    except Exception:
-        clean_column_names = list(map(_clean_column_name, colnames))  # create list because py3 map object will be consumed by first attempt
-        log.warning("Failed creating named tuple for results with column names %s (cleaned: %s) "
-                    "(see Python 'namedtuple' documentation for details on name rules). "
-                    "Results will be returned with positional names. "
-                    "Avoid this by choosing different names, using SELECT \"<col name>\" AS aliases, "
-                    "or specifying a different row_factory on your Session" %
-                    (colnames, clean_column_names))
-        Row = namedtuple('Row', _sanitize_identifiers(clean_column_names))
-
+    Row = _named_tuple_row_class(tuple(colnames))
     return [Row(*row) for row in rows]
 
 
@@ -299,9 +348,17 @@ class Statement(object):
         self.is_idempotent = is_idempotent
 
     def _key_parts_packed(self, parts):
+        _pack = uint16_pack
         for p in parts:
-            l = len(p)
-            yield struct.pack(">H%dsB" % l, l, p, 0)
+            # Normalize to bytes so any buffer-protocol object (bytearray,
+            # memoryview, including non-contiguous slices, etc.) is accepted,
+            # matching (and slightly broadening) what struct.pack used to
+            # tolerate here. This is a cheap no-op when p is already bytes.
+            if not isinstance(p, bytes):
+                p = bytes(p)
+            # Single allocation via join(), instead of chained `+` which
+            # would create an extra intermediate bytes object.
+            yield b''.join((_pack(len(p)), p, b'\x00'))
 
     def _get_routing_key(self):
         return self._routing_key
@@ -451,13 +508,16 @@ class PreparedStatement(object):
     protocol_version = None
     query_id = None
     query_string = None
-    result_metadata = None
-    result_metadata_id = None
+    _result_metadata_and_id = (None, None)
     column_encryption_policy = None
     routing_key_indexes = None
     _routing_key_index_set = None
     serial_consistency_level = None  # TODO never used?
     _is_lwt = False
+    # Set once we've logged the "new metadata id without column metadata" anomaly
+    # for this statement, to avoid logging it on every execute while a misbehaving
+    # server keeps returning it. Re-armed whenever the metadata is updated.
+    _warned_missing_column_metadata = False
 
     def __init__(self, column_metadata, query_id, routing_key_indexes, query,
                  keyspace, protocol_version, result_metadata, result_metadata_id,
@@ -468,11 +528,56 @@ class PreparedStatement(object):
         self.query_string = query
         self.keyspace = keyspace
         self.protocol_version = protocol_version
-        self.result_metadata = result_metadata
-        self.result_metadata_id = result_metadata_id
+        self._result_metadata_and_id = (result_metadata, result_metadata_id)
         self.column_encryption_policy = column_encryption_policy
         self.is_idempotent = False
         self._is_lwt = is_lwt
+
+    @property
+    def result_metadata_and_id(self):
+        """
+        The cached result metadata and its metadata id as one immutable
+        ``(result_metadata, result_metadata_id)`` pair.
+
+        Read this property when both values are needed together: the tuple is
+        replaced atomically by :meth:`update_result_metadata`, so a single read
+        can never observe the metadata of one schema version paired with the
+        metadata id of another.
+        """
+        return self._result_metadata_and_id
+
+    @property
+    def result_metadata(self):
+        """
+        Cached result metadata (column definitions) from PREPARE. Read-only:
+        :meth:`update_result_metadata` is the only way to replace it, so it can
+        never be assigned separately from the id it belongs to.
+        """
+        return self._result_metadata_and_id[0]
+
+    @property
+    def result_metadata_id(self):
+        """
+        Cached result metadata id (hash) from PREPARE. Read-only:
+        :meth:`update_result_metadata` is the only way to replace it, so it can
+        never be assigned separately from the metadata it describes.
+        """
+        return self._result_metadata_and_id[1]
+
+    def update_result_metadata(self, result_metadata, result_metadata_id):
+        """
+        Replace the cached result metadata and metadata id together, in a single
+        atomic attribute store. Response callbacks may update a statement while
+        request threads read it; updating the pair in one step (rather than the
+        two fields separately) prevents a reader from pairing a fresh metadata id
+        with stale metadata — a state in which the server would skip sending
+        metadata and rows would be decoded against the wrong columns.
+
+        Also re-arms :attr:`_warned_missing_column_metadata`, so an anomaly that
+        recurs after the metadata was recovered is logged again.
+        """
+        self._result_metadata_and_id = (result_metadata, result_metadata_id)
+        self._warned_missing_column_metadata = False
 
     @classmethod
     def from_message(cls, query_id, column_metadata, pk_indexes, cluster_metadata,
@@ -565,6 +670,7 @@ class BoundStatement(Statement):
         self.custom_payload = prepared_statement.custom_payload
         self.is_idempotent = prepared_statement.is_idempotent
         self.values = []
+        self._routing_key_cache = None
 
         meta = prepared_statement.column_metadata
         if meta:
@@ -581,7 +687,15 @@ class BoundStatement(Statement):
         and returns this instance.  Note that `values` *must* be:
 
         * a sequence, even if you are only binding one value, or
-        * a dict that relates 1-to-1 between dict keys and columns
+        * a dict that maps prepared marker names to values
+
+        Bind anonymous ``?`` markers with a sequence, in marker order. The server
+        supplies names for anonymous markers (for example, ``IN(column)``), but
+        those names can change between server versions. Dictionary keys are
+        matched exactly against prepared metadata, so relying on synthesized
+        names can fail during an upgrade. Use explicit ``:name`` markers when
+        dictionary binding is needed. Dictionary lookup happens locally; values
+        are always sent to the coordinator positionally.
 
         .. versionchanged:: 2.6.0
 
@@ -634,14 +748,13 @@ class BoundStatement(Statement):
                 "Too few arguments provided to bind() (got %d, required %d for routing key)" %
                 (value_len, len(self.prepared_statement.routing_key_indexes)))
 
-        self.raw_values = values
-        self.values = []
+        serialized_values = []
         for value, col_spec in zip(values, col_meta):
             if value is None:
-                self.values.append(None)
+                serialized_values.append(None)
             elif value is UNSET_VALUE:
                 if proto_version >= 4:
-                    self._append_unset_value()
+                    self._append_unset_value(serialized_values)
                 else:
                     raise ValueError("Attempt to bind UNSET_VALUE while using unsuitable protocol version (%d < 4)" % proto_version)
             else:
@@ -652,7 +765,7 @@ class BoundStatement(Statement):
                     col_bytes = col_type.serialize(value, proto_version)
                     if uses_ce:
                         col_bytes = ce_policy.encrypt(col_desc, col_bytes)
-                    self.values.append(col_bytes)
+                    serialized_values.append(col_bytes)
                 except (TypeError, struct.error) as exc:
                     actual_type = type(value)
                     message = ('Received an argument of invalid type for column "%s". '
@@ -660,19 +773,26 @@ class BoundStatement(Statement):
                     raise TypeError(message)
 
         if proto_version >= 4:
-            diff = col_meta_len - len(self.values)
+            diff = col_meta_len - len(serialized_values)
             if diff:
                 for _ in range(diff):
-                    self._append_unset_value()
+                    self._append_unset_value(serialized_values)
 
+        # Replace the values and their cached key only after a successful
+        # bind, so serialization failures preserve the previous bound state.
+        self.raw_values = values
+        self.values = serialized_values
+        self._routing_key_cache = None
         return self
 
-    def _append_unset_value(self):
-        next_index = len(self.values)
+    def _append_unset_value(self, serialized_values=None):
+        if serialized_values is None:
+            serialized_values = self.values
+        next_index = len(serialized_values)
         if self.prepared_statement.is_routing_key_index(next_index):
             col_meta = self.prepared_statement.column_metadata[next_index]
             raise ValueError("Cannot bind UNSET_VALUE as a part of the routing key '%s'" % col_meta.name)
-        self.values.append(UNSET_VALUE)
+        serialized_values.append(UNSET_VALUE)
 
     @property
     def routing_key(self):
@@ -682,13 +802,16 @@ class BoundStatement(Statement):
         if self._routing_key is not None:
             return self._routing_key
 
+        if self._routing_key_cache is not None:
+            return self._routing_key_cache
+
         routing_indexes = self.prepared_statement.routing_key_indexes
         if len(routing_indexes) == 1:
-            self._routing_key = self.values[routing_indexes[0]]
+            self._routing_key_cache = self.values[routing_indexes[0]]
         else:
-            self._routing_key = b"".join(self._key_parts_packed(self.values[i] for i in routing_indexes))
+            self._routing_key_cache = b"".join(self._key_parts_packed(self.values[i] for i in routing_indexes))
 
-        return self._routing_key
+        return self._routing_key_cache
 
     def is_lwt(self):
         return self.prepared_statement.is_lwt()
@@ -1021,7 +1144,7 @@ class QueryTrace(object):
         This can be used to query events from partial sessions.
 
         `query_cl` specifies a consistency level to use for polling the trace tables,
-        if it should be different than the session default.
+        if different from the session default.
         """
         attempt = 0
         start = time.time()
@@ -1046,7 +1169,7 @@ class QueryTrace(object):
             if is_complete:
                 log.debug("Fetched trace info for trace ID: %s", self.trace_id)
             else:
-                log.debug("Fetching parital trace info for trace ID: %s", self.trace_id)
+                log.debug("Fetching partial trace info for trace ID: %s", self.trace_id)
 
             self.request_type = session_row.request
             self.duration = timedelta(microseconds=session_row.duration) if is_complete else None

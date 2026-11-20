@@ -1,0 +1,136 @@
+name: Code coverage
+
+on:
+  push:
+    branches:
+      - master
+      - 'branch-**'
+    paths-ignore:
+      - docs/**
+      - examples/**
+      - .gitignore
+      - '**/*.rst'
+      - '**/*.md'
+      - '*.ini'
+      - LICENSE
+      - .github/dependabot.yml
+      - .github/pull_request_template.md
+      - .github/workflows/docs-*
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      run-on-pr:
+        description: 'Run full coverage when called by opt-in pre-release CI'
+        type: boolean
+        default: false
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+
+jobs:
+  changes:
+    if: github.event_name == 'pull_request' && !inputs.run-on-pr
+    uses: ./.github/workflows/select-tests.yml
+
+  coverage:
+    name: Measure code coverage
+    # Only ordinary PRs use selected tests. Merge queues, protected pushes,
+    # manual runs and pre-release calls retain full coverage.
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (inputs.run-on-pr || github.event_name != 'pull_request' ||
+       (needs.changes.result == 'success' &&
+        needs.changes.outputs.mode == 'selected' && needs.changes.outputs.unit != '[]'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SCYLLA_VERSION: release:2026.1.13
+      PROTOCOL_VERSION: 4
+      # Set once at job level so every step (including "Build driver" and the
+      # summary step, both of which invoke `uv run`) sees the same value.
+      # uv's cache-keys include this var, so a value that flips between steps
+      # makes each `uv run` re-detect a "changed" build config and rebuild the
+      # Cython extensions from scratch -- about two minutes wasted per flip.
+      CASS_DRIVER_NO_CYTHON: ${{ needs.changes.outputs.mode != 'selected' && '1' || '' }}
+      TEST_PLAN: ${{ needs.changes.outputs.plan }}
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install libev
+      run: sudo apt-get install libev4 libev-dev
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      with:
+        python-version: "3.13"
+        enable-cache: true
+
+    - name: Build driver
+      if: needs.changes.outputs.mode != 'selected'
+      run: uv sync
+
+    - name: Build driver for selected PR tests
+      if: needs.changes.outputs.mode == 'selected'
+      env:
+        CASS_DRIVER_BUILD_EXTENSIONS_ARE_MUST: 'yes'
+      run: uv sync
+
+    - name: Cache Scylla download
+      if: needs.changes.outputs.mode != 'selected'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.ccm/scylla-repository
+        key: scylla-${{ env.SCYLLA_VERSION }}-${{ runner.os }}
+        restore-keys: scylla-${{ env.SCYLLA_VERSION }}-
+
+    - name: Run impacted PR unit and helper tests
+      if: needs.changes.outputs.mode == 'selected'
+      env:
+        CASS_DRIVER_BUILD_EXTENSIONS_ARE_MUST: 'yes'
+        CASS_DRIVER_NO_SKIP: '1'
+      run: python3 scripts/ci/select_tests.py --plan-json "$TEST_PLAN" --run --suite unit
+
+    - name: Run tests with coverage
+      if: needs.changes.outputs.mode != 'selected'
+      run: bash scripts/coverage.sh
+
+    - name: Publish coverage summary
+      if: always() && needs.changes.outputs.mode != 'selected'
+      run: |
+        {
+          echo '## Coverage report'
+          echo '```'
+          uv run coverage report -m
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload coverage report
+      if: always() && needs.changes.outputs.mode != 'selected'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: coverage-report
+        path: |
+          htmlcov/
+          coverage.xml
+
+    # No `if: always()` here: only a run in which every step above passed
+    # uploads. scripts/coverage.sh writes its reports even when a test fails,
+    # so only publish complete coverage measurements. Opt-in fork PRs may run
+    # without a Codecov token.
+    - name: Upload coverage to Codecov
+      if: needs.changes.outputs.mode != 'selected'
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: coverage.xml
+        disable_search: true
+        fail_ci_if_error: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}

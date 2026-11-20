@@ -1,16 +1,18 @@
-import time
-
 import pytest
 
+from cassandra import ConsistencyLevel
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
 from cassandra.policies import ConstantReconnectionPolicy, RoundRobinPolicy, TokenAwarePolicy
 
 from tests.integration import PROTOCOL_VERSION, use_cluster, get_cluster
+from tests.util import wait_until
 from tests.unit.test_host_connection_pool import LOGGER
 
 
 def setup_module():
-    use_cluster('tablets', [3], start=True)
+    # Keep server read balancing from obscuring the driver's routing in traces.
+    use_cluster('tablets', [3], start=True, set_keyspace=False,
+                configuration_options={'cache_hit_rate_read_balancing': False})
 
 
 class TestTabletsIntegration:
@@ -28,7 +30,7 @@ class TestTabletsIntegration:
         cls.cluster.shutdown()
 
     def verify_hosts_in_tracing(self, results, expected):
-        traces = results.get_query_trace()
+        traces = results.get_query_trace(max_wait_sec=10)
         events = traces.events
         host_set = set()
         for event in events:
@@ -49,12 +51,21 @@ class TestTabletsIntegration:
         assert len(host_set) == expected
         assert 'locally' in "\n".join([event.activity for event in events])
 
-    def get_tablet_record(self, query):
-        metadata = self.session.cluster.metadata
+    def get_tablet_record(self, query, session=None):
+        metadata = (session or self.session).cluster.metadata
         return metadata._tablets.get_tablet_for_key(query.keyspace, query.table, metadata.token_map.token_class.from_key(query.routing_key))
 
+    def warm_up_tablet(self, session, bound):
+        # A nonreplica coordinator supplies routing information for this key.
+        for host in session.cluster.metadata.all_hosts():
+            session.execute(bound, host=host)
+            record = self.get_tablet_record(bound, session)
+            if record is not None:
+                return record
+        raise AssertionError("failed to find tablet record")
+
     def verify_same_shard_in_tracing(self, results):
-        traces = results.get_query_trace()
+        traces = results.get_query_trace(max_wait_sec=10)
         events = traces.events
         shard_set = set()
         for event in events:
@@ -95,7 +106,8 @@ class TestTabletsIntegration:
 
         session.execute(
             """
-            CREATE TABLE test1.table1 (pk int, ck int, v int, PRIMARY KEY (pk, ck));
+            CREATE TABLE test1.table1 (pk int, ck int, v int, PRIMARY KEY (pk, ck))
+            WITH speculative_retry = 'NONE';
             """)
 
     @staticmethod
@@ -114,8 +126,11 @@ class TestTabletsIntegration:
             """
             SELECT pk, ck, v FROM test1.table1 WHERE pk = ?
             """)
+        # Trace a single replica to check the selected shard.
+        prepared.consistency_level = ConsistencyLevel.LOCAL_ONE
 
         bound = prepared.bind([(2)])
+        self.warm_up_tablet(session, bound)
         results = session.execute(bound, trace=True)
         assert results == [(2, 2, 0)]
         if verify_in_tracing:
@@ -126,8 +141,11 @@ class TestTabletsIntegration:
             """
             SELECT pk, ck, v FROM test1.table1 WHERE pk = ?
             """)
+        # The trace below must contain only the selected replica's host.
+        prepared.consistency_level = ConsistencyLevel.LOCAL_ONE
 
         bound = prepared.bind([(2)])
+        self.warm_up_tablet(session, bound)
         results = session.execute(bound, trace=True)
         assert results == [(2, 2, 0)]
         if verify_in_tracing:
@@ -140,6 +158,7 @@ class TestTabletsIntegration:
             """)
 
         bound = prepared.bind([(51), (1), (2)])
+        self.warm_up_tablet(session, bound)
         results = session.execute(bound, trace=True)
         if verify_in_tracing:
             self.verify_same_shard_in_tracing(results)
@@ -151,6 +170,7 @@ class TestTabletsIntegration:
             """)
 
         bound = prepared.bind([(52), (1), (2)])
+        self.warm_up_tablet(session, bound)
         results = session.execute(bound, trace=True)
         if verify_in_tracing:
             self.verify_hosts_in_tracing(results, 2)
@@ -172,8 +192,8 @@ class TestTabletsIntegration:
                           reconnection_policy=ConstantReconnectionPolicy(1))
         session = cluster.connect()
         try:
-            self.query_data_host_select(self.session)
-            self.query_data_host_insert(self.session)
+            self.query_data_host_select(session)
+            self.query_data_host_insert(session)
         finally:
             session.shutdown()
             cluster.shutdown()
@@ -212,9 +232,43 @@ class TestTabletsIntegration:
         def drop_ks(_):
             # Drop and recreate ks and table to trigger tablets invalidation
             self.create_ks_and_cf(self.cluster.connect())
-            time.sleep(3)
+            # Wait for tablet metadata to be refreshed
+            wait_until(
+                lambda: 'test1' in self.cluster.metadata.keyspaces,
+                delay=0.5, max_attempts=20)
 
         self.run_tablets_invalidation_test(drop_ks)
+
+    def test_tablets_invalidation_drop_table(self):
+        """Dropping a table invalidates its tablet metadata via the schema change event."""
+        keyspace, table = "test_drop_table", "table1"
+
+        # Own keyspace/table so this test doesn't disturb state shared with other tests
+        self.session.execute(f"DROP KEYSPACE IF EXISTS {keyspace}")
+        self.session.execute(
+            f"""
+            CREATE KEYSPACE {keyspace}
+            WITH replication = {{
+                'class': 'NetworkTopologyStrategy',
+                'replication_factor': 2
+            }} AND tablets = {{
+                'initial': 8
+            }}
+            """)
+        self.session.execute(f"CREATE TABLE {keyspace}.{table} (pk int, ck int, v int, PRIMARY KEY (pk, ck))")
+
+        prepared = self.session.prepare(f"INSERT INTO {keyspace}.{table} (pk, ck, v) VALUES (?, ?, ?)")
+        for i in range(50):
+            self.session.execute(prepared.bind((i, i % 5, i % 2)))
+
+        def drop_table(_):
+            # Drop table to trigger tablets invalidation
+            self.session.execute(f"DROP TABLE {keyspace}.{table}")
+
+        try:
+            self.run_tablets_invalidation_test(drop_table, keyspace=keyspace, table=table)
+        finally:
+            self.session.execute(f"DROP KEYSPACE IF EXISTS {keyspace}")
 
     @pytest.mark.last
     def test_tablets_invalidation_decommission_non_cc_node(self):
@@ -233,29 +287,26 @@ class TestTabletsIntegration:
                 break
             else:
                 assert False, "failed to find node to decommission"
-            time.sleep(10)
+            # Wait for decommission to complete and metadata to update
+            wait_until(
+                lambda: len([h for h in self.cluster.metadata.all_hosts() if h.is_up]) < 3,
+                delay=1, max_attempts=60)
+            # Tablet metadata invalidation may take additional time to propagate;
+            # run_tablets_invalidation_test will poll for the expected result.
 
         self.run_tablets_invalidation_test(decommission_non_cc_node)
 
 
-    def run_tablets_invalidation_test(self, invalidate):
-        # Make sure driver holds tablet info
-        # By landing query to the host that is not in replica set
+    def run_tablets_invalidation_test(self, invalidate, keyspace="test1", table="table1"):
         bound = self.session.prepare(
-            """
-            SELECT pk, ck, v FROM test1.table1 WHERE pk = ?
+            f"""
+            SELECT pk, ck, v FROM {keyspace}.{table} WHERE pk = ?
             """).bind([(2)])
 
-        rec = None
-        for host in self.cluster.metadata.all_hosts():
-            self.session.execute(bound, host=host)
-            rec = self.get_tablet_record(bound)
-            if rec is not None:
-                break
-
-        assert rec is not None, "failed to find tablet record"
-
+        rec = self.warm_up_tablet(self.session, bound)
         invalidate(rec)
 
-        # Check if tablets information was purged
-        assert self.get_tablet_record(bound) is None, "tablet was not deleted, invalidation did not work"
+        # Wait for tablets information to be purged (invalidation is async)
+        wait_until(
+            lambda: self.get_tablet_record(bound) is None,
+            delay=0.5, max_attempts=20)
